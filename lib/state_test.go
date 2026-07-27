@@ -27,7 +27,7 @@ func openTestOptimizerStore(t *testing.T) *OptimizerStore {
 
 func normalInfo() Info {
 	return Info{
-		Hostname:    "mineira",
+		Hostname:    "bitaxe-alpha",
 		MacAddr:     "aa:bb:cc:dd:ee:ff",
 		Frequency:   400,
 		CoreVoltage: 1100,
@@ -335,7 +335,7 @@ func TestOptimizerStoreRejectsInvalidPendingStateAndPoint(t *testing.T) {
 	store := openTestOptimizerStore(t)
 	state := MinerState{
 		MacAddr:            "aa:bb:cc:dd:ee:ff",
-		Hostname:           "mineira",
+		Hostname:           "bitaxe-alpha",
 		IP:                 "192.0.2.10",
 		Phase:              PhaseBaseline,
 		CurrentFrequency:   400,

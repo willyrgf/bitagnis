@@ -11,20 +11,36 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/willyrgf/bitagnis/lib"
 )
 
 const (
-	colorReset      = "\033[0m"
-	colorRed        = "\033[31m"
-	colorGreen      = "\033[32m"
-	colorYellow     = "\033[33m"
-	pollWorkerLimit = 16
+	colorReset       = "\033[0m"
+	colorRed         = "\033[31m"
+	colorGreen       = "\033[32m"
+	colorYellow      = "\033[33m"
+	pollWorkerLimit  = 16
+	minerColumnCount = 10
 )
+
+var minerTableHeader = [minerColumnCount]string{
+	"Hostname",
+	"Freq",
+	"VCore",
+	"State",
+	"Window",
+	"Temp",
+	"VRTemp",
+	"HRate/Expected",
+	"Watts",
+	"Fan",
+}
 
 type deviceAPI interface {
 	GetSystemInfo(context.Context, string) (lib.Info, error)
@@ -71,7 +87,7 @@ type pollJob struct {
 }
 
 type minerPollResult struct {
-	line              string
+	columns           [minerColumnCount]string
 	hashRate          float64
 	hashRateAvailable bool
 	observation       *minerObservation
@@ -314,21 +330,6 @@ func (minerController *controller) pollMiners(
 	now time.Time,
 ) {
 	output := minerController.outputWriter()
-	fmt.Fprintf(
-		output,
-		"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		"Hostname",
-		"Freq",
-		"VCore",
-		"State",
-		"Window",
-		"Temp",
-		"VRTemp",
-		"HRate/Expected",
-		"Watts",
-		"Fan",
-	)
-
 	results := make([]minerPollResult, len(miners))
 	jobs := make(chan pollJob, len(miners))
 	for index, miner := range miners {
@@ -416,7 +417,7 @@ func (minerController *controller) pollMiners(
 		if observation == nil {
 			continue
 		}
-		results[index].line = minerController.formatMinerLine(
+		results[index].columns = minerController.formatMinerColumns(
 			observation.state,
 			observation.info,
 			observation.settings,
@@ -427,19 +428,17 @@ func (minerController *controller) pollMiners(
 	}
 
 	sort.Slice(results, func(left int, right int) bool {
-		return results[left].line < results[right].line
+		return results[left].columns[0] < results[right].columns[0]
 	})
 	totalHashRate := 0.0
 	hashRateAvailable := false
 	for _, result := range results {
-		if result.line != "" {
-			fmt.Fprint(output, result.line)
-		}
 		if result.hashRateAvailable {
 			totalHashRate += result.hashRate
 			hashRateAvailable = true
 		}
 	}
+	writeMinerTable(output, results)
 	fmt.Fprintf(output, "\nTotal: %s\n\n", formatAggregateHashRate(totalHashRate, hashRateAvailable))
 }
 
@@ -553,16 +552,49 @@ func (minerController *controller) cachedASICSettings(
 	return settings, nil
 }
 
-func (minerController *controller) formatMinerLine(
+func writeMinerTable(output io.Writer, results []minerPollResult) {
+	rows := make([][minerColumnCount]string, 1, len(results)+1)
+	rows[0] = minerTableHeader
+	for _, result := range results {
+		if result.columns[0] != "" {
+			rows = append(rows, result.columns)
+		}
+	}
+
+	var widths [minerColumnCount]int
+	for _, row := range rows {
+		for index, value := range row {
+			widths[index] = max(widths[index], terminalTextWidth(value))
+		}
+	}
+	for _, row := range rows {
+		for index, value := range row {
+			fmt.Fprint(output, value)
+			if index < minerColumnCount-1 {
+				padding := widths[index] - terminalTextWidth(value) + 2
+				fmt.Fprint(output, strings.Repeat(" ", padding))
+			}
+		}
+		fmt.Fprintln(output)
+	}
+}
+
+func terminalTextWidth(value string) int {
+	for _, color := range [...]string{colorReset, colorRed, colorGreen, colorYellow} {
+		value = strings.ReplaceAll(value, color, "")
+	}
+	return utf8.RuneCountInString(value)
+}
+
+func (minerController *controller) formatMinerColumns(
 	state lib.MinerState,
 	info lib.Info,
 	settings lib.Settings,
 	now time.Time,
-) string {
-	return fmt.Sprintf(
-		"%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+) [minerColumnCount]string {
+	return [minerColumnCount]string{
 		info.Hostname,
-		info.Frequency,
+		fmt.Sprintf("%d", info.Frequency),
 		formatCoreVoltage(info),
 		formatState(state, info, now),
 		minerController.formatWindow(state, settings, now),
@@ -571,7 +603,7 @@ func (minerController *controller) formatMinerLine(
 		formatHashRate(info),
 		formatPower(info, settings),
 		formatFan(info),
-	)
+	}
 }
 
 func formatCoreVoltage(info lib.Info) string {
@@ -581,13 +613,17 @@ func formatCoreVoltage(info lib.Info) string {
 	return fmt.Sprintf("%d", info.CoreVoltage)
 }
 
+func colorize(color string, value string) string {
+	return color + value + colorReset
+}
+
 func validHashRate(hashRate float64) bool {
 	return hashRate >= 0 && !math.IsNaN(hashRate) && !math.IsInf(hashRate, 0)
 }
 
 func formatHashRate(info lib.Info) string {
 	if !validHashRate(info.HashRate) {
-		return colorYellow + "N/A" + colorReset
+		return colorize(colorYellow, "N/A")
 	}
 	formatted := fmt.Sprintf("%.0f", info.HashRate)
 	if info.ExpectedHashRate > 0 {
@@ -600,11 +636,11 @@ func formatHashRate(info lib.Info) string {
 	}
 	switch {
 	case info.OverHeatMode != 0:
-		return colorRed + formatted + colorReset
+		return colorize(colorRed, formatted)
 	case info.HashRate == 0:
-		return colorYellow + formatted + colorReset
+		return colorize(colorYellow, formatted)
 	default:
-		return colorGreen + formatted + colorReset
+		return colorize(colorGreen, formatted)
 	}
 }
 
@@ -621,60 +657,60 @@ func formatAggregateHashRate(hashRate float64, available bool) string {
 func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 	switch {
 	case info.OverHeatMode != 0 || state.Phase == lib.PhaseOverheat:
-		return colorRed + string(lib.PhaseOverheat) + colorReset
+		return colorize(colorRed, string(lib.PhaseOverheat))
 	case state.PendingKind != "" || state.MiningPending:
-		return colorYellow + "APPLYING" + colorReset
+		return colorize(colorYellow, "APPLYING")
 	case now.Before(state.CooldownUntil):
-		return colorYellow + string(lib.PhaseCooldown) + colorReset
+		return colorize(colorYellow, string(lib.PhaseCooldown))
 	case state.Phase == lib.PhaseHold:
-		return colorGreen + string(state.Phase) + colorReset
+		return colorize(colorGreen, string(state.Phase))
 	default:
-		return colorYellow + string(state.Phase) + colorReset
+		return colorize(colorYellow, string(state.Phase))
 	}
 }
 
 func formatTemp(info lib.Info, settings lib.Settings) string {
 	if info.Temp <= 0 {
-		return colorYellow + "N/A" + colorReset
+		return colorize(colorYellow, "N/A")
 	}
 	switch {
 	case info.Temp >= settings.TempCutoff:
-		return colorRed + fmt.Sprintf("%.0f", info.Temp) + colorReset
+		return colorize(colorRed, fmt.Sprintf("%.0f", info.Temp))
 	case info.Temp > settings.TempLimit:
-		return colorRed + fmt.Sprintf("%.0f", info.Temp) + colorReset
+		return colorize(colorRed, fmt.Sprintf("%.0f", info.Temp))
 	case info.Temp >= settings.TargetTemp:
-		return colorYellow + fmt.Sprintf("%.0f", info.Temp) + colorReset
+		return colorize(colorYellow, fmt.Sprintf("%.0f", info.Temp))
 	default:
-		return colorGreen + fmt.Sprintf("%.0f", info.Temp) + colorReset
+		return colorize(colorGreen, fmt.Sprintf("%.0f", info.Temp))
 	}
 }
 
 func formatVRTemp(info lib.Info, settings lib.Settings) string {
 	if info.VRTemp <= 0 {
-		return colorYellow + "N/A" + colorReset
+		return colorize(colorYellow, "N/A")
 	}
 	formatted := fmt.Sprintf("%.0f", info.VRTemp)
 	if info.VRTemp >= settings.VRTempHigh {
-		return colorRed + formatted + colorReset
+		return colorize(colorRed, formatted)
 	}
-	return colorGreen + formatted + colorReset
+	return colorize(colorGreen, formatted)
 }
 
 func formatPower(info lib.Info, settings lib.Settings) string {
 	if info.Power <= 0 {
-		return colorYellow + "N/A" + colorReset
+		return colorize(colorYellow, "N/A")
 	}
 	formatted := fmt.Sprintf("%.0f", info.Power)
 	if info.Power >= settings.MaxPower {
-		return colorRed + formatted + colorReset
+		return colorize(colorRed, formatted)
 	}
-	return colorGreen + formatted + colorReset
+	return colorize(colorGreen, formatted)
 }
 
 func formatFan(info lib.Info) string {
 	switch {
 	case info.FanSpeed <= 0 && info.FanRPM <= 0:
-		return colorYellow + "N/A" + colorReset
+		return colorize(colorYellow, "N/A")
 	case info.FanRPM > 0:
 		return fmt.Sprintf("%.0f%%/%d", info.FanSpeed, info.FanRPM)
 	default:

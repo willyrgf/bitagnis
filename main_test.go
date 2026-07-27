@@ -290,7 +290,7 @@ func healthyInfo() lib.Info {
 		Version:           supportedAxeOSVersion,
 		ASICModel:         supportedASICModel,
 		BoardVersion:      supportedBoardVersion,
-		Hostname:          "mineira",
+		Hostname:          "bitaxe-alpha",
 		MacAddr:           "aa:bb:cc:dd:ee:ff",
 		Frequency:         400,
 		CoreVoltage:       1100,
@@ -314,7 +314,7 @@ func discovered(info lib.Info, ip string) lib.DiscoveredMiner {
 func optimizerState(now time.Time) lib.MinerState {
 	state := lib.MinerState{
 		MacAddr:        "aa:bb:cc:dd:ee:ff",
-		Hostname:       "mineira",
+		Hostname:       "bitaxe-alpha",
 		IP:             "192.0.2.10",
 		Phase:          lib.PhaseHold,
 		PhaseStartedAt: now,
@@ -360,13 +360,13 @@ func healthySummary(hash float64, expected float64) windowSummary {
 }
 
 func TestParseArgumentsRejectsUnknownFlagsAndScopesReapply(t *testing.T) {
-	options, err := parseArguments([]string{"--reapply-mining", "mineira", "mineiro"})
+	options, err := parseArguments([]string{"--reapply-mining", "bitaxe-alpha", "bitaxe-beta"})
 	if err != nil {
 		t.Fatalf("parse reapply arguments: %v", err)
 	}
 	if len(options.hostnames) != 2 ||
-		!options.reapply["mineira"] ||
-		!options.reapply["mineiro"] {
+		!options.reapply["bitaxe-alpha"] ||
+		!options.reapply["bitaxe-beta"] {
 		t.Fatalf("parsed options = %+v", options)
 	}
 	if _, err := parseArguments([]string{"--reapply-mining"}); err == nil {
@@ -1027,12 +1027,12 @@ func TestPollMinersReportsOperatingPointsAndAggregateHash(t *testing.T) {
 			info := healthyInfo()
 			switch ip {
 			case "192.0.2.10":
-				info.Hostname = "mineira"
+				info.Hostname = "bitaxe-alpha"
 				info.MacAddr = "aa:bb:cc:dd:ee:10"
 				info.HashRate = 800
 				info.ExpectedHashRate = 816
 			case "192.0.2.11":
-				info.Hostname = "mineiro"
+				info.Hostname = "bitaxe-beta"
 				info.MacAddr = "aa:bb:cc:dd:ee:11"
 				info.Frequency = 600
 				info.CoreVoltage = 1100
@@ -1063,22 +1063,97 @@ func TestPollMinersReportsOperatingPointsAndAggregateHash(t *testing.T) {
 	)
 
 	got := output.String()
+	plain := strings.NewReplacer(
+		colorReset, "",
+		colorRed, "",
+		colorGreen, "",
+		colorYellow, "",
+	).Replace(got)
 	for _, expected := range []string{
-		"Hostname\tFreq\tVCore\tState\tWindow",
-		"mineira\t400\t1100/1085",
+		"Hostname      Freq  VCore",
+		"bitaxe-alpha  400   1100/1085",
 		"800/816 98%",
-		"mineiro\t600\t1100/1080",
+		"bitaxe-beta   600   1100/1080",
 		"1175/1224 96%",
 		"100%/8450",
 		"Total: 1.98 Th/s",
 	} {
-		if !strings.Contains(got, expected) {
+		if !strings.Contains(plain, expected) {
 			t.Fatalf("output does not contain %q:\n%s", expected, got)
+		}
+	}
+	lines := strings.Split(plain, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("terminal output has fewer than three lines:\n%s", got)
+	}
+	for _, check := range []struct {
+		header string
+		first  string
+		second string
+	}{
+		{header: "Freq", first: "400", second: "600"},
+		{header: "VCore", first: "1100/1085", second: "1100/1080"},
+		{header: "State", first: "BASELINE", second: "BASELINE"},
+		{header: "Window", first: "ramp 2s", second: "ramp 2s"},
+		{header: "Temp", first: "62", second: "62"},
+		{header: "VRTemp", first: "49", second: "49"},
+		{header: "HRate/Expected", first: "800/816 98%", second: "1175/1224 96%"},
+		{header: "Watts", first: "15", second: "15"},
+		{header: "Fan", first: "100%/8450", second: "100%/8450"},
+	} {
+		want := strings.Index(lines[0], check.header)
+		first := strings.Index(lines[1], check.first)
+		second := strings.Index(lines[2], check.second)
+		if want < 0 || first != want || second != want {
+			t.Fatalf(
+				"%s column starts at header/rows %d/%d/%d:\n%s",
+				check.header,
+				want,
+				first,
+				second,
+				plain,
+			)
 		}
 	}
 	if strings.Contains(got, "synthetic-user") ||
 		strings.Contains(got, "synthetic-fallback-user") {
 		t.Fatalf("terminal output exposed a pool user:\n%s", got)
+	}
+}
+
+func TestPollMinersRendersTableAfterPollLogs(t *testing.T) {
+	info := healthyInfo()
+	devices := &fakeDeviceAPI{
+		getInfo:      func(context.Context, string) (lib.Info, error) { return info, nil },
+		asicSettings: gammaASIC(),
+	}
+	var output bytes.Buffer
+	minerController := testController(devices, newMemoryOptimizerStore(), &output)
+	minerController.output = &output
+
+	minerController.pollMiners(
+		context.Background(),
+		[]lib.DiscoveredMiner{discovered(info, "192.0.2.10")},
+		time.Now(),
+	)
+
+	got := output.String()
+	logPosition := strings.Index(got, "Bootstrapping bitaxe-alpha")
+	headerPosition := strings.Index(got, "Hostname")
+	rowPosition := strings.Index(got, "\nbitaxe-alpha")
+	if rowPosition >= 0 {
+		rowPosition++
+	}
+	if logPosition < 0 ||
+		headerPosition <= logPosition ||
+		rowPosition <= headerPosition {
+		t.Fatalf(
+			"log/header/row positions = %d/%d/%d:\n%s",
+			logPosition,
+			headerPosition,
+			rowPosition,
+			got,
+		)
 	}
 }
 

@@ -131,7 +131,7 @@ func TestLoadSettingsMergesPerHostOptimizerOverrides(t *testing.T) {
   targetTemp: 65
   tempLimit: 66
 overrides:
-  mineira:
+  bitaxe-alpha:
     targetTemp: 64
     tempLimit: 65
     rampUpSeconds: 90
@@ -140,16 +140,16 @@ overrides:
 	if err != nil {
 		t.Fatalf("LoadSettings returned an error: %v", err)
 	}
-	mineira, err := settingsFile.ForHost("mineira")
+	bitaxeAlpha, err := settingsFile.ForHost("bitaxe-alpha")
 	if err != nil {
-		t.Fatalf("resolve mineira settings: %v", err)
+		t.Fatalf("resolve bitaxe-alpha settings: %v", err)
 	}
-	if mineira.TargetTemp != 64 || mineira.TempLimit != 65 {
-		t.Fatalf("mineira optimizer overrides = %+v", mineira)
+	if bitaxeAlpha.TargetTemp != 64 || bitaxeAlpha.TempLimit != 65 {
+		t.Fatalf("bitaxe-alpha optimizer overrides = %+v", bitaxeAlpha)
 	}
-	if mineira.RampUpTime != 90*time.Second ||
-		mineira.EvaluationWindowTime != 10*time.Minute {
-		t.Fatalf("mineira intervals = %+v", mineira)
+	if bitaxeAlpha.RampUpTime != 90*time.Second ||
+		bitaxeAlpha.EvaluationWindowTime != 10*time.Minute {
+		t.Fatalf("bitaxe-alpha intervals = %+v", bitaxeAlpha)
 	}
 }
 
@@ -157,18 +157,18 @@ func TestLoadSettingsCanOverrideSkipWithFalse(t *testing.T) {
 	settingsFile, err := loadTestSettings(t, `defaults:
   skip: true
 overrides:
-  mineira:
+  bitaxe-alpha:
     skip: false
 `)
 	if err != nil {
 		t.Fatalf("LoadSettings returned an error: %v", err)
 	}
-	mineira, err := settingsFile.ForHost("mineira")
+	bitaxeAlpha, err := settingsFile.ForHost("bitaxe-alpha")
 	if err != nil {
-		t.Fatalf("resolve mineira settings: %v", err)
+		t.Fatalf("resolve bitaxe-alpha settings: %v", err)
 	}
-	if mineira.Skip {
-		t.Fatal("mineira remained skipped, want explicit false override")
+	if bitaxeAlpha.Skip {
+		t.Fatal("bitaxe-alpha remained skipped, want explicit false override")
 	}
 }
 
@@ -187,13 +187,13 @@ func TestLoadSettingsMergesNestedMiningSettingsPerHost(t *testing.T) {
       user: common-worker
       passwordEnv: BITAGNIS_FALLBACK_PASSWORD
 overrides:
-  mineira:
+  bitaxe-alpha:
     mining:
       enabled: true
       primary:
-        user: worker-mineira
+        user: worker-bitaxe-alpha
       fallback:
-        user: worker-mineira
+        user: worker-bitaxe-alpha
 `)
 	if err != nil {
 		t.Fatalf("LoadSettings returned an error: %v", err)
@@ -205,16 +205,16 @@ overrides:
 	if defaults.Mining.Enabled {
 		t.Fatal("mining was not disabled by default")
 	}
-	mineira, err := settingsFile.ForHost("mineira")
+	bitaxeAlpha, err := settingsFile.ForHost("bitaxe-alpha")
 	if err != nil {
-		t.Fatalf("resolve mineira: %v", err)
+		t.Fatalf("resolve bitaxe-alpha: %v", err)
 	}
-	if !mineira.Mining.Enabled ||
-		mineira.Mining.Primary.Host != "pool.example.net" ||
-		mineira.Mining.Primary.User != "worker-mineira" ||
-		mineira.Mining.Fallback.Port != 4444 ||
-		mineira.Mining.Fallback.User != "worker-mineira" {
-		t.Fatalf("merged mining settings = %+v", mineira.Mining)
+	if !bitaxeAlpha.Mining.Enabled ||
+		bitaxeAlpha.Mining.Primary.Host != "pool.example.net" ||
+		bitaxeAlpha.Mining.Primary.User != "worker-bitaxe-alpha" ||
+		bitaxeAlpha.Mining.Fallback.Port != 4444 ||
+		bitaxeAlpha.Mining.Fallback.User != "worker-bitaxe-alpha" {
+		t.Fatalf("merged mining settings = %+v", bitaxeAlpha.Mining)
 	}
 }
 
@@ -239,7 +239,7 @@ func TestLoadSettingsRequiresCompleteEnabledMiningConfiguration(t *testing.T) {
       user: worker
       passwordEnv: BITAGNIS_PRIMARY_PASSWORD
 overrides:
-  mineira:
+  bitaxe-alpha:
     mining:
       enabled: true
 `)
@@ -263,7 +263,7 @@ func TestLoadSettingsAllowsDefaultMiningEnablement(t *testing.T) {
       user: worker
       passwordEnv: BITAGNIS_FALLBACK_PASSWORD
 overrides:
-  mineira:
+  bitaxe-alpha:
     mining:
       enabled: false
 `)
@@ -274,15 +274,15 @@ overrides:
 	if err != nil {
 		t.Fatalf("resolve defaults: %v", err)
 	}
-	mineira, err := settingsFile.ForHost("mineira")
+	bitaxeAlpha, err := settingsFile.ForHost("bitaxe-alpha")
 	if err != nil {
-		t.Fatalf("resolve mineira: %v", err)
+		t.Fatalf("resolve bitaxe-alpha: %v", err)
 	}
-	if !defaults.Mining.Enabled || mineira.Mining.Enabled {
+	if !defaults.Mining.Enabled || bitaxeAlpha.Mining.Enabled {
 		t.Fatalf(
 			"default/override mining enabled = %v/%v, want true/false",
 			defaults.Mining.Enabled,
-			mineira.Mining.Enabled,
+			bitaxeAlpha.Mining.Enabled,
 		)
 	}
 }
@@ -391,10 +391,10 @@ func TestLoadSettingsRejectsUnsafeThresholds(t *testing.T) {
 			name: "zero override",
 			settings: `defaults: {}
 overrides:
-  mineira:
+  bitaxe-alpha:
     evaluationWindowMinutes: 0
 `,
-			want: `override for "mineira"`,
+			want: `override for "bitaxe-alpha"`,
 		},
 	}
 	for _, test := range tests {

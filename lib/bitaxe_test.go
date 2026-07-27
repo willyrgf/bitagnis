@@ -54,7 +54,7 @@ func validInfoJSON() string {
 		"version":"v2.8.1",
 		"ASICModel":"BM1370",
 		"boardVersion":"601",
-		"hostname":"mineira",
+		"hostname":"bitaxe-alpha",
 		"macAddr":"AA:BB:CC:DD:EE:FF",
 		"frequency":400,
 		"coreVoltage":1100,
