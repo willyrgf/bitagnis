@@ -27,6 +27,13 @@ go.work.sum
 # env file
 .env
 
+# Local Bitagnis configuration and runtime state
+/settings.yaml
+/optimizer.db
+
+# Locally built application binary
+/bitagnis
+
 # Editor/IDE
 # .idea/
 # .vscode/

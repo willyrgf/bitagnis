@@ -1,0 +1,27 @@
+defaults:
+  # Explore below the target, hold between target and limit, and roll back
+  # above the limit. The cutoff remains the emergency threshold.
+  recoveryTemp: 61
+  targetTemp: 65
+  tempLimit: 66
+  tempCutoff: 70
+
+  # Board limits. New trials require 2 W and 10% VR-temperature headroom.
+  maxPower: 24
+  vrTempHigh: 97
+
+  # Optional AxeOS ASIC error telemetry is a health constraint.
+  maxErrorPercentage: 5
+
+  # Each trial ramps for 60 seconds, then collects a five-minute window.
+  metricsInterval: 10
+  rampUpSeconds: 60
+  evaluationWindowMinutes: 5
+
+  # Repeated overheats multiply this cooldown, capped at 24 hours.
+  overheatCooldownMinutes: 120
+
+# Every value except metricsInterval can be overridden by hostname.
+overrides:
+  bitaxe-example:
+    maxPower: 24
