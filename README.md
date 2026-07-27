@@ -87,7 +87,7 @@ reader. An old, partial, or unknown database is rejected without modification;
 move it aside or remove it to create the current baseline. Evaluated history,
 cooldown, and pending mutation obligations persist across ordinary restarts
 after that baseline is created. Raw telemetry and Stratum credentials are never
-stored.
+stored in the optimizer database.
 
 If AxeOS settings are changed manually while Bitagnis is running, two consecutive
 polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
@@ -137,24 +137,39 @@ overrides:
 ```
 
 Every value except the global metrics interval may be overridden by hostname.
-Unknown keys are rejected during startup. The mining default must remain
-disabled; only an explicit hostname override may enable it. When enabled, both
-pools must be complete, hosts must be bare DNS names or IPv4 addresses, and
-`passwordEnv` names portable environment variables. Literal password keys are
-rejected. Resolved passwords are never printed or persisted.
+Unknown keys are rejected during startup. Mining may be enabled in the defaults
+for every selected miner and disabled or customized by hostname overrides. When
+enabled, both pools must be complete, hosts must be bare DNS names or IPv4
+addresses, and `passwordEnv` names portable entries in the local `.env` file.
+Literal password keys are rejected. Resolved passwords are never printed or
+persisted by Bitagnis. Enabling mining in the defaults authorizes reconciliation
+for every selected miner; it does not waive the new-deployment canary procedure
+below.
 
-Matching readable pool settings cause no PATCH, restart, or environment-secret
-lookup. AxeOS does not return passwords, so explicitly reapply a password-only
-change for named enabled miners:
+In clean durable state, matching readable pool settings cause no PATCH, restart,
+or `.env` lookup. A pending mining obligation still resumes after a crash.
+AxeOS does not return passwords, so explicitly reapply a password-only change
+for named enabled miners. Put the named entries in the ignored `.env` file:
+
+```dotenv
+BITAGNIS_PRIMARY_STRATUM_PASSWORD='synthetic-example'
+BITAGNIS_FALLBACK_STRATUM_PASSWORD='synthetic-example'
+```
+
+Then run:
 
 ```sh
-BITAGNIS_PRIMARY_STRATUM_PASSWORD='synthetic-example' \
-BITAGNIS_FALLBACK_STRATUM_PASSWORD='synthetic-example' \
 ./bitagnis --reapply-mining bitaxe-example
 ```
 
-Do not place real values in shell history, YAML, tests, or diagnostics. Provide
-the variables through the operator's secret-aware process environment.
+The supported `.env` syntax is blank lines, full-line `#` comments, and
+`NAME=VALUE` entries. Values may be unquoted or wrapped in single or double
+quotes. Bitagnis reads both passwords from one file snapshot only when a mining
+PATCH is required; it does not fall back to process environment variables.
+
+Keep `.env` owner-readable only and provision it without placing real values in
+shell history. It is ignored by Git. Never place real values in YAML, tests,
+examples, or diagnostics.
 
 ## Output
 

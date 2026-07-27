@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -26,6 +27,7 @@ const (
 	defaultRampUpSeconds        = 60
 	defaultEvaluationWindowMins = 5
 	defaultOverheatCooldownMins = 120
+	maxPasswordFileBytes        = 64 * 1024
 )
 
 type Settings struct {
@@ -56,8 +58,8 @@ type MiningSettings struct {
 	Fallback PoolSettings `yaml:"fallback"`
 }
 
-// PoolSettings identifies one desired Stratum endpoint and the environment
-// variable that supplies its write-only password.
+// PoolSettings identifies one desired Stratum endpoint and the dotenv entry
+// that supplies its write-only password.
 type PoolSettings struct {
 	Host        string `yaml:"host"`
 	Port        int    `yaml:"port"`
@@ -127,11 +129,6 @@ func LoadSettings(path string) (SettingsFile, error) {
 	}
 
 	settingsFile.Defaults = withDefaults(settingsFile.Defaults)
-	if settingsFile.Defaults.Mining.Enabled {
-		return SettingsFile{}, fmt.Errorf(
-			"settings defaults: mining.enabled must be false; enable mining in an explicit hostname override",
-		)
-	}
 	if err := validateSettings(settingsFile.Defaults); err != nil {
 		return SettingsFile{}, fmt.Errorf("settings defaults: %w", err)
 	}
@@ -153,6 +150,106 @@ func LoadSettings(path string) (SettingsFile, error) {
 		}
 	}
 	return settingsFile, nil
+}
+
+// LoadMiningPasswords reads the primary and fallback passwords named by
+// settings from one dotenv file snapshot.
+func LoadMiningPasswords(
+	path string,
+	settings MiningSettings,
+) (string, string, error) {
+	if !settings.Enabled {
+		return "", "", fmt.Errorf("mining is not enabled")
+	}
+	if err := validateMiningSettings(settings); err != nil {
+		return "", "", err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return "", "", fmt.Errorf("open password file %q: %w", path, err)
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxPasswordFileBytes+1))
+	if err != nil {
+		return "", "", fmt.Errorf("read password file %q: %w", path, err)
+	}
+	if len(data) > maxPasswordFileBytes {
+		return "", "", fmt.Errorf(
+			"read password file %q: file exceeds %d bytes",
+			path,
+			maxPasswordFileBytes,
+		)
+	}
+	values, err := parseDotEnv(data)
+	if err != nil {
+		return "", "", fmt.Errorf("parse password file %q: %w", path, err)
+	}
+
+	primary, primaryExists := values[settings.Primary.PasswordEnv]
+	if !primaryExists {
+		return "", "", fmt.Errorf("primary password entry is unavailable")
+	}
+	fallback, fallbackExists := values[settings.Fallback.PasswordEnv]
+	if !fallbackExists {
+		return "", "", fmt.Errorf("fallback password entry is unavailable")
+	}
+	if err := validateResolvedPassword("primary", primary); err != nil {
+		return "", "", fmt.Errorf("primary password entry is invalid")
+	}
+	if err := validateResolvedPassword("fallback", fallback); err != nil {
+		return "", "", fmt.Errorf("fallback password entry is invalid")
+	}
+	return primary, fallback, nil
+}
+
+func parseDotEnv(data []byte) (map[string]string, error) {
+	values := make(map[string]string)
+	for index, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.TrimSpace(line) == "" ||
+			strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found {
+			return nil, fmt.Errorf("line %d must use NAME=VALUE", index+1)
+		}
+		if !validDotEnvName(name) {
+			return nil, fmt.Errorf("line %d has an invalid name", index+1)
+		}
+		if _, exists := values[name]; exists {
+			return nil, fmt.Errorf("line %d duplicates an entry", index+1)
+		}
+		value, err := parseDotEnvValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("line %d has an invalid value", index+1)
+		}
+		values[name] = value
+	}
+	return values, nil
+}
+
+func parseDotEnvValue(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	switch value[0] {
+	case '\'':
+		if len(value) < 2 || value[len(value)-1] != '\'' {
+			return "", fmt.Errorf("unterminated single-quoted value")
+		}
+		return value[1 : len(value)-1], nil
+	case '"':
+		unquoted, err := strconv.Unquote(value)
+		if err != nil {
+			return "", fmt.Errorf("invalid double-quoted value")
+		}
+		return unquoted, nil
+	default:
+		return value, nil
+	}
 }
 
 func (settingsFile SettingsFile) ForHost(hostname string) (Settings, error) {
@@ -339,7 +436,7 @@ func validatePoolSettings(name string, settings PoolSettings) error {
 		return fmt.Errorf("mining %s port must be between 1 and 65535", name)
 	case !validPoolText(settings.User):
 		return fmt.Errorf("mining %s user must be non-empty, at most 255 bytes, and have no surrounding whitespace or control characters", name)
-	case !validEnvironmentName(settings.PasswordEnv):
+	case !validDotEnvName(settings.PasswordEnv):
 		return fmt.Errorf("mining %s passwordEnv is invalid", name)
 	default:
 		return nil
@@ -385,7 +482,7 @@ func validPoolText(value string) bool {
 		!hasControl(value)
 }
 
-func validEnvironmentName(value string) bool {
+func validDotEnvName(value string) bool {
 	if value == "" ||
 		len([]byte(value)) > 255 ||
 		strings.TrimSpace(value) != value ||

@@ -21,9 +21,9 @@ defaults:
   # Repeated overheats multiply this cooldown, capped at 24 hours.
   overheatCooldownMinutes: 120
 
-  # Mining reconciliation is inactive unless an effective hostname setting
-  # explicitly enables it. Passwords are read from the named environment
-  # variables only when a PATCH is required.
+  # Set enabled here to apply mining settings to every selected miner, or
+  # override it per hostname. Passwords are read from the named .env entries
+  # only when a PATCH is required.
   mining:
     enabled: false
     primary:

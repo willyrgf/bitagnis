@@ -161,7 +161,9 @@ func run(ctx context.Context, arguments []string) error {
 		miners,
 		options.reapply,
 		rediscover,
-		os.LookupEnv,
+		func(settings lib.MiningSettings) (string, string, error) {
+			return lib.LoadMiningPasswords(".env", settings)
+		},
 		log.Default(),
 		minerController.resetRuntime,
 	)

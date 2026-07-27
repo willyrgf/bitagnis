@@ -71,7 +71,7 @@ func testMutationCoordinator(
 	info lib.Info,
 	reapply map[string]bool,
 	discover mutationDiscovery,
-	getenv func(string) (string, bool),
+	resolvePasswords miningPasswordResolver,
 	logger *log.Logger,
 ) *mutationCoordinator {
 	coordinator := newMutationCoordinator(
@@ -81,12 +81,18 @@ func testMutationCoordinator(
 		[]lib.DiscoveredMiner{discovered(info, "192.0.2.10")},
 		reapply,
 		discover,
-		getenv,
+		resolvePasswords,
 		logger,
 		func(string) {},
 	)
 	coordinator.rediscoveryDelay = 0
 	return coordinator
+}
+
+func fixedMiningPasswords(password string) miningPasswordResolver {
+	return func(lib.MiningSettings) (string, string, error) {
+		return password, password, nil
+	}
 }
 
 func waitForMutation(
@@ -583,7 +589,7 @@ func TestOperatingPointIntentIsRecheckedAfterASICRead(t *testing.T) {
 	}
 }
 
-func TestMatchingMiningConfigurationDoesNotResolveSecretsOrMutate(t *testing.T) {
+func TestMatchingDefaultMiningConfigurationDoesNotResolveSecretsOrMutate(t *testing.T) {
 	now := time.Now()
 	info := matchingMiningInfo()
 	state := optimizerState(now)
@@ -593,7 +599,7 @@ func TestMatchingMiningConfigurationDoesNotResolveSecretsOrMutate(t *testing.T) 
 		getInfo:      func(context.Context, string) (lib.Info, error) { return info, nil },
 		asicSettings: gammaASIC(),
 	}
-	var environmentReads atomic.Int32
+	var passwordReads atomic.Int32
 	coordinator := testMutationCoordinator(
 		devices,
 		states,
@@ -603,9 +609,9 @@ func TestMatchingMiningConfigurationDoesNotResolveSecretsOrMutate(t *testing.T) 
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return lib.DiscoveredMiner{}, errMinerNotFound
 		},
-		func(string) (string, bool) {
-			environmentReads.Add(1)
-			return "must-not-be-read", true
+		func(lib.MiningSettings) (string, string, error) {
+			passwordReads.Add(1)
+			return "must-not-be-read", "must-not-be-read", nil
 		},
 		nil,
 	)
@@ -627,16 +633,65 @@ func TestMatchingMiningConfigurationDoesNotResolveSecretsOrMutate(t *testing.T) 
 		t.Fatalf("open startup gate: %v", err)
 	}
 	if !coordinator.GateOpen() ||
-		environmentReads.Load() != 0 ||
+		passwordReads.Load() != 0 ||
 		len(devices.miningRequests()) != 0 ||
 		len(devices.restartRequests()) != 0 {
 		t.Fatalf(
-			"gate/env/mining/restarts = %v/%d/%d/%d",
+			"gate/passwords/mining/restarts = %v/%d/%d/%d",
 			coordinator.GateOpen(),
-			environmentReads.Load(),
+			passwordReads.Load(),
 			len(devices.miningRequests()),
 			len(devices.restartRequests()),
 		)
+	}
+}
+
+func TestPasswordFileFailureBlocksMiningMutationButNotSafetyPolling(t *testing.T) {
+	now := time.Now()
+	info := matchingMiningInfo()
+	info.StratumUser = "old-worker"
+	state := optimizerState(now)
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	devices := &fakeDeviceAPI{
+		getInfo:      func(context.Context, string) (lib.Info, error) { return info, nil },
+		asicSettings: gammaASIC(),
+	}
+	var passwordReads atomic.Int32
+	coordinator := testMutationCoordinator(
+		devices,
+		states,
+		mutationSettings(true),
+		info,
+		nil,
+		func(context.Context, string) (lib.DiscoveredMiner, error) {
+			return lib.DiscoveredMiner{}, errMinerNotFound
+		},
+		func(lib.MiningSettings) (string, string, error) {
+			passwordReads.Add(1)
+			return "", "", errors.New("password file is unavailable")
+		},
+		nil,
+	)
+	observations := map[string]*minerObservation{
+		state.MacAddr: observation(info, state, mutationSettings(true)),
+	}
+
+	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+		t.Fatalf("Advance returned a password-file error: %v", err)
+	}
+	if passwordReads.Load() != 1 ||
+		len(devices.miningRequests()) != 0 ||
+		len(devices.restartRequests()) != 0 {
+		t.Fatalf(
+			"passwords/mining/restarts = %d/%d/%d",
+			passwordReads.Load(),
+			len(devices.miningRequests()),
+			len(devices.restartRequests()),
+		)
+	}
+	if !states.getState(state.MacAddr).MiningPending {
+		t.Fatal("mining obligation was not preserved after password-file failure")
 	}
 }
 
@@ -660,7 +715,7 @@ func TestNamedReapplyMutatesMatchingEnabledMiningConfiguration(t *testing.T) {
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return lib.DiscoveredMiner{}, errMinerNotFound
 		},
-		func(string) (string, bool) { return "synthetic-password", true },
+		fixedMiningPasswords("synthetic-password"),
 		nil,
 	)
 	waitForMutation(t, coordinator, func() map[string]*minerObservation {
@@ -701,7 +756,7 @@ func TestExistingMiningObligationConsumesReapplyWithoutDuplicateMutation(t *test
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return discovered(post, state.IP), nil
 		},
-		func(string) (string, bool) { return "synthetic-password", true },
+		fixedMiningPasswords("synthetic-password"),
 		nil,
 	)
 	coordinator.now = func() time.Time { return now }
@@ -799,8 +854,10 @@ func TestMiningDriftUsesCompleteRestartVerifiedFlowAndPrimaryHealth(t *testing.T
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return discovered(post, "192.0.2.77"), nil
 		},
-		func(name string) (string, bool) {
-			return "synthetic-" + name, true
+		func(settings lib.MiningSettings) (string, string, error) {
+			return "synthetic-" + settings.Primary.PasswordEnv,
+				"synthetic-" + settings.Fallback.PasswordEnv,
+				nil
 		},
 		nil,
 	)
@@ -1025,7 +1082,7 @@ func TestFirstMinerMiningFailureStopsSecondAndRedactsSecrets(t *testing.T) {
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return lib.DiscoveredMiner{}, errMinerNotFound
 		},
-		func(string) (string, bool) { return secret, true },
+		fixedMiningPasswords(secret),
 		log.New(&logs, "", 0),
 		func(string) {},
 	)
@@ -1092,7 +1149,7 @@ func TestResolvedSecretsNeverEnterSQLiteOrErrors(t *testing.T) {
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return lib.DiscoveredMiner{}, errMinerNotFound
 		},
-		func(string) (string, bool) { return secret, true },
+		fixedMiningPasswords(secret),
 		log.New(&logs, "", 0),
 	)
 	waitForMutation(t, coordinator, func() map[string]*minerObservation {
@@ -1191,7 +1248,7 @@ func TestSafetyIntentCancelsActiveMiningWithoutBlockingReplay(t *testing.T) {
 		func(context.Context, string) (lib.DiscoveredMiner, error) {
 			return lib.DiscoveredMiner{}, errMinerNotFound
 		},
-		func(string) (string, bool) { return "synthetic-password", true },
+		fixedMiningPasswords("synthetic-password"),
 		nil,
 	)
 	observations := func() map[string]*minerObservation {
@@ -1457,7 +1514,7 @@ func TestMiningCompletionFailureDoesNotRetryInSameLaunch(t *testing.T) {
 			states.mu.Unlock()
 			return discovered(post, state.IP), nil
 		},
-		func(string) (string, bool) { return "synthetic-password", true },
+		fixedMiningPasswords("synthetic-password"),
 		nil,
 	)
 	coordinator.now = func() time.Time { return now }

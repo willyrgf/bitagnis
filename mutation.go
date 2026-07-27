@@ -39,16 +39,18 @@ type minerObservation struct {
 
 type mutationDiscovery func(context.Context, string) (lib.DiscoveredMiner, error)
 
+type miningPasswordResolver func(lib.MiningSettings) (string, string, error)
+
 type mutationCoordinator struct {
 	mu sync.Mutex
 
-	devices  deviceAPI
-	states   optimizerStateStore
-	settings lib.SettingsFile
-	discover mutationDiscovery
-	getenv   func(string) (string, bool)
-	logger   *log.Logger
-	reset    func(string)
+	devices          deviceAPI
+	states           optimizerStateStore
+	settings         lib.SettingsFile
+	discover         mutationDiscovery
+	resolvePasswords miningPasswordResolver
+	logger           *log.Logger
+	reset            func(string)
 
 	routes            map[string]lib.DiscoveredMiner
 	expectedHostnames map[string]string
@@ -111,7 +113,7 @@ func newMutationCoordinator(
 	discovered []lib.DiscoveredMiner,
 	reapply map[string]bool,
 	discover mutationDiscovery,
-	getenv func(string) (string, bool),
+	resolvePasswords miningPasswordResolver,
 	logger *log.Logger,
 	reset func(string),
 ) *mutationCoordinator {
@@ -122,8 +124,10 @@ func newMutationCoordinator(
 		selected = append(selected, miner.Info.MacAddr)
 	}
 	sort.Strings(selected)
-	if getenv == nil {
-		getenv = func(string) (string, bool) { return "", false }
+	if resolvePasswords == nil {
+		resolvePasswords = func(lib.MiningSettings) (string, string, error) {
+			return "", "", fmt.Errorf("password source is unavailable")
+		}
 	}
 	if logger == nil {
 		logger = log.Default()
@@ -136,7 +140,7 @@ func newMutationCoordinator(
 		states:             states,
 		settings:           settings,
 		discover:           discover,
-		getenv:             getenv,
+		resolvePasswords:   resolvePasswords,
 		logger:             logger,
 		reset:              reset,
 		routes:             routes,
@@ -826,19 +830,15 @@ func (coordinator *mutationCoordinator) cancelSupersededLocked(
 func (coordinator *mutationCoordinator) resolveMiningPasswords(
 	settings lib.MiningSettings,
 ) (string, string, error) {
-	primary, primaryExists := coordinator.getenv(settings.Primary.PasswordEnv)
-	if !primaryExists {
-		return "", "", fmt.Errorf("primary password environment variable is unavailable")
-	}
-	fallback, fallbackExists := coordinator.getenv(settings.Fallback.PasswordEnv)
-	if !fallbackExists {
-		return "", "", fmt.Errorf("fallback password environment variable is unavailable")
+	primary, fallback, err := coordinator.resolvePasswords(settings)
+	if err != nil {
+		return "", "", fmt.Errorf("load passwords from .env: %w", err)
 	}
 	if err := validResolvedPassword(primary); err != nil {
-		return "", "", fmt.Errorf("primary password environment variable is invalid")
+		return "", "", fmt.Errorf("primary password entry is invalid")
 	}
 	if err := validResolvedPassword(fallback); err != nil {
-		return "", "", fmt.Errorf("fallback password environment variable is invalid")
+		return "", "", fmt.Errorf("fallback password entry is invalid")
 	}
 	return primary, fallback, nil
 }

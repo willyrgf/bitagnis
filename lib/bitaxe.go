@@ -294,7 +294,7 @@ func validateOperatingPoint(point OperatingPoint) error {
 
 func validateResolvedPassword(name string, password string) error {
 	if password == "" {
-		return fmt.Errorf("%s password environment variable is empty", name)
+		return fmt.Errorf("%s password is empty", name)
 	}
 	if !utf8.ValidString(password) || len([]byte(password)) > 255 {
 		return fmt.Errorf("%s password must be valid UTF-8 and at most 255 bytes", name)

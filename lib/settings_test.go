@@ -56,6 +56,75 @@ func TestExampleSettingsLoads(t *testing.T) {
 	}
 }
 
+func TestLoadMiningPasswordsReadsOneDotEnvSnapshot(t *testing.T) {
+	settings := enabledMiningSettings()
+	path := filepath.Join(t.TempDir(), ".env")
+	contents := `# Synthetic test credentials.
+BITAGNIS_PRIMARY_PASSWORD='synthetic-primary=#value'
+BITAGNIS_FALLBACK_PASSWORD="synthetic-fallback=\"quoted\""
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	primary, fallback, err := LoadMiningPasswords(path, settings)
+	if err != nil {
+		t.Fatalf("LoadMiningPasswords returned an error: %v", err)
+	}
+	if primary != "synthetic-primary=#value" ||
+		fallback != `synthetic-fallback="quoted"` {
+		t.Fatalf("passwords were not parsed as expected")
+	}
+}
+
+func TestLoadMiningPasswordsDoesNotFallBackToProcessEnvironment(t *testing.T) {
+	settings := enabledMiningSettings()
+	t.Setenv(settings.Primary.PasswordEnv, "synthetic-process-primary")
+	t.Setenv(settings.Fallback.PasswordEnv, "synthetic-process-fallback")
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	_, _, err := LoadMiningPasswords(path, settings)
+	if err == nil || !strings.Contains(err.Error(), "primary password entry is unavailable") {
+		t.Fatalf("error = %v, want missing .env entry", err)
+	}
+}
+
+func TestLoadMiningPasswordsRejectsMalformedFileWithoutExposingSecret(t *testing.T) {
+	const secret = "synthetic-secret-sentinel"
+	settings := enabledMiningSettings()
+	path := filepath.Join(t.TempDir(), ".env")
+	contents := settings.Primary.PasswordEnv + "=\"" + secret + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	_, _, err := LoadMiningPasswords(path, settings)
+	if err == nil || !strings.Contains(err.Error(), "line 1 has an invalid value") {
+		t.Fatalf("error = %v, want malformed value rejection", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("password file error exposed the secret")
+	}
+}
+
+func TestLoadMiningPasswordsRejectsDuplicateEntries(t *testing.T) {
+	settings := enabledMiningSettings()
+	path := filepath.Join(t.TempDir(), ".env")
+	contents := settings.Primary.PasswordEnv + "=synthetic-first\n" +
+		settings.Primary.PasswordEnv + "=synthetic-second\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	_, _, err := LoadMiningPasswords(path, settings)
+	if err == nil || !strings.Contains(err.Error(), "line 2 duplicates an entry") {
+		t.Fatalf("error = %v, want duplicate rejection", err)
+	}
+}
+
 func TestLoadSettingsMergesPerHostOptimizerOverrides(t *testing.T) {
 	settingsFile, err := loadTestSettings(t, `defaults:
   recoveryTemp: 61
@@ -179,8 +248,8 @@ overrides:
 	}
 }
 
-func TestLoadSettingsRequiresHostnameScopedMiningEnablement(t *testing.T) {
-	_, err := loadTestSettings(t, `defaults:
+func TestLoadSettingsAllowsDefaultMiningEnablement(t *testing.T) {
+	settingsFile, err := loadTestSettings(t, `defaults:
   mining:
     enabled: true
     primary:
@@ -193,9 +262,28 @@ func TestLoadSettingsRequiresHostnameScopedMiningEnablement(t *testing.T) {
       port: 3333
       user: worker
       passwordEnv: BITAGNIS_FALLBACK_PASSWORD
+overrides:
+  mineira:
+    mining:
+      enabled: false
 `)
-	if err == nil || !strings.Contains(err.Error(), "explicit hostname override") {
-		t.Fatalf("error = %v, want hostname-scoped enablement rejection", err)
+	if err != nil {
+		t.Fatalf("LoadSettings returned an error: %v", err)
+	}
+	defaults, err := settingsFile.ForHost("")
+	if err != nil {
+		t.Fatalf("resolve defaults: %v", err)
+	}
+	mineira, err := settingsFile.ForHost("mineira")
+	if err != nil {
+		t.Fatalf("resolve mineira: %v", err)
+	}
+	if !defaults.Mining.Enabled || mineira.Mining.Enabled {
+		t.Fatalf(
+			"default/override mining enabled = %v/%v, want true/false",
+			defaults.Mining.Enabled,
+			mineira.Mining.Enabled,
+		)
 	}
 }
 
@@ -235,7 +323,7 @@ func TestMiningValidationBoundaries(t *testing.T) {
 			want: "primary user",
 		},
 		{
-			name: "nonportable environment",
+			name: "nonportable dotenv entry",
 			mutate: func(settings *MiningSettings) {
 				settings.Primary.PasswordEnv = "PRIMARY-PASSWORD"
 			},
