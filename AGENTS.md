@@ -1,9 +1,8 @@
 # Bitagnis Development Guide for AI Agents
 
 This document is the source of truth for AI-agent behavior and contribution rules in this
-repository. `README.md` describes the current controller behavior.
-`RFC_FULL_CONTROL.md` records the implemented full-control contract and its canary evidence. The
-source and tests are the executable description of the current system.
+repository. `README.md` describes the current controller behavior and operator contract. The source
+and tests are the executable description of the current system.
 
 ## Non-Negotiables
 
@@ -29,12 +28,12 @@ source and tests are the executable description of the current system.
 
 ## When Architecture Is Unclear
 
-Read `README.md`, `RFC_FULL_CONTROL.md`, the relevant implementation, and its tests before deciding
-that architecture is unclear. If architecture, ownership, or design-contract direction is still
-unclear, spawn a dedicated architect agent before implementation. Pass it the relevant context and
-these requirements explicitly: minimize concepts, code paths, public types, duplicated
-responsibilities, future change sites, and LOC; allow breaking changes; delete
-superseded code without compatibility paths or fallbacks; and divide the work into logical commits.
+Read `README.md`, the relevant implementation, and its tests before deciding that architecture is
+unclear. If architecture, ownership, or design-contract direction is still unclear, spawn a
+dedicated architect agent before implementation. Pass it the relevant context and these
+requirements explicitly: minimize concepts, code paths, public types, duplicated responsibilities,
+future change sites, and LOC; allow breaking changes; delete superseded code without compatibility
+paths or fallbacks; and divide the work into logical commits.
 
 Ask the architect agent for one target design, the complete cutover and deletion scope, affected
 contracts and tests, and a logical commit sequence. Resolve the ambiguity before adding code; do not
@@ -107,8 +106,6 @@ solution is not possible, report the blocker instead of approximating it.
   records, exclusive SQLite ownership, and exact schema validation.
 - `*_test.go` files own executable behavior contracts. Keep controller/optimizer tests in the root
   package and library boundary tests in `lib`.
-- `RFC_FULL_CONTROL.md` owns the full-control contract and its operational canary gate. Keep the
-  implementation status and unresolved firmware or canary evidence explicit.
 
 If responsibility moves between these boundaries, update this guide, current documentation, and
 tests in the same change.
@@ -150,12 +147,11 @@ code, settings, output, and tests.
 
 ## AxeOS Mutation Constraint
 
-`RFC_FULL_CONTROL.md` records a critical known limitation of AxeOS v2.8.1: `PATCH /api/system`
-persists settings but does not load them into the running miner without a restart. All current
-hardware writes therefore use the one coordinator-owned lifecycle:
+AxeOS v2.8.1 `PATCH /api/system` persists settings but does not load them into the running miner
+without a restart. All current hardware writes therefore use the one coordinator-owned lifecycle:
 
-Do not expand the write surface or claim that a PATCH is active configuration without addressing
-the RFC's phase-zero prerequisite:
+Do not expand the write surface or claim that a PATCH is active configuration without this complete
+lifecycle:
 
 ```text
 validate -> persist intent -> re-read identity and safety -> PATCH -> restart
@@ -166,7 +162,7 @@ validate -> persist intent -> re-read identity and safety -> PATCH -> restart
 Do not add a direct actuator, accept configured NVS readback without reboot proof, or bypass
 per-miner serialization and fleet-wide normal-mutation ordering. Preserve emergency safety
 priority, temporary-disappearance tolerance, and exact same-MAC verification. Mining activation
-remains canary-first and explicitly authorized because the firmware risks in the RFC cannot be
+remains canary-first and explicitly authorized because the firmware risks cannot be
 resolved by host-side code.
 
 ## Go and API Rules
@@ -244,8 +240,6 @@ turn a canary test into an implicit fleet rollout.
 - Update `README.md` when current thermal behavior, settings, output, or run commands change.
 - Update `settings.example.yaml` with any current configuration change and ensure its load test
   continues to pass.
-- Update `RFC_FULL_CONTROL.md` only for deliberate changes to the full-control contract or its
-  operational evidence. Keep implementation status explicit.
 - Documentation is part of the change, not follow-up work.
 
 ## Repository Hygiene

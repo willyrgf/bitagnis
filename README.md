@@ -201,6 +201,20 @@ supply. AxeOS thermal protection remains the final safety layer.
 
 AxeOS v2.8.1 uses plain HTTP, cannot positively read back pool passwords, may
 log a string value when an NVS write fails, and does not prove individual NVS
-writes succeeded. Before enabling mining writes, the owner must accept or
-resolve those firmware risks and run the authorized named-canary procedure in
-`RFC_FULL_CONTROL.md`. Do not enable a second miner until that canary passes.
+writes succeeded.
+
+## Mining-write canary
+
+Mining writes on a new deployment remain canary-first because host-side code
+cannot remove those firmware risks. Before mutation, the owner must explicitly
+authorize one named miner, accept or resolve the risks above, record its exact
+MAC, uptime behavior, readable pool fields, operating point, and safe
+pre-change telemetry, and keep an owner-only recovery snapshot.
+
+First confirm that matching readable settings cause no PATCH or restart. Then
+exercise one named `--reapply-mining` and require one complete PATCH, restart,
+same-MAC rediscovery, uptime discontinuity, exact readable-field and
+operating-point verification, a fresh ramp, and two safe positive-hash primary
+polls. A fallback failover requires separate authorization and must be restored
+through the same durable path. Do not enable another miner until the canary
+passes, and never treat canary authorization as permission for a fleet rollout.
