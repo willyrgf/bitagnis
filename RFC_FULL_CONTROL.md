@@ -1,121 +1,269 @@
-# RFC: Full Bitaxe Mining Configuration Control
+# RFC: Startup Bitaxe Mining Configuration
 
-- Status: Proposed
+- Status: Proposed; mining-write activation is blocked on the material uncertainties below
 - Date: 2026-07-27
-- Scope: Bitagnis and AxeOS-managed Bitaxe devices
+- Scope: Bitagnis and the two deployed AxeOS v2.8.1 BM1370 board-601 devices
 
 ## Summary
 
-Bitagnis should manage Bitaxe mining configuration in addition to optimizing
-temperature, frequency, and core voltage.
+Bitagnis should reconcile each explicitly enabled Bitaxe's primary and fallback
+Stratum settings during startup.
 
-The first supported configuration model will match the two currently deployed
-devices: one primary Stratum pool and one fallback Stratum pool. Bitagnis will
-read the live non-secret configuration, compare it with a desired configuration
-from `settings.yaml`, apply changes through AxeOS, restart one miner at a time,
-verify recovery, and then resume thermal optimization.
+Mining configuration is low frequency; thermal safety is continuous. Bitagnis
+will start fleet polling immediately in a safety-only mode, reconcile mining
+settings on one miner at a time, and enable evaluation and upward exploration
+only after every selected miner is safe and healthy.
 
-No additional hardware or service is required. The implementation can use the
-existing AxeOS HTTP API, discovery loop, hostname overrides, and SQLite state
-store.
+Every AxeOS setting change, including operating-point trials, will use one
+controller-owned path:
 
-## Context
+```text
+validate
+    -> persist intent
+    -> re-read identity and safety
+    -> PATCH
+    -> restart
+    -> rediscover the same MAC
+    -> prove a new boot
+    -> verify readback
+    -> transactionally clear intent and set ramp
+    -> reset in-memory telemetry
+```
 
-The devices observed while preparing this RFC were:
+The design adds no mining subcommands, background reconciliation,
+mining-specific state table, stored payload, or recoverable secret store. Current
+settings plus named environment variables are the desired state. One minimal
+pending mutation record is the crash-recovery state. The cutover has no legacy
+schema migration, compatibility reader, deprecated API, alias, adapter, or dual
+actuation path.
+
+## Material uncertainties
+
+- **Device-side password logging:** Bitagnis will never log a resolved secret,
+  but v2.8.1 logs both NVS key and value when a string write fails. A failed
+  password write can therefore expose the password in AxeOS logs. It is
+  uncertain whether the repository's no-secret rule permits that device-side
+  risk. If not, a firmware fix is required. Resolve through explicit owner
+  acceptance or verified fixed firmware before mining password writes are
+  enabled; do not claim Bitagnis can suppress the device log.
+- **Fallback-password assurance:** readback can verify fallback host, port, and
+  user, but positive hashing verifies only the pool currently in use. It cannot
+  prove a write-only fallback password while primary is active. Resolve by
+  accepting primary-only runtime verification plus an authorized canary
+  failover, or block v2.8.1 until firmware exposes verifiable pool status.
+- **v2.8.1 persistence:** the PATCH handler performs independent NVS writes,
+  ignores their results, and returns success; its NVS wrapper has no explicit
+  `nvs_commit`. A response therefore does not prove persistence. Resolve with the
+  authorized PATCH/restart/readback canary before enabling the second miner.
+- **Exact device and reboot evidence:** source proves the identity and uptime
+  fields exist, but not the deployed strings or the tolerance needed to
+  distinguish rebooted uptime from uninterrupted uptime. Record exact values and
+  timing read-only on the named canary before freezing validation and tests.
+
+No architecture or ownership uncertainty remains: one mutation owner, one
+pending-record representation, one startup safety gate, and one transport path
+per AxeOS operation.
+
+## Firmware facts and current defect
+
+The initial devices are:
 
 | Hostname | ASIC | Board | AxeOS |
 | --- | --- | --- | --- |
 | `mineira` | BM1370 | 601 | v2.8.1 |
 | `mineiro` | BM1370 | 601 | v2.8.1 |
 
-Both advertise primary and fallback Stratum configuration through
-`GET /api/system/info`. Passwords are write-only and are not returned.
+`GET /api/system/info` exposes firmware, ASIC, board, hostname, MAC, uptime,
+configured operating point, primary/fallback host-port-user fields, fallback-use
+status, hash rate, thermal telemetry, overheat mode, and optional `power_fault`.
+Passwords are write-only. The exact response and PATCH fields are in the pinned
+[OpenAPI schema][axeos-v281-openapi].
 
-AxeOS v2.8.1 accepts the following mining fields through
-`PATCH /api/system`:
+The v2.8.1 UI requires a bare pool host without `stratum+tcp://` or a port, and
+firmware passes that value directly to `gethostbyname`. Bitagnis must use the
+same contract despite the OpenAPI example containing a scheme.
+[The UI validation][axeos-v281-pool-ui] and
+[startup code][axeos-v281-system] are the source of truth.
 
-- `stratumURL`
-- `stratumPort`
-- `stratumUser`
-- `stratumPassword`
-- `fallbackStratumURL`
-- `fallbackStratumPort`
-- `fallbackStratumUser`
-- `fallbackStratumPassword`
+The [PATCH handler][axeos-v281-handler] writes fields separately and does not
+restart or reload the miner. `GET /api/system/info` reads configured values from
+NVS, so immediate readback is not evidence that the ASIC or Stratum process
+loaded them.
 
-The contract is documented in the
-[AxeOS v2.8.1 OpenAPI schema][axeos-v281-openapi].
+The current `BitaxeClient.SetOperatingPoint` and
+`BitaxeClient.RecoverOperatingPoint` stop after PATCH. The optimizer can mistake
+persisted frequency and voltage for active settings. Mining writes MUST remain
+disabled until every existing operating-point and overheat mutation uses the
+restart-verified path in this RFC.
 
-## Critical prerequisite: settings require a restart
-
-On AxeOS v2.8.1, `PATCH /api/system` persists configuration in NVS but does not
-restart the device or reload the running mining process. The AxeOS web
-interface separately asks the user to restart after saving.
-
-This applies to pool configuration and to the frequency/core-voltage settings
-that Bitagnis already writes. The current
-[`BitaxeClient.SetOperatingPoint`](lib/bitaxe.go) method stops after the PATCH.
-Therefore, Bitagnis can currently observe a persisted value as though it were
-active before the ASIC has actually loaded it.
-
-Before mining configuration is added, Bitagnis MUST introduce a shared device
-mutation operation:
-
-```text
-validate desired change
-    -> PATCH /api/system
-    -> POST /api/system/restart
-    -> wait for the device to leave and return
-    -> verify boot and configuration
-    -> reset the optimizer telemetry window
-    -> resume optimization after ramp-up
-```
-
-The v2.8.1 behavior is visible in the
-[firmware PATCH and restart handlers][axeos-v281-handler].
+The same handler ignores individual NVS write failures. The pinned
+[NVS wrapper][axeos-v281-nvs] also logs failing string values and does not call
+`nvs_commit`, although ESP-IDF says explicit commit is required for guaranteed
+persistence. [ESP-IDF NVS documentation][esp-idf-nvs] defines those limits.
 
 ## Goals
 
-1. Manage primary and fallback mining pool settings for the existing AxeOS
-   v2.8.1 Bitaxes.
-2. Provide read-only status and plan commands before any mutation.
-3. Apply configuration to miners one at a time.
-4. Verify both configuration readback and mining recovery.
-5. Keep passwords out of YAML, logs, terminal output, and SQLite.
-6. Prevent mining configuration changes from racing thermal-control changes.
-7. Preserve validated operating-point history across configuration restarts.
-8. Detect manual configuration drift and apply an explicit policy.
-9. Create a version-aware foundation for newer AxeOS mining capabilities.
+1. Configure one primary and one fallback pool on the required devices.
+2. Preserve fleet-wide overheat, ASIC-temperature, VR-temperature, and power
+   protection throughout startup reconciliation.
+3. Make no mining PATCH or restart when readable fields already match and no
+   recovery or explicit password reapply is pending.
+4. Recover every interrupted mutation or durably supersede it with a
+   higher-priority safety action.
+5. Verify same-MAC reboot, post-boot operating point, readable mining fields,
+   and current-primary health before ramping.
+6. Preserve evaluated operating-point history and cooldown state after the new
+   schema baseline is established.
+7. Keep real credentials out of YAML, Bitagnis output, errors, SQLite, and
+   committed tests.
 
 ## Non-goals
 
-The initial implementation will not:
+The first implementation will not add background drift reconciliation, mining
+status/plan/apply subcommands, management modes, automatic pool rollback,
+fallback disabling, multiple-controller coordination, firmware adapters,
+Stratum V2/TLS, or unrelated AxeOS settings.
 
-- choose a pool based on profitability or market data;
-- manage Wi-Fi credentials, firmware, displays, or unrelated AxeOS settings;
-- require a web dashboard or a new daemon;
-- store recoverable Stratum passwords in SQLite;
-- depend on accepted shares appearing within a short fixed period;
-- configure newer multi-pool, Stratum V2, or TLS fields on v2.8.1;
-- silently apply options that the detected firmware cannot verify.
+It will not detect a password-only change without explicit operator intent or
+claim to verify a password AxeOS does not return.
 
-## Terminology
+## One mutation owner
 
-- **Desired configuration**: mining settings loaded from `settings.yaml` and
-  referenced environment variables.
-- **Observed configuration**: non-secret settings returned by AxeOS.
-- **Managed configuration**: settings that Bitagnis is authorized to reconcile.
-- **Drift**: a difference between desired and observed non-secret settings, or a
-  changed desired secret revision.
-- **Device mutation**: any AxeOS setting change that may require a restart,
-  including an operating-point or mining-configuration change.
-- **Healthy recovery**: the device has rebooted, reports the desired settings,
-  and resumes plausible hashing without a safety fault.
+Add one private root-package owner, `mutation.go`, and update `AGENTS.md` in the
+same change:
 
-## Proposed configuration
+- `main.go` starts discovery, polling, and the startup gate.
+- `optimizer.go` decides safety actions and operating-point targets.
+- `mutation.go` owns priority, durable intent, PATCH/restart ordering,
+  rediscovery, reboot proof, readback, and reset.
+- `lib/bitaxe.go` owns validated typed HTTP primitives and local discovery.
+- `lib/state.go` owns pending intent and exclusive store ownership.
+- `lib/settings.go` owns strict decoding, merging, and static validation.
 
-Mining configuration will be nested under the existing defaults and hostname
-overrides:
+The mutation owner handles only three concrete kinds:
+
+- `operating_point`
+- `overheat_recovery`
+- `mining_configuration`
+
+This changes actuation, not thermal policy. Automated operating points remain
+complete advertised pairs. Normal rollback still chooses a validated point with
+thermal, VR-temperature, and power headroom or the minimum advertised pair.
+Overheat recovery still waits for `recoveryTemp`, applies the minimum advertised
+pair while clearing the firmware flag, rejects emergency sentinel values as
+normal points, resets samples, and retains cooldown backoff.
+
+There is at most one active normal mutation across the fleet. Overheat recovery
+and hard-safety rollback are never delayed behind normal mining or exploration.
+No restart, rediscovery, ramp, or health wait may block the fleet polling
+cadence; the coordinator advances from poll and discovery evidence. No store,
+controller, or cache lock may span a network request or wait.
+
+Delete direct APIs and controller paths that treat PATCH or NVS readback as
+completed actuation. `optimizer.go` must not implement its own restart lifecycle.
+
+## Complete replacement and deletion scope
+
+Implementation is one breaking internal cutover. Delete, rather than wrap or
+deprecate:
+
+- `BitaxeClient.SetOperatingPoint` and `RecoverOperatingPoint` as complete
+  actuator APIs;
+- `controller.reconcilePending`, `pendingTimeout`, and every path that confirms
+  or abandons a request from configured NVS readback without reboot proof;
+- `PendingRecovery` and mutation-kind inference from
+  `PendingFrequency != 0`;
+- direct optimizer calls to hardware PATCH methods;
+- the discovery path that reduces identity to `[]string` IP addresses;
+- GORM `AutoMigrate` as the optimizer schema authority;
+- old device-interface methods, fakes, fixtures, formatting branches, and tests
+  tied to those contracts; and
+- documentation that describes PATCH-only actuation or the old pending-state
+  behavior.
+
+Update every current producer and consumer in the same logical change. Do not
+retain forwarding methods, deprecated fields, build flags, schema translators,
+fallback readers, temporary alternate paths, or tests for deleted behavior. Git
+history is the archive.
+
+## Durable pending record and state cutover
+
+Replace the operating-point-only pending representation in `optimizer_miners`
+with:
+
+```text
+pending_kind
+pending_frequency
+pending_core_voltage
+pending_since
+mining_pending
+```
+
+The invariants are:
+
+- empty kind: zero pair and zero timestamp;
+- operating-point or overheat-recovery kind: one complete validated advertised
+  pair and a timestamp; and
+- `mining_pending`: an independent Boolean obligation to replay current enabled
+  mining settings.
+
+Delete `PendingRecovery`. Do not persist pool data, passwords, hashes, revisions,
+phases, retries, or errors. `mining_pending` is not a second workflow or queue:
+it preserves the one fact that readback cannot rediscover after a password-only
+request. Mining replay requires mining to remain enabled and resolves the current
+effective settings and environment values. If any input is unavailable, the
+obligation stays pending, mining stays blocked, and safety polling continues.
+
+Persist the applicable operating-point intent or mining obligation before
+PATCH. Keep it after cancellation, PATCH failure, restart ambiguity, wrong
+identity, reboot-proof failure, or readback mismatch. A later process revalidates
+and replays the complete idempotent mutation; it never infers active state from
+NVS alone.
+
+After same-MAC reboot proof and readback:
+
+1. transactionally clear intent, update verified durable state, clear manual
+   observations, and set `RampUntil`;
+2. reset in-memory samples before accepting another sample; and
+3. preserve evaluated points, overheat count, and cooldown.
+
+A higher-priority action may replace a normal operating-point intent only in the
+same transaction that records the replacement. It never clears
+`mining_pending`. This deliberately cancels an unsafe exploration target while
+preserving any mining or password-reapply obligation across emergency recovery
+and process loss.
+
+Set one new SQLite schema baseline with `PRAGMA user_version`. An empty database
+with no application tables creates only the new schema. An exact
+current-version/current-layout database opens normally. Any populated database
+with a pre-cutover or unknown version, missing or unexpected application tables,
+or missing or unexpected columns fails before device discovery or reads with a
+deterministic instruction to move aside or remove the runtime database and start
+from a fresh baseline.
+
+Bitagnis must not migrate, copy, reinterpret, delete, or modify an incompatible
+database. This deliberately discards old optimizer control state and evaluated
+history when the operator chooses the new baseline. It preserves all history
+across ordinary process and device restarts after that point.
+
+## Process ownership
+
+`OpenOptimizerStore` must acquire process-lifetime exclusive SQLite ownership
+before schema work, discovery, or device reads:
+
+1. use the store's sole SQLite connection;
+2. set `PRAGMA locking_mode=EXCLUSIVE`;
+3. force bounded acquisition with an exclusive transaction; and
+4. retain the connection and lock until `Close`.
+
+This needs no dependency or lock file. It excludes another Bitagnis using the
+same database, not a process using a different database or a manual AxeOS
+writer. Those writers are unsupported. The immediate pre-PATCH recheck narrows
+but cannot eliminate that external race.
+
+## Configuration
+
+Mining settings use the existing defaults and hostname overrides:
 
 ```yaml
 defaults:
@@ -132,16 +280,14 @@ defaults:
   overheatCooldownMinutes: 120
 
   mining:
-    mode: observe
-    restartTimeoutSeconds: 180
-    healthyHashTimeoutSeconds: 300
+    enabled: false
     primary:
-      url: pool.example.net
+      host: pool.example.net
       port: 3333
       user: worker-name
       passwordEnv: BITAGNIS_PRIMARY_STRATUM_PASSWORD
     fallback:
-      url: fallback.example.net
+      host: fallback.example.net
       port: 3333
       user: worker-name
       passwordEnv: BITAGNIS_FALLBACK_STRATUM_PASSWORD
@@ -149,6 +295,7 @@ defaults:
 overrides:
   mineira:
     mining:
+      enabled: true
       primary:
         user: worker-mineira
       fallback:
@@ -156,466 +303,273 @@ overrides:
 
   mineiro:
     mining:
+      enabled: false
       primary:
         user: worker-mineiro
       fallback:
         user: worker-mineiro
 ```
 
-### Management modes
+`enabled` is the only enabling condition and defaults to `false`. Common pool
+settings can be defined once while each hostname is authorized deliberately.
+Enable the canary first; enable the second miner only after the canary gate.
 
-- `disabled`: do not read, compare, or mutate mining configuration.
-- `observe`: report status and drift; mutate only through an explicit apply
-  command. This SHOULD be the default.
-- `managed`: reconcile drift automatically when a miner is discovered and safe
-  to restart.
+When enabled, primary and fallback must both be complete after pointer-based
+nested merging. Unknown fields, including a literal `password`, fail strict YAML
+decoding. Restart and health deadlines are bounded shared mutation policy, not
+mining-specific configuration.
 
-An omitted `passwordEnv` means "preserve the existing device password." Bitagnis
-cannot verify that password and MUST report the field as unmanaged. Supplying
-`passwordEnv` makes the desired password managed, although operational recovery
-rather than readback is the only available verification.
+### Password-only reapply
 
-Literal passwords in YAML MUST be rejected. Environment variable names may be
-stored, but their resolved values MUST NOT be persisted or logged.
-
-Hostname overrides will merge individual nested fields using the same
-omitted-versus-explicit semantics as existing settings overrides. Unknown YAML
-keys will continue to fail startup.
-
-### Validation
-
-Bitagnis MUST validate the complete effective configuration before contacting any
-device:
-
-- pool URL/host is non-empty and within the firmware's length limit;
-- ports are in the range 1 through 65535;
-- primary URL, port, and user are complete;
-- fallback URL, port, and user are either complete or explicitly disabled;
-- referenced environment variables exist when their values are required;
-- v2.8.1 pool hosts are normalized to the bare-host form expected by its UI;
-- values unsupported by the detected firmware produce an error rather than
-  being silently ignored;
-- restart and health timeouts are positive and bounded.
-
-## Device API changes
-
-[`lib/bitaxe.go`](lib/bitaxe.go) should add separate public models for observed
-and desired state:
-
-```go
-type PoolConfig struct {
-    URL  string
-    Port uint16
-    User string
-}
-
-type MiningConfig struct {
-    Primary  PoolConfig
-    Fallback *PoolConfig
-}
-```
-
-Passwords should be carried only in a short-lived apply request. They should not
-be fields on long-lived observed models or printable types.
-
-The client interface should gain operations equivalent to:
-
-```go
-GetMiningConfig(context.Context, string) (MiningConfig, error)
-SetMiningConfig(context.Context, MiningConfigPatch, string) error
-Restart(context.Context, string) error
-```
-
-The lower-level PATCH implementation should accept typed payloads without
-forcing mining fields into the existing operating-point structure.
-
-`GET /api/system/info` should also capture:
-
-- firmware version;
-- ASIC and board model;
-- primary and fallback pool fields;
-- fallback-in-use status;
-- any available pool connection status;
-- uptime and telemetry needed for restart verification.
-
-## Mutation coordinator
-
-Bitagnis MUST serialize mutations per miner. A mining update, optimizer trial,
-safety rollback, and overheat recovery may not issue overlapping PATCH or
-restart requests.
-
-Safety remains the highest priority:
-
-1. Emergency and overheat recovery.
-2. Safety rollback.
-3. Confirmation of an already-started mutation.
-4. Explicit mining configuration apply.
-5. Automatic managed-configuration reconciliation.
-6. Optimizer exploration.
-
-An emergency may interrupt a pending mining rollout. A normal mining update
-MUST wait until the miner is not overheated and does not have an unconfirmed
-operating-point request.
-
-The coordinator should own the complete PATCH/restart/verify lifecycle instead
-of exposing restart behavior separately to optimizer policy code.
-
-## Reconciliation flow
-
-For each target miner:
-
-1. Discover the device and identify it by MAC address.
-2. Read system information and determine firmware capabilities.
-3. Resolve and validate the effective desired configuration.
-4. Compare observed non-secret fields with desired fields.
-5. Compare the desired secret revision with the last successfully applied
-   revision, without storing secret values.
-6. Produce a redacted plan.
-7. Wait for a safe mutation window.
-8. Persist an `APPLYING` state before the PATCH.
-9. PATCH only the managed fields. Password fields are included only when their
-   configured revision needs to be applied.
-10. Persist a `RESTARTING` state and call `POST /api/system/restart`.
-11. Poll with bounded exponential backoff until the device returns.
-12. Confirm that uptime reset and the MAC address still identifies the target.
-13. Verify all readable mining settings.
-14. Clear pre-restart telemetry samples and begin a new ramp-up period.
-15. Wait for plausible positive hashing and the absence of thermal, power,
-    voltage-regulator, or firmware faults.
-16. Mark the desired revision `IN_SYNC`.
-17. Proceed to the next device only after the current device succeeds.
-
-A short period without an accepted share is not a failure. Solo pools and
-high-difficulty pools may legitimately take much longer than the health
-timeout to return an accepted share. Hashing, pool status when available, and
-fault telemetry are the primary short-term health signals.
-
-## Optimizer coordination
-
-A configuration restart resets uptime, hash telemetry, and share counters. It
-must not contaminate an evaluation window.
-
-After any confirmed restart, Bitagnis MUST:
-
-- discard in-memory telemetry samples for that MAC address;
-- clear pending observation counters;
-- set `RampUntil` using the effective host ramp-up setting;
-- return the optimizer to a baseline/hold transition appropriate to its prior
-  state;
-- preserve validated operating-point records;
-- preserve the selected safe or best operating point when it is still the live
-  configuration;
-- avoid interpreting reset share counters as wraparound or negative deltas.
-
-Bitagnis SHOULD track the last observed uptime or an equivalent boot generation
-so that restarts initiated outside Bitagnis also reset the telemetry window.
-
-## Durable state
-
-Mining reconciliation state belongs in a separate SQLite table rather than in
-the optimizer phase:
-
-```text
-mining_config_state
-  mac_addr                 primary key
-  desired_revision
-  last_applied_revision
-  phase
-  changed_at
-  restart_requested_at
-  last_verified_at
-  retry_after
-  last_error
-```
-
-Suggested phases:
-
-- `UNKNOWN`
-- `IN_SYNC`
-- `DRIFT`
-- `APPLYING`
-- `RESTARTING`
-- `VERIFYING`
-- `FAILED`
-
-The desired revision should be derived from the canonical effective
-configuration. Secret material MUST NOT be stored directly. A plain,
-unsalted hash of a password MUST NOT be stored because weak passwords could be
-tested offline. A process-local comparison or keyed digest using a separately
-managed key is acceptable.
-
-If Bitagnis stops during a mutation, the next process must resume reconciliation
-from persisted state and live device evidence. It must not blindly send a
-second restart.
-
-## CLI
-
-Existing optimizer invocation remains compatible:
+A secret-only change uses an ephemeral flag:
 
 ```sh
-bitagnis
-bitagnis mineira mineiro
+bitagnis --reapply-mining mineira
+bitagnis --reapply-mining mineira mineiro
 ```
 
-Mining configuration adds explicit subcommands:
+The flag requires explicit hostname arguments, applies only to enabled miners,
+and creates ordinary durable intent before PATCH. Unknown flags fail. There is
+no persistent reapply setting that can accidentally restart miners on every
+launch.
 
-```sh
-bitagnis mining status
-bitagnis mining status mineira
-bitagnis mining plan mineira
-bitagnis mining apply mineira
-bitagnis mining apply mineira mineiro
-bitagnis mining apply --all
-```
+Without the flag, matching readable fields cause no mutation even though
+Bitagnis cannot know whether existing passwords match the environment.
 
-Behavior:
+### Validation and secrets
 
-- `status` is read-only and redacts users as appropriate.
-- `plan` is read-only and shows which non-secret fields would change, whether a
-  write-only secret revision would be applied, and whether a restart is needed.
-- `apply` performs the planned rolling mutation.
-- Applying to every discovered miner requires the explicit `--all` flag.
-- A failed miner stops the remaining rollout by default.
-- A future `--continue-on-error` option may relax that behavior.
+Before discovery, require:
 
-The daemon's terminal table should add a compact mining state such as
-`POOL:OK`, `POOL:DRIFT`, `POOL:RESTART`, or `POOL:FAILED`. It must not print
-passwords or complete sensitive usernames.
+- complete primary and fallback blocks for each enabled effective config;
+- bare DNS hosts or IPv4 addresses without scheme, port, path, control
+  characters, or surrounding whitespace;
+- ports from 1 through 65535;
+- non-empty users and environment names without control characters or
+  surrounding whitespace;
+- portable environment names matching `[A-Za-z_][A-Za-z0-9_]*`;
+- host, user, and resolved-password values of at most 255 UTF-8 bytes; and
+- a complete encoded PATCH below the pinned 10,240-byte request buffer.
 
-## Failure handling and rollback
+Do not trim or normalize valid values. Compare observed host, port, and user
+bytes exactly.
 
-Failures are divided into four classes:
+After discovery and immediately before PATCH, require the same MAC, supported
+firmware/ASIC/board, valid uptime and telemetry, no higher-priority mutation, no
+overheat or `power_fault`, and values below the distinct hard ASIC-temperature,
+VR-temperature, and power limits.
 
-1. **Validation failure**: make no API calls.
-2. **PATCH failure**: do not restart; record the error and retry only with
-   bounded backoff or a new explicit apply.
-3. **Restart/reappearance failure**: stop the fleet rollout and preserve
-   recovery instructions.
-4. **Post-restart health failure**: attempt rollback only when Bitagnis has a
-   complete, previously managed recovery configuration whose secrets are still
-   resolvable.
+Resolve both password variables only after drift, recovery intent, or the flag
+requires a PATCH. Both must exist and be non-empty. Hold them only in the private
+typed payload and encoded request body; never pass either to formatting or
+logging.
 
-Because AxeOS does not return passwords, Bitagnis cannot safely snapshot an
-arbitrary manually configured pool and later restore its password. The first
-managed apply therefore has no automatic secret rollback unless the operator
-provides an explicit recovery profile.
+## Device and discovery contracts
 
-If rollback is unavailable, Bitagnis MUST:
+Keep observed AxeOS fields flat in `lib.Info`; do not add duplicate public
+pool/mining models. Extend `Info` only with:
 
-- stop applying configuration to other miners;
-- continue safety monitoring if the device remains reachable;
-- show the failed hostname and redacted intended endpoints;
-- state that manual AxeOS recovery may be required;
-- avoid repeated restart loops.
+- `version`, `ASICModel`, and `boardVersion`;
+- primary/fallback host, port, and user;
+- `isUsingFallbackStratum`; and
+- optional `power_fault`.
 
-Automatic retries must use a durable `retry_after` backoff. Transient read
-errors or a single mismatching poll must never trigger a restart.
+Desired nested settings are the sole pool representation. The secret-bearing
+PATCH type is private.
 
-## Security
+Change discovery to return one canonical record containing IP and validated
+`Info`, ordered by MAC. Do not discard identity into `[]string`. Rediscovery may
+update IP only after the same MAC is proven.
 
-AxeOS configuration calls can redirect hash power and carry pool credentials.
-They must be treated as privileged operations.
+`lib/bitaxe.go` should expose typed primitives for complete operating-point
+PATCH, complete recovery PATCH, complete primary-plus-fallback mining PATCH,
+restart, information reads, and discovery. Delete `SetOperatingPoint` and
+`RecoverOperatingPoint` APIs that imply PATCH completes actuation.
 
-- Keep Bitagnis and Bitaxe management endpoints on a trusted LAN.
-- Do not expose the AxeOS HTTP API through an unauthenticated public proxy.
-- Resolve passwords from environment variables or a future secret provider.
-- Never include secrets in logs, errors, test fixtures, SQLite, plan output, or
-  panic dumps.
-- Redact pool users by default because they may contain a Bitcoin address or
-  account identifier.
-- Set restrictive permissions on any local file containing user identifiers.
-- Reject redirects to unexpected hosts when calling device APIs.
-- Continue using bounded response sizes and HTTP timeouts.
-- Record who/what initiated a mutation (`explicit`, `managed`, `safety`, or
-  `optimizer`) without recording secret payloads.
+The client must reject every redirect; validate before request construction;
+bound time, connections, and bodies; honor cancellation; and return status-only
+errors for secret-bearing requests. It must never include a secret request or
+untrusted response body in an error.
 
-## Firmware compatibility
+## Startup and reconciliation
 
-### Required first target
+After settings load, exclusive store acquisition, and discovery:
 
-AxeOS v2.8.1 on BM1370 board 601 is the required compatibility target. Its
-primary/fallback flat fields are the normative initial implementation.
+1. Require every explicitly named hostname to map to exactly one MAC before a
+   normal mining mutation.
+2. Load optimizer state and begin bounded fleet polling in safety-only mode.
+3. On every poll, handle in order:
+   1. firmware overheat and emergency recovery;
+   2. hard-safety rollback;
+   3. pending operating-point recovery;
+   4. the current mining startup action; and
+   5. read-only startup health.
+4. Suppress telemetry-window evaluation, candidate selection, and upward
+   exploration until the startup gate opens.
 
-### Version-aware extensions
+Enabled miners reconcile in MAC order:
 
-Newer AxeOS releases advertise additional fields such as Stratum protocol,
-TLS, suggested difficulty, richer connection status, pause/resume, and a
-multi-pool schema. The current official release is
-[v2.14.2][axeos-v2142-release], and its
-[OpenAPI schema][axeos-current-openapi] documents the expanded model.
+1. Read identity, uptime, operating point, readable mining fields, and safety.
+2. If readable fields match and neither `mining_pending` nor the force flag
+   applies, send no mining PATCH or restart.
+3. Otherwise resolve secrets, validate the complete payload, and persist mining
+   obligation.
+4. Re-read immediately before PATCH; stop the normal action if identity,
+   operating point, readable settings, or safety changed.
+5. PATCH complete primary and fallback configuration, then request restart.
+6. Rediscover until the same MAC returns, tolerating temporary disappearance and
+   DHCP movement.
+7. Prove a new boot from uptime discontinuity relative to pre-restart uptime and
+   elapsed monotonic wall time. Offline observation alone is not proof.
+8. Verify that the complete post-boot operating point exactly matches the
+   pre-restart point before preserving optimizer state. Route an unsafe,
+   emergency, or mismatching point through safety policy and keep mining
+   pending.
+9. Verify exact readable mining fields and require primary, not fallback, during
+   normal recovery.
+10. Clear `mining_pending` and start a fresh ramp.
+11. After ramp-up, require two consecutive valid polls with positive hash rate,
+    no fault or overheat, and safe instantaneous telemetry.
+12. Continue to the next miner only after health succeeds.
 
-Bitagnis must not infer support solely from a version string. It should combine:
+Readable readback plus reboot proof shows that the new boot saw the returned
+non-secret NVS values. It does not verify either password. Positive hashing while
+fallback is false verifies only the active primary path.
 
-- parsed firmware version;
-- fields observed from `GET /api/system/info`;
-- known capability rules;
-- integration tests against the target firmware.
+When every selected miner is safe and healthy, discard startup samples, set a
+fresh per-host ramp, and open optimization.
 
-Unknown firmware should fall back to read-only reporting unless the requested
-payload is proven compatible. A future adapter interface may support legacy
-flat pools and newer pool models independently.
+## Failure behavior
 
-Firmware upgrades are operationally separate from mining configuration. The
-recommended rollout is to add version-aware Bitagnis support, upgrade one miner,
-validate it, and only then upgrade the rest.
+A normal mining rollout gets one attempt per miner per launch. Bounded polling
+inside that attempt is not a retry. Emergency behavior keeps its independent
+safety-driven retry rules. After a normal failure, an in-memory attempt latch
+prevents the still-durable mining obligation from replaying again in the same
+process; the next launch may replay it.
 
-## Observability
+- Validation or intent-persistence failure sends no mutation.
+- PATCH failure sends no intentional restart and leaves intent pending because
+  fields may have changed partially.
+- Restart ambiguity, wrong identity, failed reboot proof, readback mismatch, or
+  primary health failure leaves rollout blocked before the next miner.
 
-Each mutation should emit structured, redacted events:
+While blocked, Bitagnis continues safety polling, preserves optimizer history,
+reports the affected miner without pool users or secrets, and avoids a normal
+restart loop. Cancellation exits with durable intent intact. The next launch
+revalidates and replays it.
 
-- desired drift detected;
-- apply started;
-- PATCH acknowledged;
-- restart requested;
-- device offline;
-- device rediscovered;
-- readback verified;
-- mining health recovered;
-- rollout completed or stopped;
-- rollback started/completed/failed.
+Automatic pool rollback is omitted because AxeOS cannot return old passwords.
+The recovery source is the current validated settings and environment values.
 
-Useful durations include PATCH latency, restart downtime, time to positive hash
-rate, and total reconciliation time. Repeated identical poll failures should be
-rate-limited in logs.
+## Security limits
 
-## Testing
+Pool configuration redirects hash power and carries credentials. Bitagnis must
+remain on the trusted local discovery scope, verify MAC after restart, reject
+redirects and unknown firmware, redact pool users, use only synthetic test
+secrets, and never persist resolved secrets.
 
-### Unit tests
+The v2.8.1 transport is plain HTTP, so confidentiality depends on the trusted
+LAN. The device-side NVS logging risk is an implementation gate, not something
+host-side redaction can solve.
 
-- YAML defaults and nested hostname override merging.
-- Unknown-field rejection.
-- URL, port, fallback completeness, environment, and timeout validation.
-- Exact legacy v2.8.1 JSON payloads.
-- Password omission versus intentional secret update.
-- Secret redaction in plans, errors, logs, and formatted structs.
-- Capability selection by firmware and observed schema.
-- Drift detection and canonical configuration revision.
-- Uptime reset and reboot detection.
+## Verification
 
-### Controller tests
+Automated tests must cover:
 
-- No-op when configuration is already synchronized.
-- Plan never mutates.
-- PATCH occurs before restart.
-- Restart occurs exactly once after a successful PATCH.
-- PATCH failure never triggers restart.
-- Device disappearance and reappearance are tolerated.
-- Wrong MAC after restart is rejected.
-- Readback mismatch fails verification.
-- Hash recovery succeeds without requiring an accepted share.
-- Optimizer samples reset after restart.
-- Safety rollback preempts mining reconciliation.
-- Mining apply waits for an existing optimizer mutation.
-- A failed first miner prevents mutation of the second miner.
-- Process restart resumes an interrupted reconciliation safely.
+- strict nested settings merge, disabled-by-default behavior, hostname-scoped
+  enablement, literal-password rejection, validation boundaries, and no
+  environment resolution on a no-op;
+- exact typed payloads, validation-before-request, restart transport, redirect
+  rejection, bounded bodies/timeouts, cancellation, and status-only secret
+  errors;
+- exclusive second-store failure, serialized access, exact current-schema
+  reopen, rejection of every old/unknown/partial schema without modifying it,
+  post-baseline history preservation, persist-before-PATCH, ambiguous-failure
+  retention, replay of both operating-point intent kinds, and preservation of
+  the mining obligation through safety preemption;
+- canonical MAC discovery/order, named-host completeness, DHCP movement,
+  wrong-MAC rejection, uptime reboot proof, and rejection of offline-only or
+  NVS-only proof;
+- fleet safety polling during every restart/ramp/blocked state, emergency
+  preemption, first-miner failure stopping the normal rollout, and exploration
+  remaining gated;
+- crash injection after intent save, around PATCH/restart, around reboot proof,
+  and around durable clear/reset; and
+- synthetic secret sentinels absent from formatting, errors, logs,
+  panic-recovery output, SQLite bytes, and terminal output.
 
-### Integration test
+No automated test contacts a real miner.
 
-Use one Bitaxe as a canary:
+### Authorized canary
 
-1. Record its current non-secret mining and operating-point settings.
-2. Run `mining plan` and confirm zero writes.
-3. Apply a test worker configuration.
-4. Confirm one restart and the same MAC address after rediscovery.
-5. Confirm exact readable pool settings.
-6. Confirm positive sustained hash rate and safe telemetry.
-7. Confirm the optimizer begins a fresh ramp/evaluation window.
-8. Restore the production profile through the same managed path.
+With explicit authorization, a named canary, recorded pre-change state, and a
+recovery plan:
 
-No fleet-wide automatic management should be enabled until this canary test
-passes.
+1. Record exact identity, uptime behavior, non-secret pools, and operating point.
+2. Resolve the device-side password-logging decision.
+3. Confirm matching settings cause no mutation.
+4. Enable only the canary with synthetic test-worker credentials.
+5. Confirm one complete PATCH, one restart, uptime discontinuity, same MAC, and
+   exact readable fields.
+6. Confirm primary selection and two safe positive-hash polls.
+7. If required, perform a separately authorized fallback failover.
+8. Confirm a fresh optimizer ramp with evaluated history preserved.
+9. Restore production settings through the same path.
+10. Exercise `--reapply-mining` once for the named canary.
 
-## Rollout plan
+Do not enable the second miner until the canary succeeds.
 
-### Phase 0: correct existing actuator semantics
+## Delivery plan
 
-- Add restart support to `BitaxeClient`.
-- Add the per-miner mutation coordinator.
-- Route operating-point PATCHes through PATCH/restart/verify.
-- Detect external reboots and reset telemetry windows.
+1. **`enforce one controller process per optimizer store`** — acquire exclusive
+   SQLite ownership and test bounded second-opener failure; no device change.
+2. **`make device mutations durable and restart-verified`** — cut over the
+   schema baseline, canonical discovery, mutation owner, restart proof, every
+   operating-point/rollback/overheat path, tests, `AGENTS.md`, and `README.md`;
+   reject old databases and delete every old API, field, reader, writer, and test
+   in the same inseparable safety commit.
+3. **`add restart-verified startup mining configuration`** — add
+   disabled-by-default settings, flat observed fields, comparison, typed payload,
+   redaction, force flag, safety-only gate, sequential rollout, replay, readback,
+   primary health, blocked behavior, `README.md`, and
+   `settings.example.yaml` as one complete cutover.
 
-### Phase 1: read-only mining control
-
-- Extend `Info` with firmware and pool fields.
-- Add configuration models and validation.
-- Implement `mining status` and `mining plan`.
-- Add redaction tests.
-
-### Phase 2: explicit legacy apply
-
-- Implement v2.8.1 mining PATCH payloads.
-- Add durable reconciliation state.
-- Implement rolling restart and verification.
-- Enable `mining apply` for named miners.
-
-### Phase 3: managed reconciliation
-
-- Enable `mode: managed`.
-- Add drift detection, backoff, recovery behavior, and fleet stopping rules.
-- Surface mining state in normal output.
-
-### Phase 4: newer firmware capabilities
-
-- Add a capability adapter for supported newer AxeOS releases.
-- Add pause/resume where available.
-- Add protocol, TLS, and extended-pool settings only after device-level tests.
+The authorized canary is an operational gate, not a code commit.
 
 ## Acceptance criteria
 
 The RFC is implemented when:
 
-1. `bitagnis mining plan` performs no writes and shows a fully redacted,
-   deterministic plan.
-2. Bitagnis can apply primary and fallback pool settings to either current
-   v2.8.1 Bitaxe.
-3. Applying to both miners restarts and verifies them sequentially.
-4. A failure on one miner stops the default rollout before changing the next.
-5. No password appears in YAML, logs, output, SQLite, errors, or tests.
-6. The optimizer cannot mutate a miner concurrently with mining
-   reconciliation.
-7. Every restart creates a fresh telemetry ramp/evaluation window.
-8. A no-op configuration causes no PATCH and no restart.
-9. Manual drift is visible and follows the configured management mode.
-10. Existing `bitagnis [hostnames...]` behavior remains compatible.
+1. Existing settings files remain valid and mining remains inactive unless
+   explicitly enabled.
+2. Every mutation uses durable pending state and proven restart semantics.
+3. A matching mining config causes no PATCH, restart, or secret resolution.
+4. Drift or named `--reapply-mining` produces a durable mining obligation,
+   complete PATCH, and verified restart.
+5. Every crash boundary safely replays or remains blocked.
+6. Safety polling continues while only optimization is gated.
+7. Emergency actions outrank normal mining, and first-miner failure prevents
+   mutation of the second.
+8. Restart proof requires the same MAC and uptime discontinuity.
+9. Primary health requires safe telemetry, primary selection, and two positive
+   hash polls, not accepted shares.
+10. Real credentials never enter YAML, Bitagnis output, errors, SQLite, or
+    committed tests.
+11. The state cutover creates only the new baseline, rejects old databases
+    without modifying them, and contains no migration or old representation.
+12. A second Bitagnis using the same optimizer database cannot start.
+13. The material uncertainties are resolved and recorded.
+14. The named canary passes before the second miner is enabled.
 
-## Alternatives considered
+## Future work
 
-### Write pool configuration during every metrics poll
+Background reconciliation, mining subcommands, rollback profiles, stored mining
+revisions, other secret providers, distributed coordination, fallback disabling,
+newer-firmware adapters, Stratum V2/TLS, and firmware or fleet upgrades require
+separate designs.
 
-Rejected. Mining configuration is low-frequency desired state. Repeated writes
-increase flash wear, create restart risk, and couple configuration availability
-to the thermal loop.
-
-### Put passwords directly in `settings.yaml`
-
-Rejected. The file is local and ignored by Git, but plaintext secrets would
-still leak through backups, diagnostics, or accidental copies.
-
-### Restart every miner concurrently
-
-Rejected. A rolling restart preserves fleet capacity and prevents one bad
-configuration from taking every miner offline.
-
-### Treat PATCH success as completion
-
-Rejected. AxeOS v2.8.1 persists settings without loading them into the running
-miner, and its password fields cannot be verified by readback.
-
-### Require an accepted share during health verification
-
-Rejected. Share timing depends on pool difficulty and is unsuitable as a short
-fixed-time readiness check.
-
-## Follow-up work
-
-- Decide whether an explicit recovery profile is required before enabling
-  automatic managed mode.
-- Define and test the exact capability matrix for supported post-v2.8.1 AxeOS
-  releases.
-- Consider a pluggable secret provider after environment-variable support is
-  proven.
-
-[axeos-v281-openapi]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/http_server/openapi.yaml#L302-L449
-[axeos-v281-handler]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/http_server/http_server.c#L388-L530
-[axeos-v2142-release]: https://github.com/bitaxeorg/ESP-Miner/releases/tag/v2.14.2
-[axeos-current-openapi]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.14.2/main/http_server/openapi.yaml
+[axeos-v281-openapi]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/http_server/openapi.yaml
+[axeos-v281-handler]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/http_server/http_server.c
+[axeos-v281-nvs]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/nvs_config.c
+[axeos-v281-system]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/system.c
+[axeos-v281-pool-ui]: https://github.com/bitaxeorg/ESP-Miner/blob/v2.8.1/main/http_server/axe-os/src/app/components/pool/pool.component.ts
+[esp-idf-nvs]: https://docs.espressif.com/projects/esp-idf/en/v5.1.3/esp32/api-reference/storage/nvs_flash.html
