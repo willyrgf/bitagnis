@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -25,26 +26,38 @@ const (
 	defaultHTTPTimeout = 5 * time.Second
 	scanWorkerLimit    = 64
 	maxAPIResponseSize = 1 << 20
+	maxAPIRequestSize  = 10_240
 )
 
 type Info struct {
-	CoreVoltage       int      `json:"coreVoltage"`
-	CoreVoltageActual float64  `json:"coreVoltageActual"`
-	ErrorPercentage   *float64 `json:"errorPercentage"`
-	ExpectedHashRate  float64  `json:"expectedHashrate"`
-	FanRPM            int      `json:"fanrpm"`
-	FanSpeed          float64  `json:"fanspeed"`
-	Frequency         int      `json:"frequency"`
-	HashRate          float64  `json:"hashRate"`
-	Hostname          string   `json:"hostname"`
-	MacAddr           string   `json:"macAddr"`
-	OverHeatMode      int      `json:"overheat_mode"`
-	Power             float64  `json:"power"`
-	SharesAccepted    uint64   `json:"sharesAccepted"`
-	SharesRejected    uint64   `json:"sharesRejected"`
-	Temp              float64  `json:"temp"`
-	UpTimeSeconds     int      `json:"uptimeSeconds"`
-	VRTemp            float64  `json:"vrTemp"`
+	Version                string   `json:"version"`
+	ASICModel              string   `json:"ASICModel"`
+	BoardVersion           string   `json:"boardVersion"`
+	CoreVoltage            int      `json:"coreVoltage"`
+	CoreVoltageActual      float64  `json:"coreVoltageActual"`
+	ErrorPercentage        *float64 `json:"errorPercentage"`
+	ExpectedHashRate       float64  `json:"expectedHashrate"`
+	FanRPM                 int      `json:"fanrpm"`
+	FanSpeed               float64  `json:"fanspeed"`
+	Frequency              int      `json:"frequency"`
+	HashRate               float64  `json:"hashRate"`
+	Hostname               string   `json:"hostname"`
+	MacAddr                string   `json:"macAddr"`
+	OverHeatMode           int      `json:"overheat_mode"`
+	Power                  float64  `json:"power"`
+	PowerFault             *string  `json:"power_fault"`
+	SharesAccepted         uint64   `json:"sharesAccepted"`
+	SharesRejected         uint64   `json:"sharesRejected"`
+	StratumURL             string   `json:"stratumURL"`
+	StratumPort            int      `json:"stratumPort"`
+	StratumUser            string   `json:"stratumUser"`
+	FallbackStratumURL     string   `json:"fallbackStratumURL"`
+	FallbackStratumPort    int      `json:"fallbackStratumPort"`
+	FallbackStratumUser    string   `json:"fallbackStratumUser"`
+	IsUsingFallbackStratum int      `json:"isUsingFallbackStratum"`
+	Temp                   float64  `json:"temp"`
+	UpTimeSeconds          int      `json:"uptimeSeconds"`
+	VRTemp                 float64  `json:"vrTemp"`
 }
 
 type ASICSettings struct {
@@ -84,14 +97,24 @@ func NewBitaxeClient(timeout time.Duration) *BitaxeClient {
 
 	return &BitaxeClient{
 		httpClient: &http.Client{
-			Timeout:   timeout,
-			Transport: transport,
+			Timeout:       timeout,
+			Transport:     transport,
+			CheckRedirect: rejectRedirect,
 		},
 	}
 }
 
 func newBitaxeClient(httpClient *http.Client) *BitaxeClient {
-	return &BitaxeClient{httpClient: httpClient}
+	if httpClient == nil {
+		return &BitaxeClient{}
+	}
+	cloned := *httpClient
+	cloned.CheckRedirect = rejectRedirect
+	return &BitaxeClient{httpClient: &cloned}
+}
+
+func rejectRedirect(_ *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("Bitaxe redirects are not allowed")
 }
 
 func (client *BitaxeClient) GetSystemInfo(ctx context.Context, target string) (Info, error) {
@@ -108,6 +131,7 @@ func (client *BitaxeClient) GetSystemInfo(ctx context.Context, target string) (I
 	if err := validateInfo(info); err != nil {
 		return Info{}, fmt.Errorf("validate system info: %w", err)
 	}
+	info.MacAddr, _ = normalizeMAC(info.MacAddr)
 	return info, nil
 }
 
@@ -148,43 +172,113 @@ func (client *BitaxeClient) GetASICSettings(
 	return settings, nil
 }
 
-type axeSettingsPatch struct {
+type axeOperatingPointPatch struct {
 	Frequency    int  `json:"frequency"`
-	CoreVoltage  int  `json:"coreVoltage,omitempty"`
+	CoreVoltage  int  `json:"coreVoltage"`
 	OverHeatMode *int `json:"overheat_mode,omitempty"`
 }
 
-func (client *BitaxeClient) SetOperatingPoint(
-	ctx context.Context,
-	point OperatingPoint,
-	target string,
-) error {
-	if err := validateOperatingPoint(point); err != nil {
-		return fmt.Errorf("set operating point: %w", err)
-	}
-	return client.patch(ctx, target, axeSettingsPatch{
-		Frequency:   point.Frequency,
-		CoreVoltage: point.CoreVoltage,
-	})
+type axeMiningPatch struct {
+	StratumURL              string `json:"stratumURL"`
+	StratumPort             int    `json:"stratumPort"`
+	StratumUser             string `json:"stratumUser"`
+	StratumPassword         string `json:"stratumPassword"`
+	FallbackStratumURL      string `json:"fallbackStratumURL"`
+	FallbackStratumPort     int    `json:"fallbackStratumPort"`
+	FallbackStratumUser     string `json:"fallbackStratumUser"`
+	FallbackStratumPassword string `json:"fallbackStratumPassword"`
 }
 
-// RecoverOperatingPoint applies a complete operating point before clearing the
-// firmware's latched overheat flag.
-func (client *BitaxeClient) RecoverOperatingPoint(
+// PatchOperatingPoint persists one complete advertised operating-point pair.
+// The caller must restart and verify the device before treating it as active.
+func (client *BitaxeClient) PatchOperatingPoint(
 	ctx context.Context,
 	point OperatingPoint,
 	target string,
 ) error {
 	if err := validateOperatingPoint(point); err != nil {
-		return fmt.Errorf("recover Bitaxe: %w", err)
+		return fmt.Errorf("patch operating point: %w", err)
+	}
+	return client.patch(ctx, target, axeOperatingPointPatch{
+		Frequency:   point.Frequency,
+		CoreVoltage: point.CoreVoltage,
+	}, false)
+}
+
+// PatchOverheatRecovery persists one complete pair while clearing the firmware
+// overheat flag. The caller must restart and verify the device.
+func (client *BitaxeClient) PatchOverheatRecovery(
+	ctx context.Context,
+	point OperatingPoint,
+	target string,
+) error {
+	if err := validateOperatingPoint(point); err != nil {
+		return fmt.Errorf("patch overheat recovery: %w", err)
 	}
 
 	disabled := 0
-	return client.patch(ctx, target, axeSettingsPatch{
+	return client.patch(ctx, target, axeOperatingPointPatch{
 		Frequency:    point.Frequency,
 		CoreVoltage:  point.CoreVoltage,
 		OverHeatMode: &disabled,
-	})
+	}, false)
+}
+
+// PatchMiningConfiguration persists complete primary and fallback Stratum
+// settings without exposing a secret-bearing payload type.
+func (client *BitaxeClient) PatchMiningConfiguration(
+	ctx context.Context,
+	settings MiningSettings,
+	primaryPassword string,
+	fallbackPassword string,
+	target string,
+) error {
+	if err := validateMiningSettings(settings); err != nil {
+		return fmt.Errorf("patch mining configuration: %w", err)
+	}
+	if !settings.Enabled {
+		return fmt.Errorf("patch mining configuration: mining is not enabled")
+	}
+	if err := validateResolvedPassword("primary", primaryPassword); err != nil {
+		return fmt.Errorf("patch mining configuration: %w", err)
+	}
+	if err := validateResolvedPassword("fallback", fallbackPassword); err != nil {
+		return fmt.Errorf("patch mining configuration: %w", err)
+	}
+	return client.patch(ctx, target, axeMiningPatch{
+		StratumURL:              settings.Primary.Host,
+		StratumPort:             settings.Primary.Port,
+		StratumUser:             settings.Primary.User,
+		StratumPassword:         primaryPassword,
+		FallbackStratumURL:      settings.Fallback.Host,
+		FallbackStratumPort:     settings.Fallback.Port,
+		FallbackStratumUser:     settings.Fallback.User,
+		FallbackStratumPassword: fallbackPassword,
+	}, true)
+}
+
+// Restart requests an AxeOS system restart.
+func (client *BitaxeClient) Restart(ctx context.Context, target string) error {
+	requestURL, err := bitaxeURL(target, "/api/system/restart")
+	if err != nil {
+		return fmt.Errorf("restart Bitaxe: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("restart Bitaxe: create request: %w", err)
+	}
+	response, err := client.do(request)
+	if err != nil {
+		return fmt.Errorf("restart Bitaxe: %w", err)
+	}
+	defer response.Body.Close()
+	if err := requireSuccessfulStatusOnly(response); err != nil {
+		return fmt.Errorf("restart Bitaxe: %w", err)
+	}
+	if err := discardBounded(response.Body); err != nil {
+		return fmt.Errorf("restart Bitaxe: %w", err)
+	}
+	return nil
 }
 
 func validateOperatingPoint(point OperatingPoint) error {
@@ -196,6 +290,16 @@ func validateOperatingPoint(point OperatingPoint) error {
 	default:
 		return nil
 	}
+}
+
+func validateResolvedPassword(name string, password string) error {
+	if password == "" {
+		return fmt.Errorf("%s password environment variable is empty", name)
+	}
+	if !utf8.ValidString(password) || len([]byte(password)) > 255 {
+		return fmt.Errorf("%s password must be valid UTF-8 and at most 255 bytes", name)
+	}
+	return nil
 }
 
 func normalizedOptions(options []int, valid func(int) bool) []int {
@@ -253,11 +357,15 @@ func (client *BitaxeClient) getJSON(
 func (client *BitaxeClient) patch(
 	ctx context.Context,
 	target string,
-	patch axeSettingsPatch,
+	patch any,
+	secret bool,
 ) error {
 	body, err := json.Marshal(patch)
 	if err != nil {
 		return fmt.Errorf("encode settings: %w", err)
+	}
+	if len(body) > maxAPIRequestSize {
+		return fmt.Errorf("encoded settings exceed %d bytes", maxAPIRequestSize)
 	}
 	requestURL, err := bitaxeURL(target, "/api/system")
 	if err != nil {
@@ -280,10 +388,17 @@ func (client *BitaxeClient) patch(
 	}
 	defer response.Body.Close()
 
-	if err := requireSuccessfulStatus(response); err != nil {
+	if secret {
+		err = requireSuccessfulStatusOnly(response)
+	} else {
+		err = requireSuccessfulStatus(response)
+	}
+	if err != nil {
 		return fmt.Errorf("patch Bitaxe: %w", err)
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxAPIResponseSize))
+	if err := discardBounded(response.Body); err != nil {
+		return fmt.Errorf("patch Bitaxe: %w", err)
+	}
 	return nil
 }
 
@@ -328,6 +443,28 @@ func requireSuccessfulStatus(response *http.Response) error {
 	return fmt.Errorf("HTTP %s: %s", status, detail)
 }
 
+func requireSuccessfulStatusOnly(response *http.Response) error {
+	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	status := response.Status
+	if status == "" {
+		status = fmt.Sprintf("%d", response.StatusCode)
+	}
+	return fmt.Errorf("HTTP %s", status)
+}
+
+func discardBounded(body io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(body, maxAPIResponseSize+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxAPIResponseSize {
+		return fmt.Errorf("response exceeds %d bytes", maxAPIResponseSize)
+	}
+	return nil
+}
+
 func decodeResponse(body io.Reader, destination any) error {
 	data, err := io.ReadAll(io.LimitReader(body, maxAPIResponseSize+1))
 	if err != nil {
@@ -346,11 +483,20 @@ func decodeResponse(body io.Reader, destination any) error {
 }
 
 func validateInfo(info Info) error {
+	_, macErr := normalizeMAC(info.MacAddr)
 	switch {
 	case strings.TrimSpace(info.Hostname) == "":
 		return fmt.Errorf("hostname is empty")
-	case strings.TrimSpace(info.MacAddr) == "":
-		return fmt.Errorf("MAC address is empty")
+	case strings.TrimSpace(info.Hostname) != info.Hostname || hasControl(info.Hostname):
+		return fmt.Errorf("hostname is invalid")
+	case macErr != nil:
+		return macErr
+	case strings.TrimSpace(info.Version) == "":
+		return fmt.Errorf("firmware version is empty")
+	case strings.TrimSpace(info.ASICModel) == "":
+		return fmt.Errorf("ASIC model is empty")
+	case strings.TrimSpace(info.BoardVersion) == "":
+		return fmt.Errorf("board version is empty")
 	case info.Frequency <= 0 || info.Frequency > 10_000:
 		return fmt.Errorf("frequency %d is outside the accepted range", info.Frequency)
 	case info.CoreVoltage < 0 || info.CoreVoltage > 10_000:
@@ -372,12 +518,29 @@ func validateInfo(info Info) error {
 		return fmt.Errorf("uptime %d is invalid", info.UpTimeSeconds)
 	case info.OverHeatMode < 0:
 		return fmt.Errorf("overheat mode %d is invalid", info.OverHeatMode)
+	case info.StratumPort < 0 || info.StratumPort > 65535:
+		return fmt.Errorf("primary Stratum port %d is invalid", info.StratumPort)
+	case info.FallbackStratumPort < 0 || info.FallbackStratumPort > 65535:
+		return fmt.Errorf("fallback Stratum port %d is invalid", info.FallbackStratumPort)
+	case info.IsUsingFallbackStratum < 0 || info.IsUsingFallbackStratum > 1:
+		return fmt.Errorf(
+			"fallback Stratum status %d is invalid",
+			info.IsUsingFallbackStratum,
+		)
 	case !finite(info.FanSpeed) || info.FanSpeed < 0 || info.FanSpeed > 100:
 		return fmt.Errorf("fan speed %.2f is invalid", info.FanSpeed)
 	case info.FanRPM < 0:
 		return fmt.Errorf("fan RPM %d is invalid", info.FanRPM)
 	}
 	return nil
+}
+
+func normalizeMAC(value string) (string, error) {
+	address, err := net.ParseMAC(value)
+	if err != nil || len(address) != 6 {
+		return "", fmt.Errorf("MAC address %q is invalid", value)
+	}
+	return address.String(), nil
 }
 
 func finite(value float64) bool {
@@ -393,8 +556,14 @@ type scanJob struct {
 }
 
 type scanResult struct {
-	ip       string
-	hostname string
+	miner DiscoveredMiner
+}
+
+// DiscoveredMiner keeps validated identity and telemetry attached to its
+// currently observed IP address.
+type DiscoveredMiner struct {
+	IP   string
+	Info Info
 }
 
 // ScanNetwork probes each local IPv4 /24 with a fixed worker limit. Probe
@@ -405,7 +574,7 @@ func ScanNetwork(
 	hostnames map[string]bool,
 	settingsFile SettingsFile,
 	client SystemInfoClient,
-) ([]string, error) {
+) ([]DiscoveredMiner, error) {
 	if client == nil {
 		return nil, fmt.Errorf("scan network: system-info client is nil")
 	}
@@ -448,23 +617,51 @@ func ScanNetwork(
 	workers.Wait()
 	close(results)
 
-	found := make(map[string]string)
+	var discovered []scanResult
 	for result := range results {
-		found[result.ip] = result.hostname
+		discovered = append(discovered, result)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	ips := make([]string, 0, len(found))
-	for ip, hostname := range found {
-		log.Printf("Found Bitaxe: %s %s", ip, hostname)
-		ips = append(ips, ip)
+	miners, err := canonicalDiscovered(discovered)
+	if err != nil {
+		return nil, fmt.Errorf("scan network: %w", err)
 	}
-	sort.Slice(ips, func(left int, right int) bool {
-		return bytes.Compare(net.ParseIP(ips[left]).To4(), net.ParseIP(ips[right]).To4()) < 0
+	for _, miner := range miners {
+		log.Printf("Found Bitaxe: %s %s", miner.IP, miner.Info.Hostname)
+	}
+	return miners, nil
+}
+
+func canonicalDiscovered(results []scanResult) ([]DiscoveredMiner, error) {
+	found := make(map[string]DiscoveredMiner, len(results))
+	for _, result := range results {
+		miner := result.miner
+		if existing, ok := found[miner.Info.MacAddr]; ok && existing.IP != miner.IP {
+			return nil, fmt.Errorf(
+				"MAC %s was discovered at both %s and %s",
+				miner.Info.MacAddr,
+				existing.IP,
+				miner.IP,
+			)
+		}
+		found[miner.Info.MacAddr] = miner
+	}
+	miners := make([]DiscoveredMiner, 0, len(found))
+	for _, miner := range found {
+		miners = append(miners, miner)
+	}
+	sort.Slice(miners, func(left int, right int) bool {
+		if miners[left].Info.MacAddr != miners[right].Info.MacAddr {
+			return miners[left].Info.MacAddr < miners[right].Info.MacAddr
+		}
+		return bytes.Compare(
+			net.ParseIP(miners[left].IP).To4(),
+			net.ParseIP(miners[right].IP).To4(),
+		) < 0
 	})
-	return ips, nil
+	return miners, nil
 }
 
 func probeMiner(
@@ -477,7 +674,7 @@ func probeMiner(
 ) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("Recovered panic while probing %s: %v\n%s", ip, recovered, debug.Stack())
+			log.Printf("Recovered panic while probing %s\n%s", ip, debug.Stack())
 		}
 	}()
 
@@ -501,7 +698,7 @@ func probeMiner(
 	}
 
 	select {
-	case results <- scanResult{ip: ip, hostname: info.Hostname}:
+	case results <- scanResult{miner: DiscoveredMiner{IP: ip, Info: info}}:
 	case <-ctx.Done():
 	}
 }

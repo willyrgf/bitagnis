@@ -11,7 +11,6 @@ import (
 )
 
 const (
-	pendingTimeout          = 2 * time.Minute
 	manualConfirmationPolls = 2
 	blockedPointRetry       = 2 * time.Hour
 	minimumHashGain         = 0.02
@@ -62,49 +61,57 @@ func (minerController *controller) controlMiner(
 	settings lib.Settings,
 	now time.Time,
 ) error {
+	handled, err := minerController.enforceMinerSafety(
+		ctx,
+		state,
+		info,
+		asic,
+		settings,
+		now,
+	)
+	if err != nil || handled {
+		return err
+	}
+	return minerController.controlMinerAfterSafety(
+		ctx,
+		state,
+		info,
+		asic,
+		settings,
+		now,
+		true,
+	)
+}
+
+func (minerController *controller) enforceMinerSafety(
+	ctx context.Context,
+	state *lib.MinerState,
+	info lib.Info,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+) (bool, error) {
 	if state == nil {
-		return fmt.Errorf("control miner: state is nil")
+		return true, fmt.Errorf("control miner: state is nil")
 	}
 	livePoint := operatingPointFromInfo(info)
 
 	if info.OverHeatMode != 0 {
-		return minerController.handleOverheat(ctx, state, info, asic, settings, now)
+		return true, minerController.handleOverheat(ctx, state, info, asic, settings, now)
 	}
-	if state.OverheatPending && state.PendingFrequency == 0 {
-		if validLivePoint(livePoint) {
-			state.SetCurrentPoint(livePoint)
-		}
-		state.SetBestPoint(lib.OperatingPoint{})
-		state.BestHashRate = 0
-		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.OverheatPending = false
-		state.Phase = lib.PhaseCooldown
-		state.PhaseStartedAt = now
-		state.RampUntil = now.Add(settings.RampUpTime)
-		state.ObservedCount = 0
-		state.ObservedFrequency = 0
-		state.ObservedCoreVoltage = 0
-		minerController.resetRuntime(state.MacAddr)
-		if err := minerController.states.SaveMiner(state); err != nil {
-			return fmt.Errorf("accept %s firmware overheat recovery: %w", state.Hostname, err)
-		}
-		minerController.logf(
-			"Bitaxe %s left overheat mode at %d MHz/%d mV; cooldown until %s",
-			state.Hostname,
-			livePoint.Frequency,
-			livePoint.CoreVoltage,
-			state.CooldownUntil.Format(time.RFC3339),
-		)
-		return nil
+	if state.OverheatPending {
+		return true, minerController.handleOverheat(ctx, state, info, asic, settings, now)
 	}
 
 	if failure, failed := instantaneousSafetyFailure(info, settings); failed {
-		if state.PendingFrequency != 0 &&
+		if state.PendingKind != "" &&
 			state.PendingPoint() != livePoint &&
 			noMoreAggressive(state.PendingPoint(), livePoint) {
-			return minerController.reconcilePending(ctx, state, livePoint, settings, now)
+			state.Phase = lib.PhaseCooldown
+			state.PhaseStartedAt = now
+			return true, minerController.states.SaveMiner(state)
 		}
-		return minerController.rollbackForSafety(
+		return true, minerController.rollbackForSafety(
 			ctx,
 			state,
 			livePoint,
@@ -117,10 +124,22 @@ func (minerController *controller) controlMiner(
 		)
 	}
 
-	if state.PendingFrequency != 0 {
-		return minerController.reconcilePending(ctx, state, livePoint, settings, now)
+	if state.PendingKind != "" || state.MiningPending {
+		return true, nil
 	}
+	return false, nil
+}
 
+func (minerController *controller) controlMinerAfterSafety(
+	ctx context.Context,
+	state *lib.MinerState,
+	info lib.Info,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+	allowOptimization bool,
+) error {
+	livePoint := operatingPointFromInfo(info)
 	if !validLivePoint(state.CurrentPoint()) {
 		if !validLivePoint(livePoint) {
 			return fmt.Errorf(
@@ -171,6 +190,9 @@ func (minerController *controller) controlMiner(
 		return nil
 	}
 
+	if !allowOptimization {
+		return nil
+	}
 	if info.UpTimeSeconds < 60 || now.Before(state.RampUntil) {
 		return nil
 	}
@@ -179,73 +201,6 @@ func (minerController *controller) controlMiner(
 		return nil
 	}
 	return minerController.evaluateWindow(ctx, state, summary, asic, settings, now)
-}
-
-func (minerController *controller) reconcilePending(
-	_ context.Context,
-	state *lib.MinerState,
-	livePoint lib.OperatingPoint,
-	settings lib.Settings,
-	now time.Time,
-) error {
-	pending := state.PendingPoint()
-	if livePoint == pending {
-		recovery := state.PendingRecovery
-		state.SetCurrentPoint(pending)
-		state.ClearPendingPoint()
-		state.ObservedCount = 0
-		state.ObservedFrequency = 0
-		state.ObservedCoreVoltage = 0
-		state.RampUntil = now.Add(settings.RampUpTime)
-		state.PhaseStartedAt = now
-		if recovery {
-			state.OverheatPending = false
-			state.Phase = lib.PhaseCooldown
-		}
-		minerController.resetRuntime(state.MacAddr)
-		if err := minerController.states.SaveMiner(state); err != nil {
-			return fmt.Errorf("confirm %s operating point: %w", state.Hostname, err)
-		}
-		minerController.logf(
-			"Operating point confirmed for %s: %d MHz/%d mV (%s)",
-			state.Hostname,
-			pending.Frequency,
-			pending.CoreVoltage,
-			state.Phase,
-		)
-		return nil
-	}
-	if now.Sub(state.PendingSince) < pendingTimeout {
-		return nil
-	}
-
-	state.ClearPendingPoint()
-	if validLivePoint(livePoint) {
-		state.SetCurrentPoint(livePoint)
-	}
-	state.SetFallbackPoint(lib.OperatingPoint{})
-	state.SetBestPoint(lib.OperatingPoint{})
-	state.BestHashRate = 0
-	state.Phase = lib.PhaseBaseline
-	if now.Before(state.CooldownUntil) {
-		state.Phase = lib.PhaseCooldown
-	}
-	state.PhaseStartedAt = now
-	state.RampUntil = now.Add(settings.RampUpTime)
-	state.ObservedCount = 0
-	state.ObservedFrequency = 0
-	state.ObservedCoreVoltage = 0
-	minerController.resetRuntime(state.MacAddr)
-	if err := minerController.states.SaveMiner(state); err != nil {
-		return fmt.Errorf("record %s operating-point timeout: %w", state.Hostname, err)
-	}
-	minerController.logf(
-		"Operating-point request timed out for %s; adopting live point %d MHz/%d mV",
-		state.Hostname,
-		livePoint.Frequency,
-		livePoint.CoreVoltage,
-	)
-	return nil
 }
 
 func (minerController *controller) observeExternalPoint(
@@ -731,7 +686,7 @@ func (minerController *controller) requestRollback(
 }
 
 func (minerController *controller) requestOperatingPoint(
-	ctx context.Context,
+	_ context.Context,
 	state *lib.MinerState,
 	target lib.OperatingPoint,
 	phase lib.OptimizerPhase,
@@ -757,9 +712,11 @@ func (minerController *controller) requestOperatingPoint(
 			target.CoreVoltage,
 		)
 	}
-	state.SetPendingPoint(target)
-	state.PendingSince = now
-	state.PendingRecovery = recovery
+	kind := lib.MutationOperatingPoint
+	if recovery {
+		kind = lib.MutationOverheatRecovery
+	}
+	state.SetPendingMutation(kind, target, now)
 	state.Phase = phase
 	state.PhaseStartedAt = now
 	state.RampUntil = time.Time{}
@@ -770,27 +727,9 @@ func (minerController *controller) requestOperatingPoint(
 		return fmt.Errorf("persist %s operating-point request: %w", state.Hostname, err)
 	}
 
-	var err error
-	if recovery {
-		err = minerController.devices.RecoverOperatingPoint(ctx, target, state.IP)
-	} else {
-		err = minerController.devices.SetOperatingPoint(ctx, target, state.IP)
-	}
-	if err != nil {
-		state.ClearPendingPoint()
-		state.Phase = lib.PhaseHold
-		_ = minerController.states.SaveMiner(state)
-		return fmt.Errorf(
-			"apply %s operating point %d MHz/%d mV: %w",
-			state.Hostname,
-			target.Frequency,
-			target.CoreVoltage,
-			err,
-		)
-	}
 	minerController.resetRuntime(state.MacAddr)
 	minerController.logf(
-		"Operating point requested for %s: %d MHz/%d mV (%s)",
+		"Operating point queued for %s: %d MHz/%d mV (%s)",
 		state.Hostname,
 		target.Frequency,
 		target.CoreVoltage,
@@ -855,7 +794,7 @@ func (minerController *controller) rollbackForSafety(
 		ctx,
 		state,
 		target,
-		lib.PhaseBaseline,
+		lib.PhaseCooldown,
 		false,
 		now,
 	)
@@ -898,7 +837,7 @@ func (minerController *controller) bestRollbackPoint(
 }
 
 func (minerController *controller) handleOverheat(
-	ctx context.Context,
+	_ context.Context,
 	state *lib.MinerState,
 	info lib.Info,
 	asic lib.ASICSettings,
@@ -912,7 +851,12 @@ func (minerController *controller) handleOverheat(
 		state.CooldownUntil = now.Add(overheatCooldown(settings, state.OverheatCount))
 		state.Phase = lib.PhaseOverheat
 		state.PhaseStartedAt = now
-		state.ClearPendingPoint()
+		target, err := minimumAdvertisedPoint(asic)
+		if err != nil {
+			return err
+		}
+		state.SetPendingMutation(lib.MutationOverheatRecovery, target, now)
+		state.SetFallbackPoint(lib.OperatingPoint{})
 		if err := minerController.states.SaveMiner(state); err != nil {
 			return fmt.Errorf("record overheat for %s: %w", state.Hostname, err)
 		}
@@ -926,23 +870,21 @@ func (minerController *controller) handleOverheat(
 			return err
 		}
 	}
-	if state.PendingRecovery || !safeToRecover(info, settings) {
+	if state.PendingKind != lib.MutationOverheatRecovery {
+		target, err := minimumAdvertisedPoint(asic)
+		if err != nil {
+			return err
+		}
+		state.SetPendingMutation(lib.MutationOverheatRecovery, target, now)
+		state.SetFallbackPoint(lib.OperatingPoint{})
+		if err := minerController.states.SaveMiner(state); err != nil {
+			return fmt.Errorf("replace %s mutation with overheat recovery: %w", state.Hostname, err)
+		}
+	}
+	if !safeToRecover(info, settings) {
 		return nil
 	}
-
-	target, err := minimumAdvertisedPoint(asic)
-	if err != nil {
-		return err
-	}
-	state.SetFallbackPoint(lib.OperatingPoint{})
-	return minerController.requestOperatingPoint(
-		ctx,
-		state,
-		target,
-		lib.PhaseCooldown,
-		true,
-		now,
-	)
+	return nil
 }
 
 func (minerController *controller) addSample(
@@ -990,7 +932,7 @@ func (minerController *controller) formatWindow(
 	settings lib.Settings,
 	now time.Time,
 ) string {
-	if state.PendingFrequency != 0 {
+	if state.PendingKind != "" || state.MiningPending {
 		return "apply"
 	}
 	if now.Before(state.RampUntil) {

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,38 +29,73 @@ const (
 )
 
 type Settings struct {
-	Skip                    bool    `yaml:"skip"`
-	RecoveryTemp            float64 `yaml:"recoveryTemp"`
-	TargetTemp              float64 `yaml:"targetTemp"`
-	TempLimit               float64 `yaml:"tempLimit"`
-	TempCutoff              float64 `yaml:"tempCutoff"`
-	MaxPower                float64 `yaml:"maxPower"`
-	VRTempHigh              float64 `yaml:"vrTempHigh"`
-	MaxErrorPercentage      float64 `yaml:"maxErrorPercentage"`
-	MetricsInterval         int     `yaml:"metricsInterval"`
-	RampUpSeconds           int     `yaml:"rampUpSeconds"`
-	EvaluationWindowMinutes int     `yaml:"evaluationWindowMinutes"`
-	OverheatCooldownMins    int     `yaml:"overheatCooldownMinutes"`
+	Skip                    bool           `yaml:"skip"`
+	RecoveryTemp            float64        `yaml:"recoveryTemp"`
+	TargetTemp              float64        `yaml:"targetTemp"`
+	TempLimit               float64        `yaml:"tempLimit"`
+	TempCutoff              float64        `yaml:"tempCutoff"`
+	MaxPower                float64        `yaml:"maxPower"`
+	VRTempHigh              float64        `yaml:"vrTempHigh"`
+	MaxErrorPercentage      float64        `yaml:"maxErrorPercentage"`
+	MetricsInterval         int            `yaml:"metricsInterval"`
+	RampUpSeconds           int            `yaml:"rampUpSeconds"`
+	EvaluationWindowMinutes int            `yaml:"evaluationWindowMinutes"`
+	OverheatCooldownMins    int            `yaml:"overheatCooldownMinutes"`
+	Mining                  MiningSettings `yaml:"mining"`
 
 	MetricsTime          time.Duration `yaml:"-"`
 	RampUpTime           time.Duration `yaml:"-"`
 	EvaluationWindowTime time.Duration `yaml:"-"`
 }
 
+// MiningSettings is the complete desired primary and fallback Stratum
+// configuration for one effective hostname.
+type MiningSettings struct {
+	Enabled  bool         `yaml:"enabled"`
+	Primary  PoolSettings `yaml:"primary"`
+	Fallback PoolSettings `yaml:"fallback"`
+}
+
+// PoolSettings identifies one desired Stratum endpoint and the environment
+// variable that supplies its write-only password.
+type PoolSettings struct {
+	Host        string `yaml:"host"`
+	Port        int    `yaml:"port"`
+	User        string `yaml:"user"`
+	PasswordEnv string `yaml:"passwordEnv"`
+}
+
 // SettingsOverride uses pointers so false and an omitted setting remain
 // distinguishable. Explicit zero values are rejected after merging.
 type SettingsOverride struct {
-	Skip                    *bool    `yaml:"skip"`
-	RecoveryTemp            *float64 `yaml:"recoveryTemp"`
-	TargetTemp              *float64 `yaml:"targetTemp"`
-	TempLimit               *float64 `yaml:"tempLimit"`
-	TempCutoff              *float64 `yaml:"tempCutoff"`
-	MaxPower                *float64 `yaml:"maxPower"`
-	VRTempHigh              *float64 `yaml:"vrTempHigh"`
-	MaxErrorPercentage      *float64 `yaml:"maxErrorPercentage"`
-	RampUpSeconds           *int     `yaml:"rampUpSeconds"`
-	EvaluationWindowMinutes *int     `yaml:"evaluationWindowMinutes"`
-	OverheatCooldownMins    *int     `yaml:"overheatCooldownMinutes"`
+	Skip                    *bool                   `yaml:"skip"`
+	RecoveryTemp            *float64                `yaml:"recoveryTemp"`
+	TargetTemp              *float64                `yaml:"targetTemp"`
+	TempLimit               *float64                `yaml:"tempLimit"`
+	TempCutoff              *float64                `yaml:"tempCutoff"`
+	MaxPower                *float64                `yaml:"maxPower"`
+	VRTempHigh              *float64                `yaml:"vrTempHigh"`
+	MaxErrorPercentage      *float64                `yaml:"maxErrorPercentage"`
+	RampUpSeconds           *int                    `yaml:"rampUpSeconds"`
+	EvaluationWindowMinutes *int                    `yaml:"evaluationWindowMinutes"`
+	OverheatCooldownMins    *int                    `yaml:"overheatCooldownMinutes"`
+	Mining                  *MiningSettingsOverride `yaml:"mining"`
+}
+
+// MiningSettingsOverride retains omission semantics while merging nested
+// hostname overrides.
+type MiningSettingsOverride struct {
+	Enabled  *bool                 `yaml:"enabled"`
+	Primary  *PoolSettingsOverride `yaml:"primary"`
+	Fallback *PoolSettingsOverride `yaml:"fallback"`
+}
+
+// PoolSettingsOverride retains omission semantics for individual pool fields.
+type PoolSettingsOverride struct {
+	Host        *string `yaml:"host"`
+	Port        *int    `yaml:"port"`
+	User        *string `yaml:"user"`
+	PasswordEnv *string `yaml:"passwordEnv"`
 }
 
 type SettingsFile struct {
@@ -90,6 +127,11 @@ func LoadSettings(path string) (SettingsFile, error) {
 	}
 
 	settingsFile.Defaults = withDefaults(settingsFile.Defaults)
+	if settingsFile.Defaults.Mining.Enabled {
+		return SettingsFile{}, fmt.Errorf(
+			"settings defaults: mining.enabled must be false; enable mining in an explicit hostname override",
+		)
+	}
 	if err := validateSettings(settingsFile.Defaults); err != nil {
 		return SettingsFile{}, fmt.Errorf("settings defaults: %w", err)
 	}
@@ -198,6 +240,9 @@ func validateSettings(settings Settings) error {
 	case settings.OverheatCooldownMins <= 0 || settings.OverheatCooldownMins > 24*60:
 		return fmt.Errorf("overheatCooldownMinutes must be between 1 and 1440")
 	}
+	if err := validateMiningSettings(settings.Mining); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -235,5 +280,142 @@ func mergeSettings(settings Settings, override SettingsOverride) Settings {
 	if override.OverheatCooldownMins != nil {
 		settings.OverheatCooldownMins = *override.OverheatCooldownMins
 	}
+	if override.Mining != nil {
+		settings.Mining = mergeMiningSettings(settings.Mining, *override.Mining)
+	}
 	return withDurations(settings)
+}
+
+func mergeMiningSettings(
+	settings MiningSettings,
+	override MiningSettingsOverride,
+) MiningSettings {
+	if override.Enabled != nil {
+		settings.Enabled = *override.Enabled
+	}
+	if override.Primary != nil {
+		settings.Primary = mergePoolSettings(settings.Primary, *override.Primary)
+	}
+	if override.Fallback != nil {
+		settings.Fallback = mergePoolSettings(settings.Fallback, *override.Fallback)
+	}
+	return settings
+}
+
+func mergePoolSettings(settings PoolSettings, override PoolSettingsOverride) PoolSettings {
+	if override.Host != nil {
+		settings.Host = *override.Host
+	}
+	if override.Port != nil {
+		settings.Port = *override.Port
+	}
+	if override.User != nil {
+		settings.User = *override.User
+	}
+	if override.PasswordEnv != nil {
+		settings.PasswordEnv = *override.PasswordEnv
+	}
+	return settings
+}
+
+func validateMiningSettings(settings MiningSettings) error {
+	if !settings.Enabled {
+		return nil
+	}
+	if err := validatePoolSettings("primary", settings.Primary); err != nil {
+		return err
+	}
+	if err := validatePoolSettings("fallback", settings.Fallback); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePoolSettings(name string, settings PoolSettings) error {
+	switch {
+	case !validPoolHost(settings.Host):
+		return fmt.Errorf("mining %s host is not a bare DNS host or IPv4 address", name)
+	case settings.Port < 1 || settings.Port > 65535:
+		return fmt.Errorf("mining %s port must be between 1 and 65535", name)
+	case !validPoolText(settings.User):
+		return fmt.Errorf("mining %s user must be non-empty, at most 255 bytes, and have no surrounding whitespace or control characters", name)
+	case !validEnvironmentName(settings.PasswordEnv):
+		return fmt.Errorf("mining %s passwordEnv is invalid", name)
+	default:
+		return nil
+	}
+}
+
+func validPoolHost(host string) bool {
+	if host == "" ||
+		len([]byte(host)) > 255 ||
+		strings.TrimSpace(host) != host ||
+		hasControl(host) ||
+		strings.ContainsAny(host, ":/\\?#") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.To4() != nil
+	}
+	if strings.HasSuffix(host, ".") || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') &&
+				character != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validPoolText(value string) bool {
+	return value != "" &&
+		len([]byte(value)) <= 255 &&
+		strings.TrimSpace(value) == value &&
+		!hasControl(value)
+}
+
+func validEnvironmentName(value string) bool {
+	if value == "" ||
+		len([]byte(value)) > 255 ||
+		strings.TrimSpace(value) != value ||
+		hasControl(value) {
+		return false
+	}
+	for index, character := range value {
+		if index == 0 {
+			if character != '_' &&
+				(character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') {
+				return false
+			}
+			continue
+		}
+		if character != '_' &&
+			(character < 'a' || character > 'z') &&
+			(character < 'A' || character > 'Z') &&
+			(character < '0' || character > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func hasControl(value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return true
+		}
+	}
+	return false
 }

@@ -1,9 +1,9 @@
 # Bitagnis Development Guide for AI Agents
 
 This document is the source of truth for AI-agent behavior and contribution rules in this
-repository. `README.md` describes the current thermal-control behavior.
-`RFC_FULL_CONTROL.md` is a proposed future contract, not implemented behavior. The source and tests
-are the executable description of the current system.
+repository. `README.md` describes the current controller behavior.
+`RFC_FULL_CONTROL.md` records the implemented full-control contract and its canary evidence. The
+source and tests are the executable description of the current system.
 
 ## Non-Negotiables
 
@@ -95,17 +95,20 @@ solution is not possible, report the blocker instead of approximating it.
 - `main.go` owns process startup, network discovery orchestration, polling, and terminal rendering.
   Keep it thin; domain decisions belong in the optimizer or `lib`.
 - `optimizer.go` owns thermal-frontier search, telemetry windows, safety evaluation, rollback,
-  cooldown, and overheat recovery.
+  cooldown, overheat policy, and operating-point target selection.
+- `mutation.go` owns mutation priority, durable-intent coordination, preflight checks, PATCH/restart
+  ordering, same-MAC rediscovery, reboot proof, readback, startup mining reconciliation, and the
+  optimization gate.
 - `lib/bitaxe.go` owns AxeOS HTTP transport, response validation, advertised ASIC settings, and local
   network discovery primitives.
 - `lib/settings.go` owns strict YAML decoding, defaults, hostname overrides, and safety-setting
   validation.
-- `lib/state.go` owns durable optimizer state, evaluated operating-point records, and SQLite
-  validation.
+- `lib/state.go` owns durable optimizer and pending-mutation state, evaluated operating-point
+  records, exclusive SQLite ownership, and exact schema validation.
 - `*_test.go` files own executable behavior contracts. Keep controller/optimizer tests in the root
   package and library boundary tests in `lib`.
-- `RFC_FULL_CONTROL.md` owns the proposed mining-configuration design. Do not treat proposed
-  commands, fields, persistence, or mutation coordination as already implemented.
+- `RFC_FULL_CONTROL.md` owns the full-control contract and its operational canary gate. Keep the
+  implementation status and unresolved firmware or canary evidence explicit.
 
 If responsibility moves between these boundaries, update this guide, current documentation, and
 tests in the same change.
@@ -127,7 +130,7 @@ These invariants are high risk if violated:
 - Normal safety rollback chooses a validated point with thermal, VR-temperature, and power
   headroom; if no validated point qualifies, use the minimum advertised pair.
 - Persist a pending operating-point request before touching the device. Do not evaluate it until
-  live telemetry confirms the complete pair.
+  the same MAC returns after proven reboot and exact complete-pair readback.
 - A manual operating-point change requires two consecutive observations before adoption. Adoption
   starts a fresh baseline ramp and telemetry window.
 - Telemetry samples remain in memory. Durable state contains optimizer control state and evaluated
@@ -148,20 +151,23 @@ code, settings, output, and tests.
 ## AxeOS Mutation Constraint
 
 `RFC_FULL_CONTROL.md` records a critical known limitation of AxeOS v2.8.1: `PATCH /api/system`
-persists settings but does not load them into the running miner without a restart. The current
-`BitaxeClient.SetOperatingPoint` stops after the PATCH.
+persists settings but does not load them into the running miner without a restart. All current
+hardware writes therefore use the one coordinator-owned lifecycle:
 
 Do not expand the write surface or claim that a PATCH is active configuration without addressing
 the RFC's phase-zero prerequisite:
 
 ```text
-validate -> PATCH -> restart -> wait for return -> verify -> reset telemetry -> ramp
+validate -> persist intent -> re-read identity and safety -> PATCH -> restart
+         -> rediscover the same MAC -> prove a new boot -> verify
+         -> clear intent and reset telemetry -> ramp
 ```
 
-Any implementation of that lifecycle must serialize mutations per miner, preserve emergency safety
-priority, verify the same device by MAC address, tolerate temporary disappearance, and never race
-mining configuration against thermal control. A fleet-level mutation must be canary-first and
-explicitly authorized.
+Do not add a direct actuator, accept configured NVS readback without reboot proof, or bypass
+per-miner serialization and fleet-wide normal-mutation ordering. Preserve emergency safety
+priority, temporary-disappearance tolerance, and exact same-MAC verification. Mining activation
+remains canary-first and explicitly authorized because the firmware risks in the RFC cannot be
+resolved by host-side code.
 
 ## Go and API Rules
 
@@ -238,8 +244,8 @@ turn a canary test into an implicit fleet rollout.
 - Update `README.md` when current thermal behavior, settings, output, or run commands change.
 - Update `settings.example.yaml` with any current configuration change and ensure its load test
   continues to pass.
-- Update `RFC_FULL_CONTROL.md` only for deliberate changes to the proposed full-control contract.
-  Keep proposal and implementation status explicit.
+- Update `RFC_FULL_CONTROL.md` only for deliberate changes to the full-control contract or its
+  operational evidence. Keep implementation status explicit.
 - Documentation is part of the change, not follow-up work.
 
 ## Repository Hygiene

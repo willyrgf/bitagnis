@@ -29,12 +29,21 @@ const (
 type deviceAPI interface {
 	GetSystemInfo(context.Context, string) (lib.Info, error)
 	GetASICSettings(context.Context, string) (lib.ASICSettings, error)
-	SetOperatingPoint(context.Context, lib.OperatingPoint, string) error
-	RecoverOperatingPoint(context.Context, lib.OperatingPoint, string) error
+	PatchOperatingPoint(context.Context, lib.OperatingPoint, string) error
+	PatchOverheatRecovery(context.Context, lib.OperatingPoint, string) error
+	PatchMiningConfiguration(
+		context.Context,
+		lib.MiningSettings,
+		string,
+		string,
+		string,
+	) error
+	Restart(context.Context, string) error
 }
 
 type optimizerStateStore interface {
 	LoadOrCreate(lib.Info, string, time.Time) (lib.MinerState, bool, error)
+	LoadMiner(string) (lib.MinerState, error)
 	SaveMiner(*lib.MinerState) error
 	SavePoint(*lib.OperatingPointRecord) error
 	ListPoints(string) ([]lib.OperatingPointRecord, error)
@@ -52,17 +61,20 @@ type controller struct {
 
 	asicMu    sync.Mutex
 	asicCache map[string]lib.ASICSettings
+
+	mutations *mutationCoordinator
 }
 
 type pollJob struct {
 	index int
-	ip    string
+	miner lib.DiscoveredMiner
 }
 
 type minerPollResult struct {
 	line              string
 	hashRate          float64
 	hashRateAvailable bool
+	observation       *minerObservation
 }
 
 func main() {
@@ -75,8 +87,15 @@ func main() {
 }
 
 func run(ctx context.Context, arguments []string) error {
+	options, err := parseArguments(arguments)
+	if err != nil {
+		return err
+	}
 	settingsFile, err := lib.LoadSettings("settings.yaml")
 	if err != nil {
+		return err
+	}
+	if err := validateReapplyHostnames(options.reapply, settingsFile); err != nil {
 		return err
 	}
 	defaultSettings, err := settingsFile.ForHost("")
@@ -95,12 +114,14 @@ func run(ctx context.Context, arguments []string) error {
 
 	scanClient := lib.NewBitaxeClient(3 * time.Second)
 	client := lib.NewBitaxeClient(5 * time.Second)
-	hostnames := selectedHostnames(arguments)
-	ips, err := lib.ScanNetwork(ctx, hostnames, settingsFile, scanClient)
+	miners, err := lib.ScanNetwork(ctx, options.hostnames, settingsFile, scanClient)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
+		return err
+	}
+	if err := validateNamedDiscovery(options.hostnames, miners); err != nil {
 		return err
 	}
 
@@ -113,6 +134,44 @@ func run(ctx context.Context, arguments []string) error {
 		runtimes:  make(map[string]*minerRuntime),
 		asicCache: make(map[string]lib.ASICSettings),
 	}
+	rediscover := func(
+		discoveryContext context.Context,
+		macAddr string,
+	) (lib.DiscoveredMiner, error) {
+		discovered, discoveryErr := lib.ScanNetwork(
+			discoveryContext,
+			map[string]bool{"all": true},
+			settingsFile,
+			scanClient,
+		)
+		if discoveryErr != nil {
+			return lib.DiscoveredMiner{}, discoveryErr
+		}
+		for _, miner := range discovered {
+			if miner.Info.MacAddr == macAddr {
+				return miner, nil
+			}
+		}
+		return lib.DiscoveredMiner{}, errMinerNotFound
+	}
+	minerController.mutations = newMutationCoordinator(
+		client,
+		store,
+		settingsFile,
+		miners,
+		options.reapply,
+		rediscover,
+		os.LookupEnv,
+		log.Default(),
+		minerController.resetRuntime,
+	)
+	if !options.hostnames["all"] {
+		expected := make(map[string]string, len(miners))
+		for _, miner := range miners {
+			expected[miner.Info.MacAddr] = miner.Info.Hostname
+		}
+		minerController.mutations.RequireHostnames(expected)
+	}
 	metricsPoll := time.NewTicker(defaultSettings.MetricsTime)
 	defer metricsPoll.Stop()
 	networkPoll := time.NewTicker(20 * time.Minute)
@@ -124,46 +183,132 @@ func run(ctx context.Context, arguments []string) error {
 		defaultSettings.EvaluationWindowTime,
 		defaultSettings.RampUpTime,
 	)
+	minerController.pollMiners(ctx, minerController.mutations.Routes(), time.Now())
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-networkPoll.C:
-			discovered, scanErr := lib.ScanNetwork(ctx, hostnames, settingsFile, scanClient)
+			discovered, scanErr := lib.ScanNetwork(
+				ctx,
+				options.hostnames,
+				settingsFile,
+				scanClient,
+			)
 			if scanErr != nil {
 				if !errors.Is(scanErr, context.Canceled) {
 					log.Printf(
 						"Network rescan failed; retaining %d known miners: %s",
-						len(ips),
+						len(minerController.mutations.Routes()),
 						scanErr,
 					)
 				}
 				continue
 			}
-			ips = discovered
+			if discoveryErr := validateNamedDiscovery(
+				options.hostnames,
+				discovered,
+			); discoveryErr != nil {
+				log.Printf("Network rescan rejected: %s", discoveryErr)
+				continue
+			}
+			minerController.mutations.UpdateDiscovery(discovered)
 		case now := <-metricsPoll.C:
-			minerController.pollMiners(ctx, ips, now)
+			minerController.pollMiners(
+				ctx,
+				minerController.mutations.Routes(),
+				now,
+			)
 		}
 	}
 }
 
-func selectedHostnames(arguments []string) map[string]bool {
-	hostnames := make(map[string]bool)
-	for _, hostname := range arguments {
-		if hostname != "" {
-			hostnames[hostname] = true
+type commandOptions struct {
+	hostnames map[string]bool
+	reapply   map[string]bool
+}
+
+func parseArguments(arguments []string) (commandOptions, error) {
+	options := commandOptions{
+		hostnames: make(map[string]bool),
+		reapply:   make(map[string]bool),
+	}
+	reapply := false
+	for _, argument := range arguments {
+		switch {
+		case argument == "--reapply-mining":
+			if reapply {
+				return commandOptions{}, fmt.Errorf("--reapply-mining was specified more than once")
+			}
+			reapply = true
+		case argument == "":
+			return commandOptions{}, fmt.Errorf("hostname arguments cannot be empty")
+		case argument[0] == '-':
+			return commandOptions{}, fmt.Errorf("unknown flag %q", argument)
+		default:
+			options.hostnames[argument] = true
 		}
 	}
-	if len(hostnames) == 0 {
-		hostnames["all"] = true
+	if reapply {
+		if len(options.hostnames) == 0 {
+			return commandOptions{}, fmt.Errorf("--reapply-mining requires at least one hostname")
+		}
+		for hostname := range options.hostnames {
+			options.reapply[hostname] = true
+		}
 	}
-	return hostnames
+	if len(options.hostnames) == 0 {
+		options.hostnames["all"] = true
+	}
+	return options, nil
+}
+
+func validateReapplyHostnames(
+	hostnames map[string]bool,
+	settingsFile lib.SettingsFile,
+) error {
+	for hostname := range hostnames {
+		settings, err := settingsFile.ForHost(hostname)
+		if err != nil {
+			return err
+		}
+		if !settings.Mining.Enabled {
+			return fmt.Errorf(
+				"--reapply-mining requires mining to be enabled for %q",
+				hostname,
+			)
+		}
+	}
+	return nil
+}
+
+func validateNamedDiscovery(
+	hostnames map[string]bool,
+	miners []lib.DiscoveredMiner,
+) error {
+	if hostnames["all"] {
+		return nil
+	}
+	counts := make(map[string]int)
+	for _, miner := range miners {
+		counts[miner.Info.Hostname]++
+	}
+	for hostname := range hostnames {
+		if counts[hostname] != 1 {
+			return fmt.Errorf(
+				"selected hostname %q must map to exactly one MAC; found %d",
+				hostname,
+				counts[hostname],
+			)
+		}
+	}
+	return nil
 }
 
 func (minerController *controller) pollMiners(
 	ctx context.Context,
-	ips []string,
+	miners []lib.DiscoveredMiner,
 	now time.Time,
 ) {
 	output := minerController.outputWriter()
@@ -182,25 +327,102 @@ func (minerController *controller) pollMiners(
 		"Fan",
 	)
 
-	results := make([]minerPollResult, len(ips))
-	jobs := make(chan pollJob, len(ips))
-	for index, ip := range ips {
-		jobs <- pollJob{index: index, ip: ip}
+	results := make([]minerPollResult, len(miners))
+	jobs := make(chan pollJob, len(miners))
+	for index, miner := range miners {
+		jobs <- pollJob{index: index, miner: miner}
 	}
 	close(jobs)
 
-	workerCount := min(pollWorkerLimit, len(ips))
+	workerCount := min(pollWorkerLimit, len(miners))
 	var workers sync.WaitGroup
 	for range workerCount {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
-				results[job.index] = minerController.pollMinerSafely(ctx, job.ip, now)
+				results[job.index] = minerController.pollMinerSafely(
+					ctx,
+					job.miner,
+					now,
+				)
 			}
 		}()
 	}
 	workers.Wait()
+
+	observations := make(map[string]*minerObservation, len(results))
+	handled := make(map[string]bool, len(results))
+	allowOptimization := minerController.mutations == nil ||
+		minerController.mutations.GateOpen()
+	for index := range results {
+		observation := results[index].observation
+		if observation == nil {
+			continue
+		}
+		observations[observation.state.MacAddr] = observation
+		wasHandled, err := minerController.enforceMinerSafety(
+			ctx,
+			&observation.state,
+			observation.info,
+			observation.asic,
+			observation.settings,
+			now,
+		)
+		handled[observation.state.MacAddr] = wasHandled || err != nil
+		if err != nil && !errors.Is(err, context.Canceled) {
+			minerController.logf(
+				"Safety control failed for %s: %s",
+				observation.info.Hostname,
+				err,
+			)
+		}
+	}
+	if minerController.mutations != nil {
+		if err := minerController.mutations.Advance(ctx, observations, now); err != nil {
+			minerController.logf("Mutation coordination failed: %s", err)
+		}
+	}
+	for index := range results {
+		observation := results[index].observation
+		if observation == nil || handled[observation.state.MacAddr] {
+			continue
+		}
+		if err := minerController.controlMinerAfterSafety(
+			ctx,
+			&observation.state,
+			observation.info,
+			observation.asic,
+			observation.settings,
+			now,
+			allowOptimization,
+		); err != nil && !errors.Is(err, context.Canceled) {
+			minerController.logf(
+				"Optimizer control failed for %s: %s",
+				observation.info.Hostname,
+				err,
+			)
+		}
+	}
+	if minerController.mutations != nil && allowOptimization {
+		if err := minerController.mutations.Advance(ctx, observations, now); err != nil {
+			minerController.logf("Mutation coordination failed: %s", err)
+		}
+	}
+	for index := range results {
+		observation := results[index].observation
+		if observation == nil {
+			continue
+		}
+		results[index].line = minerController.formatMinerLine(
+			observation.state,
+			observation.info,
+			observation.settings,
+			now,
+		)
+		results[index].hashRate = observation.info.HashRate
+		results[index].hashRateAvailable = validHashRate(observation.info.HashRate)
+	}
 
 	sort.Slice(results, func(left int, right int) bool {
 		return results[left].line < results[right].line
@@ -221,36 +443,43 @@ func (minerController *controller) pollMiners(
 
 func (minerController *controller) pollMinerSafely(
 	ctx context.Context,
-	ip string,
+	miner lib.DiscoveredMiner,
 	now time.Time,
 ) (result minerPollResult) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			minerController.logf(
-				"Recovered panic while polling %s: %v\n%s",
-				ip,
-				recovered,
+				"Recovered panic while polling %s\n%s",
+				miner.IP,
 				debug.Stack(),
 			)
 			result = minerPollResult{}
 		}
 	}()
 
-	result, err := minerController.pollMiner(ctx, ip, now)
+	result, err := minerController.pollMiner(ctx, miner, now)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		minerController.logf("Poll failed for %s: %s", ip, err)
+		minerController.logf("Poll failed for %s: %s", miner.IP, err)
 	}
 	return result
 }
 
 func (minerController *controller) pollMiner(
 	ctx context.Context,
-	ip string,
+	miner lib.DiscoveredMiner,
 	now time.Time,
 ) (minerPollResult, error) {
-	info, err := minerController.devices.GetSystemInfo(ctx, ip)
+	info, err := minerController.devices.GetSystemInfo(ctx, miner.IP)
 	if err != nil {
 		return minerPollResult{}, err
+	}
+	if info.MacAddr != miner.Info.MacAddr {
+		return minerPollResult{}, fmt.Errorf(
+			"wrong device at %s: expected MAC %s, found %s",
+			miner.IP,
+			miner.Info.MacAddr,
+			info.MacAddr,
+		)
 	}
 	settings, err := minerController.settings.ForHost(info.Hostname)
 	if err != nil {
@@ -259,11 +488,19 @@ func (minerController *controller) pollMiner(
 	if settings.Skip {
 		return minerPollResult{}, nil
 	}
-	asic, err := minerController.cachedASICSettings(ctx, info.MacAddr, ip)
+	asic, err := minerController.cachedASICSettings(ctx, info.MacAddr, miner.IP)
 	if err != nil {
 		return minerPollResult{}, err
 	}
-	state, created, err := minerController.states.LoadOrCreate(info, ip, now)
+	if asic.ASICModel != info.ASICModel {
+		return minerPollResult{}, fmt.Errorf(
+			"%s reported conflicting ASIC models %q and %q",
+			info.Hostname,
+			info.ASICModel,
+			asic.ASICModel,
+		)
+	}
+	state, created, err := minerController.states.LoadOrCreate(info, miner.IP, now)
 	if err != nil {
 		return minerPollResult{}, err
 	}
@@ -280,13 +517,15 @@ func (minerController *controller) pollMiner(
 		)
 	}
 
-	if err := minerController.controlMiner(ctx, &state, info, asic, settings, now); err != nil {
-		return minerPollResult{}, err
-	}
 	return minerPollResult{
-		line:              minerController.formatMinerLine(state, info, settings, now),
-		hashRate:          info.HashRate,
-		hashRateAvailable: validHashRate(info.HashRate),
+		observation: &minerObservation{
+			miner:    miner,
+			info:     info,
+			asic:     asic,
+			settings: settings,
+			state:    state,
+			created:  created,
+		},
 	}, nil
 }
 
@@ -381,7 +620,7 @@ func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 	switch {
 	case info.OverHeatMode != 0 || state.Phase == lib.PhaseOverheat:
 		return colorRed + string(lib.PhaseOverheat) + colorReset
-	case state.PendingFrequency != 0:
+	case state.PendingKind != "" || state.MiningPending:
 		return colorYellow + "APPLYING" + colorReset
 	case now.Before(state.CooldownUntil):
 		return colorYellow + string(lib.PhaseCooldown) + colorReset

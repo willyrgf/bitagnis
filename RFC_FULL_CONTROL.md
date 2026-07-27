@@ -1,6 +1,6 @@
 # RFC: Startup Bitaxe Mining Configuration
 
-- Status: Proposed; mining-write activation is blocked on the material uncertainties below
+- Status: Implemented and canary-accepted; `mineiro` remains explicitly disabled
 - Date: 2026-07-27
 - Scope: Bitagnis and the two deployed AxeOS v2.8.1 BM1370 board-601 devices
 
@@ -39,30 +39,143 @@ actuation path.
 
 ## Material uncertainties
 
+none.
+
+## Resolved canary risks
+
 - **Device-side password logging:** Bitagnis will never log a resolved secret,
   but v2.8.1 logs both NVS key and value when a string write fails. A failed
-  password write can therefore expose the password in AxeOS logs. It is
-  uncertain whether the repository's no-secret rule permits that device-side
-  risk. If not, a firmware fix is required. Resolve through explicit owner
-  acceptance or verified fixed firmware before mining password writes are
-  enabled; do not claim Bitagnis can suppress the device log.
+  password write can therefore expose the password in AxeOS logs. On
+  2026-07-27, the owner explicitly accepted this device-side risk for the named
+  `mineira` canary and the actions necessary to complete its procedure. This is
+  a known accepted security limitation, not a capability Bitagnis can suppress.
 - **Fallback-password assurance:** readback can verify fallback host, port, and
   user, but positive hashing verifies only the pool currently in use. It cannot
-  prove a write-only fallback password while primary is active. Resolve by
-  accepting primary-only runtime verification plus an authorized canary
-  failover, or block v2.8.1 until firmware exposes verifiable pool status.
+  prove a write-only fallback password while primary is active. On 2026-07-27,
+  the owner authorized a `mineira` fallback failover. The canary subsequently
+  selected fallback and produced positive safe hash before primary restoration,
+  resolving this assurance item for the observed configuration.
 - **v2.8.1 persistence:** the PATCH handler performs independent NVS writes,
   ignores their results, and returns success; its NVS wrapper has no explicit
-  `nvs_commit`. A response therefore does not prove persistence. Resolve with the
-  authorized PATCH/restart/readback canary before enabling the second miner.
-- **Exact device and reboot evidence:** source proves the identity and uptime
-  fields exist, but not the deployed strings or the tolerance needed to
-  distinguish rebooted uptime from uninterrupted uptime. Record exact values and
-  timing read-only on the named canary before freezing validation and tests.
+  `nvs_commit`. A response alone therefore does not prove persistence. The
+  `mineira` canary completed same-MAC restarts with exact operating-point and
+  readable-mining readback for primary, failover, and restored-primary
+  configurations. This resolves persistence for the observed device/config,
+  without making a general firmware guarantee.
+- **External mutation ownership:** the owner identified and stopped the old
+  `../settle` controller. Bitagnis then held the recovered `400/1000` point for
+  22 consecutive polls. Two same-MAC snapshots advanced uptime from 299 to 311
+  seconds with the point unchanged, safe telemetry, positive hash rate, and
+  healthy primary mining. This resolves single-writer ownership for the canary
+  run. Process-exclusive SQLite ownership still cannot exclude a controller
+  using another database or host; such writers remain unsupported.
 
 No architecture or ownership uncertainty remains: one mutation owner, one
 pending-record representation, one startup safety gate, and one transport path
 per AxeOS operation.
+
+The code, automated tests, restart-verified mining canary, fallback proof, and
+stable single-writer closure are complete. The temporary 24-hour safety-monitor
+window was removed, the normal five-minute policy was restored, and a fresh
+startup opened the safety gate without PATCH or restart. Acceptance criteria 13
+and 14 are complete. `mineiro` remains disabled and must not be enabled without
+separate authorization after this accepted canary.
+
+## Authorized canary record
+
+On 2026-07-27, the owner named `mineira` as the canary and explicitly authorized
+the read-only inspection, accepted firmware risks, primary verification,
+fallback failover if needed, and the single canary mutation/restart procedure.
+No authorization extends to `mineiro`.
+
+The read-only preflight at `2026-07-27T20:21:27Z` recorded:
+
+- hostname `mineira`, MAC `d8:3b:da:4b:57:14`, and then-current IP
+  `192.168.7.118`;
+- AxeOS `v2.8.1`, ASIC `BM1370`, and board `601`;
+- uptime `89510` seconds and operating point `400 MHz / 1060 mV`;
+- a complete AxeOS-advertised operating point, positive hash rate, primary pool
+  selection, complete safety telemetry below every hard limit, no firmware
+  overheat mode, and no power fault; and
+- no other running Bitagnis controller observed on the host.
+
+Two subsequent direct reads of the same MAC, 5.03 seconds apart, advanced uptime
+by 5 seconds with unchanged identity. This validates the deployed uptime unit
+and supports the implementation's conservative 5-second uninterrupted-uptime
+tolerance.
+
+The detailed non-secret recovery snapshot is held outside the repository with
+owner-only permissions. No pool endpoint, user, or credential was copied into
+this document.
+
+The operator confirmed that both pools use a required non-secret password
+placeholder. An ignored `0600` runtime settings file was generated from the
+private readable snapshot, with defaults disabled and only the `mineira`
+hostname override enabled. The two placeholder values are held in an ignored
+`0600` environment file and never entered YAML, logs, SQLite, tests, or this
+document.
+
+The live canary produced the following evidence:
+
+- matching readable settings opened the startup gate without PATCH, restart, or
+  secret lookup;
+- named force-reapply persisted `mining_pending` before a complete
+  primary-plus-fallback PATCH, restarted once, proved a same-MAC uptime
+  discontinuity, preserved the complete operating point, verified exact
+  readable mining fields and primary selection, cleared durable intent, reset
+  telemetry, ramped, and passed two safe positive-hash primary polls;
+- a separately authorized failover used an intentionally unreachable temporary
+  primary while preserving the recorded fallback. After restart, `mineira`
+  selected fallback, produced positive hash, remained safe, and preserved its
+  complete operating point. The intentionally unverified rollout retained
+  `mining_pending`;
+- restoring the original primary configuration replayed that durable obligation
+  through a fresh PATCH and same-MAC restart, verified primary selection, and
+  cleared the obligation before the final ramp;
+- evaluated-point history survived the restarts and safety recovery; and
+- `mineiro` was never selected for polling or mutation. Broad same-MAC
+  rediscovery observed it read-only while waiting for `mineira`, as designed.
+
+The live run also exposed four production gaps that are now fixed and covered
+by regression tests:
+
+- relative `optimizer.db` paths previously produced an invalid SQLite URI;
+- the first same-MAC post-boot read could contain transient zero-temperature
+  telemetry, causing an unnecessary replay instead of bounded warm-up polling;
+- startup health could advance while a manual point still awaited durable
+  two-observation adoption instead of waiting for adoption and its fresh ramp;
+  and
+- substring redaction with a one-character pool placeholder could corrupt
+  unrelated error text. Short secret matches now collapse to one deterministic
+  generic error instead.
+
+During the canary, an externally requested high-frequency point crossed the
+hard ASIC-temperature limit. Bitagnis persisted a complete advertised
+`400/1000` rollback, restarted, proved the same MAC and new boot, waited through
+transient post-boot telemetry, verified the pair, retained evaluated history,
+and passed post-ramp health. This was a successful real-device safety-path
+exercise, not part of the planned mining mutation.
+
+Before the old controller was stopped, it moved the device among complete
+advertised pairs without local pending intent. Its final `400/1150` and
+`550/1060` points each crossed the 66°C hard ASIC-temperature limit. Bitagnis
+persisted and verified a `400/1000` safety rollback after each event. Once the
+owner stopped `../settle`, the temporary `mineira`-only safety monitor observed
+22 stable polls at `400/1000`; temperatures settled at 53°C ASIC and 43°C VR,
+board power at 12 W, and hash rate remained positive. Two direct snapshots
+confirmed the same MAC, increasing uptime, unchanged point, and healthy primary
+mining.
+
+The monitor exited cleanly, its temporary 24-hour evaluation override was
+deleted, and the ignored runtime settings again use the normal five-minute
+window. SQLite passed its integrity check with phase `BASELINE`, no pending
+mutation or overheat recovery, current point `400/1000`, and three preserved
+evaluated-point records. A newly built normal-policy process then matched the
+deployed mining configuration, opened the startup safety gate after its
+required healthy observations, and was stopped before an evaluation window
+could complete. A final same-MAC snapshot at 413 seconds uptime retained
+`400/1000`, healthy primary mining, and positive hash rate. No canary-closure
+step selected or mutated `mineiro`.
 
 ## Firmware facts and current defect
 
@@ -90,11 +203,12 @@ restart or reload the miner. `GET /api/system/info` reads configured values from
 NVS, so immediate readback is not evidence that the ASIC or Stratum process
 loaded them.
 
-The current `BitaxeClient.SetOperatingPoint` and
-`BitaxeClient.RecoverOperatingPoint` stop after PATCH. The optimizer can mistake
-persisted frequency and voltage for active settings. Mining writes MUST remain
-disabled until every existing operating-point and overheat mutation uses the
-restart-verified path in this RFC.
+The former `BitaxeClient.SetOperatingPoint` and
+`BitaxeClient.RecoverOperatingPoint` PATCH-only actuators have been deleted.
+Operating-point, rollback, overheat-recovery, and mining writes now use the
+single restart-verified path in this RFC. Mining writes nevertheless remain
+operationally disabled until the material uncertainties and named canary gate
+are resolved.
 
 The same handler ignores individual NVS write failures. The pinned
 [NVS wrapper][axeos-v281-nvs] also logs failing string values and does not call
@@ -507,13 +621,15 @@ recovery plan:
 1. Record exact identity, uptime behavior, non-secret pools, and operating point.
 2. Resolve the device-side password-logging decision.
 3. Confirm matching settings cause no mutation.
-4. Enable only the canary with synthetic test-worker credentials.
+4. Enable only the canary with its recorded desired pool fields and
+   environment-supplied passwords; do not invent an unprovisioned worker.
 5. Confirm one complete PATCH, one restart, uptime discontinuity, same MAC, and
    exact readable fields.
 6. Confirm primary selection and two safe positive-hash polls.
 7. If required, perform a separately authorized fallback failover.
 8. Confirm a fresh optimizer ramp with evaluated history preserved.
-9. Restore production settings through the same path.
+9. Restore the recorded primary settings through the same path after any
+   deliberate failover.
 10. Exercise `--reapply-mining` once for the named canary.
 
 Do not enable the second miner until the canary succeeds.
@@ -552,7 +668,7 @@ The RFC is implemented when:
 8. Restart proof requires the same MAC and uptime discontinuity.
 9. Primary health requires safe telemetry, primary selection, and two positive
    hash polls, not accepted shares.
-10. Real credentials never enter YAML, Bitagnis output, errors, SQLite, or
+10. Real passwords never enter YAML, Bitagnis output, errors, SQLite, or
     committed tests.
 11. The state cutover creates only the new baseline, rejects old databases
     without modifying them, and contains no migration or old representation.

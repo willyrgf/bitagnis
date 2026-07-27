@@ -54,9 +54,40 @@ Overheat recovery waits for the ASIC to cool to `recoveryTemp`, applies a
 complete safe pair, clears the firmware flag, and pauses exploration. Repeated
 overheats extend the cooldown up to 24 hours.
 
+## Hardware mutations and startup
+
+Every operating-point, rollback, overheat-recovery, and enabled mining-setting
+change uses one restart-verified lifecycle:
+
+```text
+validate -> persist intent -> recheck identity and safety -> PATCH -> restart
+         -> rediscover the same MAC -> prove a new boot -> verify -> ramp
+```
+
+AxeOS v2.8.1 does not load `PATCH /api/system` changes into the running miner,
+so configured-value readback alone never completes a mutation. Bitagnis keeps
+durable intent after PATCH, restart, identity, reboot-proof, or readback
+ambiguity and replays it after restart. It rejects redirects and permits
+automated operating-point targets only from the complete AxeOS-advertised grid.
+
+Fleet polling begins immediately in safety-only mode. Emergency recovery and
+hard rollback outrank normal work. Enabled mining settings reconcile one miner
+at a time in MAC order, and optimization opens only after every selected miner
+has two consecutive safe, positive-hash startup polls. A mining failure blocks
+the next normal miner while safety polling continues.
+
 ## State
 
 Optimizer state and evaluated operating points are stored in `optimizer.db`.
+The database is exclusively owned by one Bitagnis process. A second process
+using the same path fails at startup.
+
+The current schema is one versioned baseline with no migration or compatibility
+reader. An old, partial, or unknown database is rejected without modification;
+move it aside or remove it to create the current baseline. Evaluated history,
+cooldown, and pending mutation obligations persist across ordinary restarts
+after that baseline is created. Raw telemetry and Stratum credentials are never
+stored.
 
 If AxeOS settings are changed manually while Bitagnis is running, two consecutive
 polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
@@ -81,13 +112,49 @@ defaults:
   evaluationWindowMinutes: 5
   overheatCooldownMinutes: 120
 
+  mining:
+    enabled: false
+    primary:
+      host: pool.example.net
+      port: 3333
+      user: worker-name
+      passwordEnv: BITAGNIS_PRIMARY_STRATUM_PASSWORD
+    fallback:
+      host: fallback.example.net
+      port: 3333
+      user: worker-name
+      passwordEnv: BITAGNIS_FALLBACK_STRATUM_PASSWORD
+
 overrides:
   bitaxe-example:
     targetTemp: 64
+    mining:
+      enabled: false
+      primary:
+        user: worker-bitaxe-example
+      fallback:
+        user: worker-bitaxe-example
 ```
 
 Every value except the global metrics interval may be overridden by hostname.
-Unknown keys are rejected during startup.
+Unknown keys are rejected during startup. The mining default must remain
+disabled; only an explicit hostname override may enable it. When enabled, both
+pools must be complete, hosts must be bare DNS names or IPv4 addresses, and
+`passwordEnv` names portable environment variables. Literal password keys are
+rejected. Resolved passwords are never printed or persisted.
+
+Matching readable pool settings cause no PATCH, restart, or environment-secret
+lookup. AxeOS does not return passwords, so explicitly reapply a password-only
+change for named enabled miners:
+
+```sh
+BITAGNIS_PRIMARY_STRATUM_PASSWORD='synthetic-example' \
+BITAGNIS_FALLBACK_STRATUM_PASSWORD='synthetic-example' \
+./bitagnis --reapply-mining bitaxe-example
+```
+
+Do not place real values in shell history, YAML, tests, or diagnostics. Provide
+the variables through the operator's secret-aware process environment.
 
 ## Output
 
@@ -119,6 +186,9 @@ Limit optimization to selected hostnames:
 go run . bitaxe-01 bitaxe-02
 ```
 
+Every explicitly named hostname must resolve to exactly one MAC. Unknown flags
+fail before discovery.
+
 Build and run:
 
 ```sh
@@ -128,3 +198,9 @@ go build
 
 Bitagnis cannot substitute for adequate cooling or a correctly sized power
 supply. AxeOS thermal protection remains the final safety layer.
+
+AxeOS v2.8.1 uses plain HTTP, cannot positively read back pool passwords, may
+log a string value when an NVS write fails, and does not prove individual NVS
+writes succeeded. Before enabling mining writes, the owner must accept or
+resolve those firmware risks and run the authorized named-canary procedure in
+`RFC_FULL_CONTROL.md`. Do not enable a second miner until that canary passes.

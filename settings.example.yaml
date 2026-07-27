@@ -21,7 +21,29 @@ defaults:
   # Repeated overheats multiply this cooldown, capped at 24 hours.
   overheatCooldownMinutes: 120
 
+  # Mining reconciliation is inactive unless an effective hostname setting
+  # explicitly enables it. Passwords are read from the named environment
+  # variables only when a PATCH is required.
+  mining:
+    enabled: false
+    primary:
+      host: pool.example.net
+      port: 3333
+      user: worker-name
+      passwordEnv: BITAGNIS_PRIMARY_STRATUM_PASSWORD
+    fallback:
+      host: fallback.example.net
+      port: 3333
+      user: worker-name
+      passwordEnv: BITAGNIS_FALLBACK_STRATUM_PASSWORD
+
 # Every value except metricsInterval can be overridden by hostname.
 overrides:
   bitaxe-example:
     maxPower: 24
+    mining:
+      enabled: false
+      primary:
+        user: worker-bitaxe-example
+      fallback:
+        user: worker-bitaxe-example

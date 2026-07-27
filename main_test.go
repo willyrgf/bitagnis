@@ -22,6 +22,13 @@ type operatingRequest struct {
 	recovery bool
 }
 
+type miningRequest struct {
+	settings         lib.MiningSettings
+	primaryPassword  string
+	fallbackPassword string
+	ip               string
+}
+
 type fakeDeviceAPI struct {
 	mu sync.Mutex
 
@@ -30,7 +37,13 @@ type fakeDeviceAPI struct {
 	asicError    error
 	setError     error
 	recoverError error
+	miningError  error
+	restartError error
 	requests     []operatingRequest
+	mining       []miningRequest
+	restarts     []string
+	patchHook    func(lib.MutationKind, lib.OperatingPoint)
+	asicHook     func()
 }
 
 func (fake *fakeDeviceAPI) GetSystemInfo(
@@ -47,10 +60,13 @@ func (fake *fakeDeviceAPI) GetASICSettings(
 	context.Context,
 	string,
 ) (lib.ASICSettings, error) {
+	if fake.asicHook != nil {
+		fake.asicHook()
+	}
 	return fake.asicSettings, fake.asicError
 }
 
-func (fake *fakeDeviceAPI) SetOperatingPoint(
+func (fake *fakeDeviceAPI) PatchOperatingPoint(
 	_ context.Context,
 	point lib.OperatingPoint,
 	ip string,
@@ -58,10 +74,13 @@ func (fake *fakeDeviceAPI) SetOperatingPoint(
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.requests = append(fake.requests, operatingRequest{point: point, ip: ip})
+	if fake.patchHook != nil {
+		fake.patchHook(lib.MutationOperatingPoint, point)
+	}
 	return fake.setError
 }
 
-func (fake *fakeDeviceAPI) RecoverOperatingPoint(
+func (fake *fakeDeviceAPI) PatchOverheatRecovery(
 	_ context.Context,
 	point lib.OperatingPoint,
 	ip string,
@@ -73,13 +92,56 @@ func (fake *fakeDeviceAPI) RecoverOperatingPoint(
 		ip:       ip,
 		recovery: true,
 	})
+	if fake.patchHook != nil {
+		fake.patchHook(lib.MutationOverheatRecovery, point)
+	}
 	return fake.recoverError
+}
+
+func (fake *fakeDeviceAPI) PatchMiningConfiguration(
+	_ context.Context,
+	settings lib.MiningSettings,
+	primaryPassword string,
+	fallbackPassword string,
+	ip string,
+) error {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.mining = append(fake.mining, miningRequest{
+		settings:         settings,
+		primaryPassword:  primaryPassword,
+		fallbackPassword: fallbackPassword,
+		ip:               ip,
+	})
+	if fake.patchHook != nil {
+		fake.patchHook(lib.MutationMiningConfiguration, lib.OperatingPoint{})
+	}
+	return fake.miningError
+}
+
+func (fake *fakeDeviceAPI) Restart(_ context.Context, ip string) error {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.restarts = append(fake.restarts, ip)
+	return fake.restartError
 }
 
 func (fake *fakeDeviceAPI) operatingRequests() []operatingRequest {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	return append([]operatingRequest(nil), fake.requests...)
+}
+
+func (fake *fakeDeviceAPI) miningRequests() []miningRequest {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return append([]miningRequest(nil), fake.mining...)
+}
+
+func (fake *fakeDeviceAPI) restartRequests() []string {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return append([]string(nil), fake.restarts...)
 }
 
 type memoryOptimizerStore struct {
@@ -136,6 +198,16 @@ func (store *memoryOptimizerStore) SaveMiner(state *lib.MinerState) error {
 	}
 	store.states[state.MacAddr] = *state
 	return nil
+}
+
+func (store *memoryOptimizerStore) LoadMiner(macAddr string) (lib.MinerState, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	state, ok := store.states[macAddr]
+	if !ok {
+		return lib.MinerState{}, fmt.Errorf("missing state %s", macAddr)
+	}
+	return state, nil
 }
 
 func pointRecordKey(mac string, point lib.OperatingPoint) string {
@@ -215,6 +287,9 @@ func gammaASIC() lib.ASICSettings {
 
 func healthyInfo() lib.Info {
 	return lib.Info{
+		Version:           supportedAxeOSVersion,
+		ASICModel:         supportedASICModel,
+		BoardVersion:      supportedBoardVersion,
 		Hostname:          "mineira",
 		MacAddr:           "aa:bb:cc:dd:ee:ff",
 		Frequency:         400,
@@ -230,6 +305,10 @@ func healthyInfo() lib.Info {
 		UpTimeSeconds:     120,
 		SharesAccepted:    100,
 	}
+}
+
+func discovered(info lib.Info, ip string) lib.DiscoveredMiner {
+	return lib.DiscoveredMiner{IP: ip, Info: info}
 }
 
 func optimizerState(now time.Time) lib.MinerState {
@@ -280,6 +359,52 @@ func healthySummary(hash float64, expected float64) windowSummary {
 	}
 }
 
+func TestParseArgumentsRejectsUnknownFlagsAndScopesReapply(t *testing.T) {
+	options, err := parseArguments([]string{"--reapply-mining", "mineira", "mineiro"})
+	if err != nil {
+		t.Fatalf("parse reapply arguments: %v", err)
+	}
+	if len(options.hostnames) != 2 ||
+		!options.reapply["mineira"] ||
+		!options.reapply["mineiro"] {
+		t.Fatalf("parsed options = %+v", options)
+	}
+	if _, err := parseArguments([]string{"--reapply-mining"}); err == nil {
+		t.Fatal("reapply without hostnames was accepted")
+	}
+	if _, err := parseArguments([]string{"--unknown"}); err == nil {
+		t.Fatal("unknown flag was accepted")
+	}
+	options, err = parseArguments(nil)
+	if err != nil || !options.hostnames["all"] || len(options.reapply) != 0 {
+		t.Fatalf("default options = %+v, error = %v", options, err)
+	}
+}
+
+func TestNamedDiscoveryRequiresExactlyOneMACPerHostname(t *testing.T) {
+	info := healthyInfo()
+	missing := map[string]bool{"missing": true}
+	if err := validateNamedDiscovery(missing, nil); err == nil {
+		t.Fatal("missing selected hostname was accepted")
+	}
+	first := discovered(info, "192.0.2.10")
+	secondInfo := info
+	secondInfo.MacAddr = "00:11:22:33:44:55"
+	second := discovered(secondInfo, "192.0.2.11")
+	if err := validateNamedDiscovery(
+		map[string]bool{info.Hostname: true},
+		[]lib.DiscoveredMiner{first, second},
+	); err == nil {
+		t.Fatal("duplicate hostname mapped to different MACs was accepted")
+	}
+	if err := validateNamedDiscovery(
+		map[string]bool{info.Hostname: true},
+		[]lib.DiscoveredMiner{first},
+	); err != nil {
+		t.Fatalf("unique named discovery rejected: %v", err)
+	}
+}
+
 func TestSummarizeWindowUsesMedianP95AndShareDeltas(t *testing.T) {
 	errorValue := 2.0
 	samples := []telemetrySample{
@@ -312,32 +437,34 @@ func TestBootstrapWaitsForCompleteWindowThenUndervolts(t *testing.T) {
 	minerController := testController(devices, states, nil)
 	now := time.Now().Round(time.Second)
 
-	if _, err := minerController.pollMiner(context.Background(), "192.0.2.10", now); err != nil {
-		t.Fatalf("bootstrap poll: %v", err)
-	}
+	miner := discovered(info, "192.0.2.10")
+	minerController.pollMiners(context.Background(), []lib.DiscoveredMiner{miner}, now)
 	if len(devices.operatingRequests()) != 0 {
 		t.Fatal("bootstrap changed settings immediately")
 	}
 
 	for sample := 0; sample < 6; sample++ {
 		at := now.Add(2*time.Second + time.Duration(sample)*10*time.Second)
-		if _, err := minerController.pollMiner(context.Background(), "192.0.2.10", at); err != nil {
-			t.Fatalf("sample %d: %v", sample, err)
-		}
+		minerController.pollMiners(context.Background(), []lib.DiscoveredMiner{miner}, at)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) ||
-		requests[0].recovery {
-		t.Fatalf("requests = %+v, want first undervolt 400/1060", requests)
+	got := states.getState(info.MacAddr)
+	if got.PendingKind != lib.MutationOperatingPoint ||
+		got.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("pending mutation = %+v, want first undervolt 400/1060", got)
+	}
+	if len(devices.operatingRequests()) != 0 {
+		t.Fatal("optimizer bypassed the mutation coordinator")
 	}
 }
 
-func TestPendingPairMustBeConfirmedBeforeEvaluation(t *testing.T) {
+func TestPendingPairIsNotConfirmedFromConfiguredReadback(t *testing.T) {
 	now := time.Now()
 	state := optimizerState(now)
-	state.SetPendingPoint(lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060})
-	state.PendingSince = now
+	state.SetPendingMutation(
+		lib.MutationOperatingPoint,
+		lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+		now,
+	)
 	state.Phase = lib.PhaseUndervolt
 	states := newMemoryOptimizerStore()
 	states.putState(state)
@@ -356,10 +483,9 @@ func TestPendingPairMustBeConfirmedBeforeEvaluation(t *testing.T) {
 		t.Fatalf("controlMiner returned an error: %v", err)
 	}
 	got := states.getState(state.MacAddr)
-	if got.PendingFrequency != 0 ||
-		got.CurrentPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) ||
-		!got.RampUntil.After(now) {
-		t.Fatalf("confirmed state = %+v", got)
+	if got.PendingKind != lib.MutationOperatingPoint ||
+		got.CurrentPoint() == (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("NVS-only readback confirmed pending state: %+v", got)
 	}
 }
 
@@ -385,10 +511,9 @@ func TestFailedUndervoltRollsBackBothSettings(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateTrial returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1100}) {
-		t.Fatalf("rollback requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1100}) {
+		t.Fatalf("rollback intent = %+v", state)
 	}
 }
 
@@ -415,10 +540,9 @@ func TestUnderperformingFrequencyTestsOneHigherVoltage(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateTrial returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100}) {
-		t.Fatalf("voltage trial requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100}) {
+		t.Fatalf("voltage trial intent = %+v", state)
 	}
 	if got := states.getState(state.MacAddr).Phase; got != lib.PhaseVoltageTest {
 		t.Fatalf("phase = %s, want VOLT_TEST", got)
@@ -460,10 +584,9 @@ func TestVoltageWithoutMaterialResponseRollsBack(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateTrial returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
-		t.Fatalf("rollback requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("rollback intent = %+v", state)
 	}
 }
 
@@ -519,10 +642,9 @@ func TestActualHashGainWinsDespiteLowExpectedAttainment(t *testing.T) {
 	if record.Status != lib.PointValidated || record.MeanTemp != 60.2 {
 		t.Fatalf("accepted point record = %+v", record)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100}) {
-		t.Fatalf("next voltage request = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100}) {
+		t.Fatalf("next voltage intent = %+v", state)
 	}
 }
 
@@ -561,10 +683,9 @@ func TestHigherFrequencySweepStartsAtMinimumVoltage(t *testing.T) {
 	); err != nil {
 		t.Fatalf("startNextCandidate returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1000}) {
-		t.Fatalf("frequency sweep did not start at minimum voltage: %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1000}) {
+		t.Fatalf("frequency sweep intent = %+v", state)
 	}
 }
 
@@ -609,10 +730,9 @@ func TestThermalVoltageRollsBackToActualHashBest(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateWindow returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}) {
-		t.Fatalf("thermal rollback requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}) {
+		t.Fatalf("thermal rollback intent = %+v", state)
 	}
 }
 
@@ -673,10 +793,9 @@ func TestSafetyRollbackChangesFrequencyAndVoltageTogether(t *testing.T) {
 	); err != nil {
 		t.Fatalf("controlMiner returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
-		t.Fatalf("safety requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("safety rollback intent = %+v", state)
 	}
 }
 
@@ -704,10 +823,9 @@ func TestSafetyWithoutHistoryUsesMinimumAdvertisedPair(t *testing.T) {
 	); err != nil {
 		t.Fatalf("controlMiner returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
-		t.Fatalf("minimum safety requests = %+v", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
+		t.Fatalf("minimum safety intent = %+v", state)
 	}
 }
 
@@ -737,11 +855,9 @@ func TestOverheatRecoveryIgnoresEmergencySentinel(t *testing.T) {
 	); err != nil {
 		t.Fatalf("handleOverheat returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		!requests[0].recovery ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
-		t.Fatalf("overheat recovery = %+v", requests)
+	if state.PendingKind != lib.MutationOverheatRecovery ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
+		t.Fatalf("overheat recovery intent = %+v", state)
 	}
 	saved := states.getState(state.MacAddr)
 	if saved.PendingPoint().CoreVoltage == 4870 {
@@ -771,7 +887,10 @@ func TestOverheatRecoveryWaitsUntilCool(t *testing.T) {
 		t.Fatalf("handleOverheat returned an error: %v", err)
 	}
 	if len(devices.operatingRequests()) != 0 {
-		t.Fatal("recovery was requested while the ASIC was hot")
+		t.Fatal("optimizer touched the device while recording recovery")
+	}
+	if state.PendingKind != lib.MutationOverheatRecovery {
+		t.Fatal("hot recovery was not durably queued for later safe actuation")
 	}
 }
 
@@ -846,10 +965,9 @@ func TestMissingExpectedHashStillExploresByActualHash(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateWindow returned an error: %v", err)
 	}
-	requests := devices.operatingRequests()
-	if len(requests) != 1 ||
-		requests[0].point != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
-		t.Fatalf("requests = %+v, want actual-hash exploration", requests)
+	if state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("intent = %+v, want actual-hash exploration", state)
 	}
 }
 
@@ -886,13 +1004,20 @@ func TestPollMinerContainsDependencyPanic(t *testing.T) {
 	}
 	minerController := testController(devices, newMemoryOptimizerStore(), &logs)
 
-	result := minerController.pollMinerSafely(context.Background(), "192.0.2.10", time.Now())
+	info := healthyInfo()
+	result := minerController.pollMinerSafely(
+		context.Background(),
+		discovered(info, "192.0.2.10"),
+		time.Now(),
+	)
 	if result != (minerPollResult{}) {
 		t.Fatalf("result = %+v, want empty after panic", result)
 	}
-	if !strings.Contains(logs.String(), "Recovered panic") ||
-		!strings.Contains(logs.String(), "unexpected dependency panic") {
+	if !strings.Contains(logs.String(), "Recovered panic") {
 		t.Fatalf("panic was not recorded: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "unexpected dependency panic") {
+		t.Fatalf("panic value escaped into logs: %s", logs.String())
 	}
 }
 
@@ -917,6 +1042,8 @@ func TestPollMinersReportsOperatingPointsAndAggregateHash(t *testing.T) {
 			default:
 				return lib.Info{}, errors.New("unexpected IP")
 			}
+			info.StratumUser = "synthetic-user-must-not-appear"
+			info.FallbackStratumUser = "synthetic-fallback-user-must-not-appear"
 			info.UpTimeSeconds = 1
 			return info, nil
 		},
@@ -928,7 +1055,10 @@ func TestPollMinersReportsOperatingPointsAndAggregateHash(t *testing.T) {
 
 	minerController.pollMiners(
 		context.Background(),
-		[]string{"192.0.2.10", "192.0.2.11"},
+		[]lib.DiscoveredMiner{
+			discovered(lib.Info{MacAddr: "aa:bb:cc:dd:ee:10"}, "192.0.2.10"),
+			discovered(lib.Info{MacAddr: "aa:bb:cc:dd:ee:11"}, "192.0.2.11"),
+		},
 		time.Now(),
 	)
 
@@ -945,6 +1075,10 @@ func TestPollMinersReportsOperatingPointsAndAggregateHash(t *testing.T) {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("output does not contain %q:\n%s", expected, got)
 		}
+	}
+	if strings.Contains(got, "synthetic-user") ||
+		strings.Contains(got, "synthetic-fallback-user") {
+		t.Fatalf("terminal output exposed a pool user:\n%s", got)
 	}
 }
 
@@ -964,19 +1098,23 @@ func TestPollMinersUsesBoundedWorkerPool(t *testing.T) {
 			time.Sleep(2 * time.Millisecond)
 			info := healthyInfo()
 			info.Hostname = "miner-" + ip
-			info.MacAddr = "mac-" + ip
+			var host int
+			_, _ = fmt.Sscanf(ip, "192.0.2.%d", &host)
+			info.MacAddr = fmt.Sprintf("02:00:00:00:00:%02d", host)
 			info.UpTimeSeconds = 1
 			return info, nil
 		},
 		asicSettings: gammaASIC(),
 	}
 	minerController := testController(devices, newMemoryOptimizerStore(), nil)
-	ips := make([]string, 40)
-	for index := range ips {
-		ips[index] = fmt.Sprintf("192.0.2.%d", index+1)
+	miners := make([]lib.DiscoveredMiner, 40)
+	for index := range miners {
+		ip := fmt.Sprintf("192.0.2.%d", index+1)
+		macAddr := fmt.Sprintf("02:00:00:00:00:%02d", index+1)
+		miners[index] = discovered(lib.Info{MacAddr: macAddr}, ip)
 	}
 
-	minerController.pollMiners(context.Background(), ips, time.Now())
+	minerController.pollMiners(context.Background(), miners, time.Now())
 
 	if got := maximum.Load(); got > pollWorkerLimit {
 		t.Fatalf("maximum concurrent polls = %d, worker limit = %d", got, pollWorkerLimit)

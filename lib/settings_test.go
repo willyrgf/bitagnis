@@ -103,6 +103,164 @@ overrides:
 	}
 }
 
+func TestLoadSettingsMergesNestedMiningSettingsPerHost(t *testing.T) {
+	settingsFile, err := loadTestSettings(t, `defaults:
+  mining:
+    enabled: false
+    primary:
+      host: pool.example.net
+      port: 3333
+      user: common-worker
+      passwordEnv: BITAGNIS_PRIMARY_PASSWORD
+    fallback:
+      host: fallback.example.net
+      port: 4444
+      user: common-worker
+      passwordEnv: BITAGNIS_FALLBACK_PASSWORD
+overrides:
+  mineira:
+    mining:
+      enabled: true
+      primary:
+        user: worker-mineira
+      fallback:
+        user: worker-mineira
+`)
+	if err != nil {
+		t.Fatalf("LoadSettings returned an error: %v", err)
+	}
+	defaults, err := settingsFile.ForHost("")
+	if err != nil {
+		t.Fatalf("resolve defaults: %v", err)
+	}
+	if defaults.Mining.Enabled {
+		t.Fatal("mining was not disabled by default")
+	}
+	mineira, err := settingsFile.ForHost("mineira")
+	if err != nil {
+		t.Fatalf("resolve mineira: %v", err)
+	}
+	if !mineira.Mining.Enabled ||
+		mineira.Mining.Primary.Host != "pool.example.net" ||
+		mineira.Mining.Primary.User != "worker-mineira" ||
+		mineira.Mining.Fallback.Port != 4444 ||
+		mineira.Mining.Fallback.User != "worker-mineira" {
+		t.Fatalf("merged mining settings = %+v", mineira.Mining)
+	}
+}
+
+func TestLoadSettingsRejectsLiteralMiningPassword(t *testing.T) {
+	_, err := loadTestSettings(t, `defaults:
+  mining:
+    primary:
+      password: synthetic-secret
+`)
+	if err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("error = %v, want literal password rejection", err)
+	}
+}
+
+func TestLoadSettingsRequiresCompleteEnabledMiningConfiguration(t *testing.T) {
+	_, err := loadTestSettings(t, `defaults:
+  mining:
+    enabled: false
+    primary:
+      host: pool.example.net
+      port: 3333
+      user: worker
+      passwordEnv: BITAGNIS_PRIMARY_PASSWORD
+overrides:
+  mineira:
+    mining:
+      enabled: true
+`)
+	if err == nil || !strings.Contains(err.Error(), "fallback") {
+		t.Fatalf("error = %v, want incomplete fallback rejection", err)
+	}
+}
+
+func TestLoadSettingsRequiresHostnameScopedMiningEnablement(t *testing.T) {
+	_, err := loadTestSettings(t, `defaults:
+  mining:
+    enabled: true
+    primary:
+      host: pool.example.net
+      port: 3333
+      user: worker
+      passwordEnv: BITAGNIS_PRIMARY_PASSWORD
+    fallback:
+      host: fallback.example.net
+      port: 3333
+      user: worker
+      passwordEnv: BITAGNIS_FALLBACK_PASSWORD
+`)
+	if err == nil || !strings.Contains(err.Error(), "explicit hostname override") {
+		t.Fatalf("error = %v, want hostname-scoped enablement rejection", err)
+	}
+}
+
+func TestMiningValidationBoundaries(t *testing.T) {
+	valid := enabledMiningSettings()
+	tests := []struct {
+		name   string
+		mutate func(*MiningSettings)
+		want   string
+	}{
+		{
+			name: "scheme",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.Host = "stratum+tcp://pool.example.net"
+			},
+			want: "primary host",
+		},
+		{
+			name: "host port",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.Host = "pool.example.net:3333"
+			},
+			want: "primary host",
+		},
+		{
+			name: "zero port",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.Port = 0
+			},
+			want: "primary port",
+		},
+		{
+			name: "surrounding user whitespace",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.User = " worker"
+			},
+			want: "primary user",
+		},
+		{
+			name: "nonportable environment",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.PasswordEnv = "PRIMARY-PASSWORD"
+			},
+			want: "passwordEnv",
+		},
+		{
+			name: "oversized UTF-8 user",
+			mutate: func(settings *MiningSettings) {
+				settings.Primary.User = strings.Repeat("é", 128)
+			},
+			want: "primary user",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := valid
+			test.mutate(&settings)
+			err := validateMiningSettings(settings)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadSettingsRejectsUnknownKeys(t *testing.T) {
 	const key = "unknownSetting"
 	_, err := loadTestSettings(t, "defaults:\n  "+key+": 25\n")
