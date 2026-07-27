@@ -47,6 +47,49 @@ wrong, and how to resolve or validate it. Write `none` when no material uncertai
 pad the section with routine, low-impact choices. Any item involving architecture, ownership, or
 the design contract triggers the architect-agent rule above.
 
+## One Current Design
+
+Optimize the repository as a whole for fewer concepts, code paths, public types and schemas,
+duplicated responsibilities, places a future change must touch, and LOC. Each responsibility must
+have one clear owner, one canonical representation, and one implementation path.
+
+Reuse code when behavior and ownership are genuinely shared. Prefer extending the existing owner or
+extracting a small shared helper over copying logic, adding a second service, or introducing another
+representation. An abstraction must reduce total concepts, duplication, future change sites, or LOC
+after its call sites are considered. Do not add indirection, interfaces, generic frameworks,
+configuration switches, or extension points for hypothetical future reuse.
+
+Reducing LOC is valuable when it deletes duplication, indirection, obsolete behavior, or unnecessary
+surface area. Do not make code smaller by compressing readable logic, combining unrelated
+responsibilities, or removing validation, safety controls, error context, tests, or necessary
+documentation. Clear direct code is simpler than clever short code.
+
+### Replace; Do Not Preserve
+
+Prefer the best current design over backward compatibility with an inferior internal design.
+Breaking internal APIs, CLI contracts, schemas, persisted formats, and documented behavior is
+allowed when the replacement is deliberate and complete.
+
+When a design changes, complete the cutover and delete the superseded implementation, types, entry
+points, aliases, adapters, feature flags, readers and writers, tests, fixtures, and documentation.
+Do not deprecate old paths, hide them, or retain compatibility shims, dual paths, legacy modes, or
+fallbacks for old behavior. Git history is the source archive.
+
+Update every current in-repository producer and consumer in the same logical change. For a changed
+persisted contract, deliberately update or reset its baseline and reject incompatible old data
+explicitly. Never silently reinterpret old bytes or retain a legacy reader unless an externally
+required migration contract has been approved.
+
+A breaking change never relaxes correctness, hardware safety, secret handling, data integrity, or
+the thermal-control invariants in this guide.
+
+### Complete Changes
+
+Fix the underlying design or add missing support properly. Do not introduce hacks, monkey patches,
+partial workarounds, fragile schema shims, duplicated wrappers, or parallel implementations. Do not
+split an inseparable cutover merely to make individual commits smaller. If a correct complete
+solution is not possible, report the blocker instead of approximating it.
+
 ## Repository Boundaries
 
 - `main.go` owns process startup, network discovery orchestration, polling, and terminal rendering.
@@ -210,8 +253,14 @@ turn a canary test into an implicit fleet rollout.
 - Do not add generated binaries, coverage output, editor state, module caches, or temporary
   artifacts.
 
+## Reporting
+
+Report what changed, what was deleted, which verification ran, and any remaining unverified risk or
+blocker. If verification was intentionally omitted for a documentation-only change, say so
+explicitly.
+
 ## Next Time
 
-- Read the relevant safety tests before changing optimizer or mutation behavior.
-- Check the AxeOS restart constraint before touching any settings write.
-- Match verification breadth to the affected boundary and hardware risk.
+- Look for an existing owner and implementation path before adding a new abstraction or type.
+- Delete superseded code and compatibility paths as part of the same complete cutover.
+- Read the safety tests and check the AxeOS restart constraint before changing mutation behavior.

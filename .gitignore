@@ -34,6 +34,10 @@ go.work.sum
 # Locally built application binary
 /bitagnis
 
+# Imported MFM guidance after its principles were incorporated into AGENTS.md
+/MFMAGENTS.md
+/mfm-code-quality.md
+
 # Editor/IDE
 # .idea/
 # .vscode/
