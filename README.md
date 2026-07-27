@@ -174,6 +174,12 @@ Optimizer states are:
 
 ## Running
 
+Run with Nix:
+
+```sh
+nix run .#bitagnis
+```
+
 Run every discovered Bitaxe:
 
 ```sh
