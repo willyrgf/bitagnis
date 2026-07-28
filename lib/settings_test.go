@@ -406,3 +406,40 @@ overrides:
 		})
 	}
 }
+
+func TestSupportedFirmwareTripBoundaries(t *testing.T) {
+	if _, err := loadTestSettings(t, `defaults:
+  tempCutoff: 75
+  vrTempHigh: 105
+`); err != nil {
+		t.Fatalf("exact AxeOS trip boundaries were rejected: %v", err)
+	}
+	tests := []struct {
+		name     string
+		settings string
+		want     string
+	}{
+		{
+			name: "ASIC cutoff above firmware trip",
+			settings: `defaults:
+  tempCutoff: 75.001
+`,
+			want: "tempCutoff",
+		},
+		{
+			name: "VR limit above firmware trip",
+			settings: `defaults:
+  vrTempHigh: 105.001
+`,
+			want: "vrTempHigh",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestSettings(t, test.settings)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}

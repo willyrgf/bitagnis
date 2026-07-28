@@ -28,6 +28,8 @@ const (
 	defaultEvaluationWindowMins = 5
 	defaultOverheatCooldownMins = 120
 	maxPasswordFileBytes        = 64 * 1024
+	axeOSASICTripTemp           = 75
+	axeOSVRTripTemp             = 105
 )
 
 type Settings struct {
@@ -320,12 +322,19 @@ func validateSettings(settings Settings) error {
 		return fmt.Errorf("targetTemp must be greater than 0 and below tempLimit")
 	case settings.TempLimit <= 0 || settings.TempLimit > 110:
 		return fmt.Errorf("tempLimit must be between 1 and 110")
-	case settings.TempCutoff <= settings.TempLimit || settings.TempCutoff > 120:
-		return fmt.Errorf("tempCutoff must be greater than tempLimit and no more than 120")
+	case settings.TempCutoff <= settings.TempLimit ||
+		settings.TempCutoff > axeOSASICTripTemp:
+		return fmt.Errorf(
+			"tempCutoff must be greater than tempLimit and no more than %.0f",
+			float64(axeOSASICTripTemp),
+		)
 	case settings.MaxPower <= 1 || settings.MaxPower > 1000:
 		return fmt.Errorf("maxPower must be greater than 1 and no more than 1000")
-	case settings.VRTempHigh <= 0 || settings.VRTempHigh > 150:
-		return fmt.Errorf("vrTempHigh must be between 1 and 150")
+	case settings.VRTempHigh <= 0 || settings.VRTempHigh > axeOSVRTripTemp:
+		return fmt.Errorf(
+			"vrTempHigh must be between 1 and %.0f",
+			float64(axeOSVRTripTemp),
+		)
 	case settings.MaxErrorPercentage <= 0 || settings.MaxErrorPercentage > 100:
 		return fmt.Errorf("maxErrorPercentage must be greater than 0 and no more than 100")
 	case settings.MetricsInterval < 2 || settings.MetricsInterval > 60:

@@ -15,7 +15,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 1
+const optimizerSchemaVersion = 2
 
 type OptimizerPhase string
 
@@ -44,6 +44,7 @@ type MutationKind string
 
 const (
 	MutationOperatingPoint      MutationKind = "operating_point"
+	MutationSafetyRollback      MutationKind = "safety_rollback"
 	MutationOverheatRecovery    MutationKind = "overheat_recovery"
 	MutationMiningConfiguration MutationKind = "mining_configuration"
 )
@@ -80,7 +81,6 @@ type MinerState struct {
 	ObservedCount       int
 
 	ConsecutiveBadWindows int
-	OverheatPending       bool
 	OverheatCount         int
 	CooldownUntil         time.Time
 }
@@ -294,7 +294,6 @@ func (store *OptimizerStore) LoadOrCreate(
 		}
 		if info.OverHeatMode != 0 {
 			state.Phase = PhaseOverheat
-			state.OverheatPending = true
 			state.OverheatCount = 1
 		} else if point := pointFromInfo(info); validStoredPoint(point) {
 			state.SetCurrentPoint(point)
@@ -537,9 +536,8 @@ func saveMiner(executor interface {
 			fallback_core_voltage, pending_kind, pending_frequency,
 			pending_core_voltage, pending_since, mining_pending,
 			observed_frequency, observed_core_voltage, observed_count,
-			consecutive_bad_windows, overheat_pending, overheat_count,
-			cooldown_until
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			consecutive_bad_windows, overheat_count, cooldown_until
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(mac_addr) DO UPDATE SET
 			hostname = excluded.hostname,
 			ip = excluded.ip,
@@ -562,7 +560,6 @@ func saveMiner(executor interface {
 			observed_core_voltage = excluded.observed_core_voltage,
 			observed_count = excluded.observed_count,
 			consecutive_bad_windows = excluded.consecutive_bad_windows,
-			overheat_pending = excluded.overheat_pending,
 			overheat_count = excluded.overheat_count,
 			cooldown_until = excluded.cooldown_until`,
 		state.MacAddr,
@@ -587,7 +584,6 @@ func saveMiner(executor interface {
 		state.ObservedCoreVoltage,
 		state.ObservedCount,
 		state.ConsecutiveBadWindows,
-		state.OverheatPending,
 		state.OverheatCount,
 		timeValue(state.CooldownUntil),
 	)
@@ -604,8 +600,7 @@ const minerSelect = `SELECT
 	fallback_core_voltage, pending_kind, pending_frequency,
 	pending_core_voltage, pending_since, mining_pending,
 	observed_frequency, observed_core_voltage, observed_count,
-	consecutive_bad_windows, overheat_pending, overheat_count,
-	cooldown_until
+	consecutive_bad_windows, overheat_count, cooldown_until
 	FROM optimizer_miners WHERE mac_addr = ?`
 
 func queryMiner(queryer interface {
@@ -641,7 +636,6 @@ func queryMiner(queryer interface {
 		&state.ObservedCoreVoltage,
 		&state.ObservedCount,
 		&state.ConsecutiveBadWindows,
-		&state.OverheatPending,
 		&state.OverheatCount,
 		&cooldownUntil,
 	)
@@ -688,7 +682,6 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "observed_core_voltage", sqlType: "INTEGER", notNull: 1},
 		{name: "observed_count", sqlType: "INTEGER", notNull: 1},
 		{name: "consecutive_bad_windows", sqlType: "INTEGER", notNull: 1},
-		{name: "overheat_pending", sqlType: "INTEGER", notNull: 1},
 		{name: "overheat_count", sqlType: "INTEGER", notNull: 1},
 		{name: "cooldown_until", sqlType: "INTEGER", notNull: 1},
 	},
@@ -736,7 +729,6 @@ CREATE TABLE optimizer_miners (
 	observed_core_voltage INTEGER NOT NULL,
 	observed_count INTEGER NOT NULL,
 	consecutive_bad_windows INTEGER NOT NULL,
-	overheat_pending INTEGER NOT NULL,
 	overheat_count INTEGER NOT NULL,
 	cooldown_until INTEGER NOT NULL
 );
@@ -759,7 +751,7 @@ CREATE TABLE operating_points (
 	retry_after INTEGER NOT NULL,
 	PRIMARY KEY (mac_addr, frequency, core_voltage)
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -992,12 +984,25 @@ func validateMinerState(state MinerState) error {
 		return fmt.Errorf("pending mutation fields exist without a mutation kind")
 	case state.PendingKind != "" &&
 		state.PendingKind != MutationOperatingPoint &&
+		state.PendingKind != MutationSafetyRollback &&
 		state.PendingKind != MutationOverheatRecovery:
 		return fmt.Errorf("pending mutation kind %q is invalid", state.PendingKind)
 	case state.PendingKind != "" && !validStoredPoint(state.PendingPoint()):
 		return fmt.Errorf("pending operating point is invalid")
 	case state.PendingKind != "" && state.PendingSince.IsZero():
 		return fmt.Errorf("pending mutation has no timestamp")
+	case state.PendingKind == MutationSafetyRollback &&
+		state.Phase != PhaseCooldown &&
+		state.Phase != PhaseOverheat:
+		return fmt.Errorf("safety rollback requires cooldown or overheat phase")
+	case state.PendingKind == MutationOverheatRecovery &&
+		state.Phase != PhaseOverheat:
+		return fmt.Errorf("overheat recovery requires overheat phase")
+	case state.Phase == PhaseOverheat &&
+		state.PendingKind != "" &&
+		state.PendingKind != MutationSafetyRollback &&
+		state.PendingKind != MutationOverheatRecovery:
+		return fmt.Errorf("overheat phase has invalid pending mutation kind %q", state.PendingKind)
 	case state.ObservedCount == 0 &&
 		(state.ObservedFrequency != 0 || state.ObservedCoreVoltage != 0):
 		return fmt.Errorf("observed operating point exists without confirmations")

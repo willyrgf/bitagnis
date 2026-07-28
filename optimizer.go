@@ -18,6 +18,8 @@ const (
 	minimumErrorImprovement = 1.0
 	powerHeadroom           = 2.0
 	vrExplorationFactor     = 0.90
+	axeOSASICTripTemp       = 75.0
+	axeOSVRTripTemp         = 105.0
 )
 
 type telemetrySample struct {
@@ -51,6 +53,22 @@ type windowSummary struct {
 type safetyFailure struct {
 	status string
 	reason string
+}
+
+type safetyAction int
+
+const (
+	safetyNormal safetyAction = iota
+	safetyRollback
+	safetyHostContainment
+	safetyFirmwareRecovery
+	safetyEmergencyHold
+	safetyUnavailable
+)
+
+type safetyAssessment struct {
+	action  safetyAction
+	failure safetyFailure
 }
 
 func (minerController *controller) controlMiner(
@@ -95,22 +113,25 @@ func (minerController *controller) enforceMinerSafety(
 		return true, fmt.Errorf("control miner: state is nil")
 	}
 	livePoint := operatingPointFromInfo(info)
-
-	if info.OverHeatMode != 0 {
-		return true, minerController.handleOverheat(ctx, state, info, asic, settings, now)
+	minimum, err := minimumAdvertisedPoint(asic)
+	if err != nil {
+		return true, err
 	}
-	if state.OverheatPending {
-		return true, minerController.handleOverheat(ctx, state, info, asic, settings, now)
+	assessment := assessInstantaneousSafety(info, settings, livePoint, minimum)
+	if state.Phase == lib.PhaseOverheat ||
+		assessment.action == safetyHostContainment ||
+		assessment.action == safetyFirmwareRecovery ||
+		assessment.action == safetyEmergencyHold {
+		return true, minerController.handleEmergency(
+			state,
+			info,
+			asic,
+			settings,
+			now,
+			assessment,
+		)
 	}
-
-	if failure, failed := instantaneousSafetyFailure(info, settings); failed {
-		if state.PendingKind != "" &&
-			state.PendingPoint() != livePoint &&
-			noMoreAggressive(state.PendingPoint(), livePoint) {
-			state.Phase = lib.PhaseCooldown
-			state.PhaseStartedAt = now
-			return true, minerController.states.SaveMiner(state)
-		}
+	if assessment.action == safetyRollback {
 		return true, minerController.rollbackForSafety(
 			ctx,
 			state,
@@ -119,9 +140,12 @@ func (minerController *controller) enforceMinerSafety(
 			asic,
 			settings,
 			now,
-			failure,
+			assessment.failure,
 			true,
 		)
+	}
+	if assessment.action == safetyUnavailable {
+		return true, nil
 	}
 
 	if state.PendingKind != "" || state.MiningPending {
@@ -654,7 +678,14 @@ func (minerController *controller) requestTrial(
 ) error {
 	state.SetFallbackPoint(previous)
 	state.ConsecutiveBadWindows = 0
-	return minerController.requestOperatingPoint(ctx, state, candidate, phase, false, now)
+	return minerController.requestOperatingPoint(
+		ctx,
+		state,
+		candidate,
+		phase,
+		lib.MutationOperatingPoint,
+		now,
+	)
 }
 
 func (minerController *controller) requestRollback(
@@ -680,7 +711,7 @@ func (minerController *controller) requestRollback(
 		state,
 		target,
 		lib.PhaseBaseline,
-		false,
+		lib.MutationOperatingPoint,
 		now,
 	)
 }
@@ -690,7 +721,7 @@ func (minerController *controller) requestOperatingPoint(
 	state *lib.MinerState,
 	target lib.OperatingPoint,
 	phase lib.OptimizerPhase,
-	recovery bool,
+	kind lib.MutationKind,
 	now time.Time,
 ) error {
 	if !validLivePoint(target) {
@@ -712,9 +743,12 @@ func (minerController *controller) requestOperatingPoint(
 			target.CoreVoltage,
 		)
 	}
-	kind := lib.MutationOperatingPoint
-	if recovery {
-		kind = lib.MutationOverheatRecovery
+	if kind != lib.MutationOperatingPoint && kind != lib.MutationSafetyRollback {
+		return fmt.Errorf(
+			"request operating point for %s: invalid mutation kind %q",
+			state.Hostname,
+			kind,
+		)
 	}
 	state.SetPendingMutation(kind, target, now)
 	state.Phase = phase
@@ -777,8 +811,19 @@ func (minerController *controller) rollbackForSafety(
 		return err
 	}
 	if target == failedPoint {
-		state.Phase = lib.PhaseHold
-		return minerController.states.SaveMiner(state)
+		return minerController.handleEmergency(
+			state,
+			info,
+			asic,
+			settings,
+			now,
+			safetyAssessment{action: safetyEmergencyHold, failure: failure},
+		)
+	}
+	if state.PendingKind == lib.MutationSafetyRollback &&
+		state.PendingPoint() == target &&
+		state.Phase == lib.PhaseCooldown {
+		return nil
 	}
 	minerController.logf(
 		"Safety rollback for %s: %s; %d MHz/%d mV -> %d MHz/%d mV",
@@ -795,7 +840,7 @@ func (minerController *controller) rollbackForSafety(
 		state,
 		target,
 		lib.PhaseCooldown,
-		false,
+		lib.MutationSafetyRollback,
 		now,
 	)
 }
@@ -813,20 +858,11 @@ func (minerController *controller) bestRollbackPoint(
 	best := lib.OperatingPoint{}
 	bestHash := -1.0
 	for _, record := range records {
-		if record.Status != lib.PointValidated {
-			continue
-		}
-		point := record.Point()
-		if point == failedPoint ||
-			!operatingPointAdvertised(asic, point) ||
-			record.P95Temp >= settings.TargetTemp ||
-			record.P95Power > settings.MaxPower-powerHeadroom ||
-			(record.P95VRTemp > 0 &&
-				record.P95VRTemp > settings.VRTempHigh*vrExplorationFactor) {
+		if !rollbackRecordEligible(record, failedPoint, asic, settings) {
 			continue
 		}
 		if record.MedianHash > bestHash {
-			best = point
+			best = record.Point()
 			bestHash = record.MedianHash
 		}
 	}
@@ -836,55 +872,102 @@ func (minerController *controller) bestRollbackPoint(
 	return minimumAdvertisedPoint(asic)
 }
 
-func (minerController *controller) handleOverheat(
-	_ context.Context,
+func (minerController *controller) handleEmergency(
 	state *lib.MinerState,
 	info lib.Info,
 	asic lib.ASICSettings,
 	settings lib.Settings,
 	now time.Time,
+	assessment safetyAssessment,
 ) error {
 	minerController.resetRuntime(state.MacAddr)
-	if !state.OverheatPending {
-		state.OverheatPending = true
+	event, err := transitionEmergencyState(
+		state,
+		info,
+		asic,
+		settings,
+		now,
+		assessment,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if err := minerController.states.SaveMiner(state); err != nil {
+		return fmt.Errorf("persist overheat episode for %s: %w", state.Hostname, err)
+	}
+	switch event {
+	case "started":
+		minerController.logf(
+			"OVERHEAT episode started on %s; preserving optimizer history",
+			state.Hostname,
+		)
+	case "recovered":
+		minerController.logf(
+			"Host emergency recovered without another mutation for %s",
+			state.Hostname,
+		)
+	}
+	return nil
+}
+
+func transitionEmergencyState(
+	state *lib.MinerState,
+	info lib.Info,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+	assessment safetyAssessment,
+	preserveInFlight bool,
+) (string, error) {
+	minimum, err := minimumAdvertisedPoint(asic)
+	if err != nil {
+		return "", err
+	}
+	newEpisode := state.Phase != lib.PhaseOverheat
+	event := ""
+	if newEpisode {
 		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
 		state.CooldownUntil = now.Add(overheatCooldown(settings, state.OverheatCount))
 		state.Phase = lib.PhaseOverheat
 		state.PhaseStartedAt = now
-		target, err := minimumAdvertisedPoint(asic)
-		if err != nil {
-			return err
-		}
-		state.SetPendingMutation(lib.MutationOverheatRecovery, target, now)
 		state.SetFallbackPoint(lib.OperatingPoint{})
-		if err := minerController.states.SaveMiner(state); err != nil {
-			return fmt.Errorf("record overheat for %s: %w", state.Hostname, err)
-		}
-		minerController.logf(
-			"OVERHEAT detected on %s; preserving optimizer history and waiting to recover",
-			state.Hostname,
-		)
+		event = "started"
 	} else if state.CooldownUntil.IsZero() {
 		state.CooldownUntil = now.Add(overheatCooldown(settings, max(state.OverheatCount, 1)))
-		if err := minerController.states.SaveMiner(state); err != nil {
-			return err
+	}
+
+	livePoint := operatingPointFromInfo(info)
+	switch {
+	case info.OverHeatMode != 0 ||
+		state.PendingKind == lib.MutationOverheatRecovery ||
+		assessment.action == safetyFirmwareRecovery:
+		if state.PendingKind != lib.MutationOverheatRecovery ||
+			state.PendingPoint() != minimum {
+			state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
+		}
+	case preserveInFlight &&
+		state.PendingKind == lib.MutationSafetyRollback &&
+		state.CurrentPoint() != minimum:
+		// Configured readback before proven reboot cannot complete containment.
+		// The coordinator remains the sole owner of mutation completion.
+	case knownFirmwareTripExceeded(info):
+		state.ClearPendingMutation()
+	case livePoint == minimum:
+		state.ClearPendingMutation()
+		if state.CurrentPoint() == minimum && safeToRecover(info, settings) {
+			state.Phase = lib.PhaseCooldown
+			state.PhaseStartedAt = now
+			state.RampUntil = now.Add(settings.RampUpTime)
+			event = "recovered"
+		}
+	default:
+		if state.PendingKind != lib.MutationSafetyRollback ||
+			state.PendingPoint() != minimum {
+			state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
 		}
 	}
-	if state.PendingKind != lib.MutationOverheatRecovery {
-		target, err := minimumAdvertisedPoint(asic)
-		if err != nil {
-			return err
-		}
-		state.SetPendingMutation(lib.MutationOverheatRecovery, target, now)
-		state.SetFallbackPoint(lib.OperatingPoint{})
-		if err := minerController.states.SaveMiner(state); err != nil {
-			return fmt.Errorf("replace %s mutation with overheat recovery: %w", state.Hostname, err)
-		}
-	}
-	if !safeToRecover(info, settings) {
-		return nil
-	}
-	return nil
+	return event, nil
 }
 
 func (minerController *controller) addSample(
@@ -1089,50 +1172,105 @@ func hasExplorationHeadroom(summary windowSummary, settings lib.Settings) bool {
 			summary.P95VRTemp <= settings.VRTempHigh*vrExplorationFactor)
 }
 
-func instantaneousSafetyFailure(
+func assessInstantaneousSafety(
 	info lib.Info,
 	settings lib.Settings,
-) (safetyFailure, bool) {
+	livePoint lib.OperatingPoint,
+	minimum lib.OperatingPoint,
+) safetyAssessment {
 	switch {
+	case info.OverHeatMode != 0:
+		return safetyAssessment{
+			action: safetyFirmwareRecovery,
+			failure: safetyFailure{
+				status: lib.PointThermal,
+				reason: "AxeOS firmware overheat mode is active",
+			},
+		}
+	case knownFirmwareTripExceeded(info):
+		return safetyAssessment{
+			action: safetyEmergencyHold,
+			failure: safetyFailure{
+				status: lib.PointThermal,
+				reason: "telemetry exceeded a known AxeOS firmware trip boundary",
+			},
+		}
 	case info.Temp >= settings.TempCutoff:
-		return safetyFailure{
-			status: lib.PointThermal,
-			reason: fmt.Sprintf(
-				"ASIC temperature %.1f°C reached the %.1f°C cutoff",
-				info.Temp,
-				settings.TempCutoff,
-			),
-		}, true
+		action := safetyHostContainment
+		if validLivePoint(minimum) && livePoint == minimum {
+			action = safetyEmergencyHold
+		}
+		return safetyAssessment{
+			action: action,
+			failure: safetyFailure{
+				status: lib.PointThermal,
+				reason: fmt.Sprintf(
+					"ASIC temperature %.1f°C reached the %.1f°C cutoff",
+					info.Temp,
+					settings.TempCutoff,
+				),
+			},
+		}
 	case info.Temp > settings.TempLimit:
-		return safetyFailure{
-			status: lib.PointThermal,
-			reason: fmt.Sprintf(
+		return rollbackAssessment(
+			livePoint,
+			minimum,
+			lib.PointThermal,
+			fmt.Sprintf(
 				"ASIC temperature %.1f°C exceeded %.1f°C",
 				info.Temp,
 				settings.TempLimit,
 			),
-		}, true
+		)
 	case info.Power >= settings.MaxPower:
-		return safetyFailure{
-			status: lib.PointPower,
-			reason: fmt.Sprintf(
+		return rollbackAssessment(
+			livePoint,
+			minimum,
+			lib.PointPower,
+			fmt.Sprintf(
 				"power %.1fW reached the %.1fW limit",
 				info.Power,
 				settings.MaxPower,
 			),
-		}, true
+		)
 	case info.VRTemp >= settings.VRTempHigh:
-		return safetyFailure{
-			status: lib.PointVRHot,
-			reason: fmt.Sprintf(
+		return rollbackAssessment(
+			livePoint,
+			minimum,
+			lib.PointVRHot,
+			fmt.Sprintf(
 				"VR temperature %.1f°C reached the %.1f°C limit",
 				info.VRTemp,
 				settings.VRTempHigh,
 			),
-		}, true
+		)
+	case !completeSafetyTelemetry(info) ||
+		hasPowerFault(info) ||
+		!supportedSafetyIdentity(info):
+		return safetyAssessment{action: safetyUnavailable}
 	default:
-		return safetyFailure{}, false
+		return safetyAssessment{action: safetyNormal}
 	}
+}
+
+func rollbackAssessment(
+	livePoint lib.OperatingPoint,
+	minimum lib.OperatingPoint,
+	status string,
+	reason string,
+) safetyAssessment {
+	action := safetyRollback
+	if validLivePoint(minimum) && livePoint == minimum {
+		action = safetyEmergencyHold
+	}
+	return safetyAssessment{
+		action:  action,
+		failure: safetyFailure{status: status, reason: reason},
+	}
+}
+
+func knownFirmwareTripExceeded(info lib.Info) bool {
+	return info.Temp > axeOSASICTripTemp || info.VRTemp > axeOSVRTripTemp
 }
 
 func windowSafetyFailure(
@@ -1176,9 +1314,29 @@ func optionAdvertised(options []int, target int) bool {
 	return index < len(options) && options[index] == target
 }
 
-func noMoreAggressive(target lib.OperatingPoint, live lib.OperatingPoint) bool {
+func strictlyDeescalates(target lib.OperatingPoint, live lib.OperatingPoint) bool {
 	return target.Frequency <= live.Frequency &&
-		target.CoreVoltage <= live.CoreVoltage
+		target.CoreVoltage <= live.CoreVoltage &&
+		target != live
+}
+
+func rollbackRecordEligible(
+	record lib.OperatingPointRecord,
+	failedPoint lib.OperatingPoint,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+) bool {
+	point := record.Point()
+	return record.Status == lib.PointValidated &&
+		point != failedPoint &&
+		operatingPointAdvertised(asic, point) &&
+		strictlyDeescalates(point, failedPoint) &&
+		record.P95Temp > 0 &&
+		record.P95Temp < settings.TargetTemp &&
+		record.P95Power > 0 &&
+		record.P95Power <= settings.MaxPower-powerHeadroom &&
+		record.P95VRTemp > 0 &&
+		record.P95VRTemp <= settings.VRTempHigh*vrExplorationFactor
 }
 
 func minimumAdvertisedPoint(asic lib.ASICSettings) (lib.OperatingPoint, error) {
@@ -1329,10 +1487,29 @@ func targetSampleCount(settings lib.Settings) int {
 }
 
 func safeToRecover(info lib.Info, settings lib.Settings) bool {
-	if info.Temp <= 0 || info.Temp > settings.RecoveryTemp {
-		return false
-	}
-	return info.VRTemp <= 0 || info.VRTemp < settings.VRTempHigh*vrExplorationFactor
+	return supportedSafetyIdentity(info) &&
+		completeSafetyTelemetry(info) &&
+		info.Temp <= settings.RecoveryTemp &&
+		info.VRTemp <= settings.VRTempHigh*vrExplorationFactor &&
+		info.Power <= settings.MaxPower-powerHeadroom &&
+		!hasPowerFault(info)
+}
+
+func supportedSafetyIdentity(info lib.Info) bool {
+	return info.Version == supportedAxeOSVersion &&
+		info.ASICModel == supportedASICModel &&
+		info.BoardVersion == supportedBoardVersion &&
+		info.MacAddr != ""
+}
+
+func completeSafetyTelemetry(info lib.Info) bool {
+	return finitePositive(info.Temp) &&
+		finitePositive(info.VRTemp) &&
+		finitePositive(info.Power)
+}
+
+func finitePositive(value float64) bool {
+	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func incrementOverheatCount(count int) int {

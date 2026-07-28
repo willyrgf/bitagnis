@@ -202,63 +202,71 @@ func (coordinator *mutationCoordinator) Advance(
 	ctx context.Context,
 	observations map[string]*minerObservation,
 	now time.Time,
-) error {
+) (bool, error) {
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
 
 	appliedResult, err := coordinator.applyResultsLocked()
 	if err != nil {
-		return err
-	}
-	if appliedResult {
-		return nil
+		return false, err
 	}
 	for macAddr, observation := range observations {
 		state, err := coordinator.states.LoadMiner(macAddr)
 		if err != nil {
-			return err
+			return false, err
 		}
 		observation.state = state
 	}
 	coordinator.cancelSupersededLocked(observations)
 
 	pendingWithoutObservation := false
-	safetyPending := false
+	safetyBlocked := false
 	for _, macAddr := range coordinator.selected {
-		if observations[macAddr] != nil {
-			continue
-		}
-		state, err := coordinator.states.LoadMiner(macAddr)
-		if err != nil {
-			if coordinator.gateOpen {
-				return err
+		state := lib.MinerState{}
+		if observation := observations[macAddr]; observation != nil {
+			state = observation.state
+		} else {
+			var err error
+			state, err = coordinator.states.LoadMiner(macAddr)
+			if err != nil {
+				if coordinator.gateOpen {
+					return false, err
+				}
+				continue
 			}
-			continue
 		}
-		if state.PendingKind == "" && !state.MiningPending {
-			continue
+		if state.Phase == lib.PhaseOverheat ||
+			state.PendingKind == lib.MutationSafetyRollback ||
+			state.PendingKind == lib.MutationOverheatRecovery {
+			safetyBlocked = true
 		}
-		pendingWithoutObservation = true
-		if state.PendingKind == lib.MutationOverheatRecovery ||
-			state.Phase == lib.PhaseCooldown {
-			safetyPending = true
-		}
-	}
-	for _, macAddr := range sortedObservationMACs(observations) {
-		observation := observations[macAddr]
-		if !safetyMutation(observation) {
-			continue
-		}
-		safetyPending = true
-		if coordinator.canStartLocked(observation, true) {
-			coordinator.startLocked(ctx, observation, true, "", "")
+		if observations[macAddr] == nil &&
+			(state.PendingKind != "" || state.MiningPending) {
+			pendingWithoutObservation = true
 		}
 	}
-	if safetyPending {
-		return nil
+	for _, kind := range []lib.MutationKind{
+		lib.MutationOverheatRecovery,
+		lib.MutationSafetyRollback,
+	} {
+		for _, macAddr := range sortedObservationMACs(observations) {
+			observation := observations[macAddr]
+			if observation.state.PendingKind != kind {
+				continue
+			}
+			if !appliedResult && coordinator.canStartLocked(observation) {
+				coordinator.startLocked(ctx, observation, "", "")
+			}
+		}
+	}
+	if safetyBlocked {
+		return false, nil
 	}
 	if pendingWithoutObservation {
-		return nil
+		return false, nil
+	}
+	if appliedResult {
+		return false, nil
 	}
 	for _, macAddr := range sortedObservationMACs(observations) {
 		observation := observations[macAddr]
@@ -268,7 +276,7 @@ func (coordinator *mutationCoordinator) Advance(
 				"Normal mutation blocked for %s because device identity is unsupported",
 				observation.info.Hostname,
 			)
-			return nil
+			return false, nil
 		}
 	}
 	for macAddr, expected := range coordinator.expectedHostnames {
@@ -282,7 +290,7 @@ func (coordinator *mutationCoordinator) Advance(
 				"Normal mutation blocked because selected hostname %s changed",
 				expected,
 			)
-			return nil
+			return false, nil
 		}
 	}
 
@@ -291,20 +299,23 @@ func (coordinator *mutationCoordinator) Advance(
 		if observation.state.PendingKind == "" {
 			continue
 		}
-		if coordinator.normalActive == "" &&
-			coordinator.canStartLocked(observation, false) {
-			coordinator.startLocked(ctx, observation, false, "", "")
+		if !appliedResult &&
+			coordinator.normalActive == "" &&
+			coordinator.canStartLocked(observation) {
+			coordinator.startLocked(ctx, observation, "", "")
 		}
-		return nil
+		return false, nil
 	}
 	if coordinator.normalActive != "" || coordinator.startupBlocked != "" {
-		return nil
+		return false, nil
 	}
 
 	if !coordinator.gateOpen {
-		return coordinator.advanceStartupLocked(ctx, observations, now)
+		if err := coordinator.advanceStartupLocked(ctx, observations, now); err != nil {
+			return false, err
+		}
 	}
-	return nil
+	return coordinator.gateOpen, nil
 }
 
 func (coordinator *mutationCoordinator) advanceStartupLocked(
@@ -367,11 +378,10 @@ func (coordinator *mutationCoordinator) advanceStartupLocked(
 			)
 			return nil
 		}
-		if coordinator.canStartLocked(observation, false) {
+		if coordinator.canStartLocked(observation) {
 			coordinator.startLocked(
 				ctx,
 				observation,
-				false,
 				primaryPassword,
 				fallbackPassword,
 			)
@@ -451,7 +461,6 @@ func (coordinator *mutationCoordinator) openGateLocked(now time.Time) error {
 
 func (coordinator *mutationCoordinator) canStartLocked(
 	observation *minerObservation,
-	safety bool,
 ) bool {
 	if observation == nil {
 		return false
@@ -463,22 +472,32 @@ func (coordinator *mutationCoordinator) canStartLocked(
 	if _, active := coordinator.active[macAddr]; active {
 		return false
 	}
-	if !safety && coordinator.normalActive != "" {
+	kind := observation.state.PendingKind
+	if kind == "" && observation.state.MiningPending {
+		kind = lib.MutationMiningConfiguration
+	}
+	if kind == "" {
 		return false
 	}
-	if observation.state.PendingKind == lib.MutationOverheatRecovery &&
-		!safeToRecover(observation.info, observation.settings) {
+	normal := kind == lib.MutationOperatingPoint ||
+		kind == lib.MutationMiningConfiguration
+	if normal && coordinator.normalActive != "" {
 		return false
 	}
-	if observation.info.Temp <= 0 ||
-		observation.info.VRTemp <= 0 ||
-		observation.info.Power <= 0 {
+	if !completeSafetyTelemetry(observation.info) ||
+		hasPowerFault(observation.info) {
 		return false
 	}
-	if _, failed := instantaneousSafetyFailure(observation.info, observation.settings); failed {
+	minimum, err := minimumAdvertisedPoint(observation.asic)
+	if err != nil {
 		return false
 	}
-	if hasPowerFault(observation.info) {
+	if validateKindSafety(
+		observation.info,
+		observation.settings,
+		observation.state,
+		minimum,
+	) != nil {
 		return false
 	}
 	return true
@@ -487,7 +506,6 @@ func (coordinator *mutationCoordinator) canStartLocked(
 func (coordinator *mutationCoordinator) startLocked(
 	ctx context.Context,
 	observation *minerObservation,
-	safety bool,
 	primaryPassword string,
 	fallbackPassword string,
 ) {
@@ -502,10 +520,11 @@ func (coordinator *mutationCoordinator) startLocked(
 	coordinator.nextMutation++
 	flowContext, cancel := context.WithCancel(ctx)
 	active := &activeMutation{
-		id:     coordinator.nextMutation,
-		kind:   kind,
-		point:  point,
-		normal: !safety,
+		id:    coordinator.nextMutation,
+		kind:  kind,
+		point: point,
+		normal: kind == lib.MutationOperatingPoint ||
+			kind == lib.MutationMiningConfiguration,
 		cancel: cancel,
 	}
 	coordinator.active[observation.state.MacAddr] = active
@@ -553,9 +572,12 @@ func (coordinator *mutationCoordinator) execute(
 		return result
 	}
 
+	var asic lib.ASICSettings
 	if request.kind == lib.MutationOperatingPoint ||
+		request.kind == lib.MutationSafetyRollback ||
 		request.kind == lib.MutationOverheatRecovery {
-		asic, err := coordinator.devices.GetASICSettings(ctx, request.ip)
+		var err error
+		asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 		if err != nil {
 			return fail(fmt.Errorf("read advertised operating points: %w", err))
 		}
@@ -579,9 +601,6 @@ func (coordinator *mutationCoordinator) execute(
 		!sameMiningReadback(preflight, request.info) {
 		return fail(fmt.Errorf("readable mining settings changed before PATCH"))
 	}
-	if err := validateMutationSafety(preflight, request.settings, request.kind); err != nil {
-		return fail(err)
-	}
 	current, err := coordinator.states.LoadMiner(request.macAddr)
 	if err != nil {
 		return fail(err)
@@ -589,10 +608,61 @@ func (coordinator *mutationCoordinator) execute(
 	if !mutationStillPending(current, request) {
 		return fail(fmt.Errorf("durable mutation intent changed before PATCH"))
 	}
+	if request.kind != lib.MutationOverheatRecovery &&
+		(preflight.OverHeatMode != 0 || knownFirmwareTripExceeded(preflight)) {
+		if len(asic.FrequencyOptions) == 0 || len(asic.VoltageOptions) == 0 {
+			asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
+			if err != nil {
+				return fail(fmt.Errorf(
+					"read advertised operating points for emergency supersession: %w",
+					err,
+				))
+			}
+		}
+		if asic.ASICModel != supportedASICModel {
+			return fail(fmt.Errorf("emergency supersession ASIC identity is unsupported"))
+		}
+		minimum, err := minimumAdvertisedPoint(asic)
+		if err != nil {
+			return fail(err)
+		}
+		assessment := assessInstantaneousSafety(
+			preflight,
+			request.settings,
+			operatingPointFromInfo(preflight),
+			minimum,
+		)
+		if _, err := transitionEmergencyState(
+			&current,
+			preflight,
+			asic,
+			request.settings,
+			coordinator.now(),
+			assessment,
+			false,
+		); err != nil {
+			return fail(err)
+		}
+		if err := coordinator.states.SaveMiner(&current); err != nil {
+			return fail(fmt.Errorf("persist preflight emergency supersession: %w", err))
+		}
+		coordinator.reset(request.macAddr)
+		return fail(fmt.Errorf("preflight emergency superseded the pending mutation"))
+	}
+	if err := coordinator.validateMutationPreflight(
+		preflight,
+		request.settings,
+		current,
+		asic,
+	); err != nil {
+		return fail(err)
+	}
 	request.info = preflight
 
 	switch request.kind {
-	case lib.MutationOperatingPoint, lib.MutationOverheatRecovery:
+	case lib.MutationOperatingPoint,
+		lib.MutationSafetyRollback,
+		lib.MutationOverheatRecovery:
 		if request.kind == lib.MutationOverheatRecovery {
 			err = coordinator.devices.PatchOverheatRecovery(ctx, request.point, request.ip)
 		} else {
@@ -698,11 +768,25 @@ func postRestartVerificationMaySettle(
 	if hasPowerFault(info) {
 		return false
 	}
-	if info.OverHeatMode != 0 && kind != lib.MutationOverheatRecovery {
+	switch kind {
+	case lib.MutationOperatingPoint, lib.MutationMiningConfiguration:
+		if !completeSafetyTelemetry(info) {
+			return true
+		}
+		assessment := assessInstantaneousSafety(
+			info,
+			settings,
+			operatingPointFromInfo(info),
+			lib.OperatingPoint{},
+		)
+		return assessment.action == safetyNormal
+	case lib.MutationSafetyRollback:
+		return info.OverHeatMode == 0
+	case lib.MutationOverheatRecovery:
+		return true
+	default:
 		return false
 	}
-	_, unsafe := instantaneousSafetyFailure(info, settings)
-	return !unsafe
 }
 
 func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
@@ -755,19 +839,15 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 		return err
 	}
 	switch result.kind {
-	case lib.MutationOperatingPoint, lib.MutationOverheatRecovery:
+	case lib.MutationOperatingPoint,
+		lib.MutationSafetyRollback,
+		lib.MutationOverheatRecovery:
 		if state.PendingKind != result.kind || state.PendingPoint() != result.point {
 			return nil
 		}
 		state.SetCurrentPoint(result.point)
 		state.ClearPendingMutation()
-		if state.Phase == lib.PhaseCooldown {
-			state.Phase = lib.PhaseBaseline
-		}
 		if result.kind == lib.MutationOverheatRecovery {
-			state.OverheatPending = false
-			state.SetBestPoint(lib.OperatingPoint{})
-			state.BestHashRate = 0
 			state.SetFallbackPoint(lib.OperatingPoint{})
 			state.Phase = lib.PhaseCooldown
 		}
@@ -786,7 +866,9 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 	completedAt := coordinator.now()
 	state.IP = result.miner.IP
 	state.RampUntil = completedAt.Add(settings.RampUpTime)
-	state.PhaseStartedAt = completedAt
+	if result.kind != lib.MutationSafetyRollback {
+		state.PhaseStartedAt = completedAt
+	}
 	state.ObservedFrequency = 0
 	state.ObservedCoreVoltage = 0
 	state.ObservedCount = 0
@@ -868,42 +950,158 @@ func validateMutationIdentity(info lib.Info, macAddr string) error {
 	}
 }
 
-func validateMutationSafety(
+func validateKindSafety(
 	info lib.Info,
 	settings lib.Settings,
-	kind lib.MutationKind,
+	state lib.MinerState,
+	minimum lib.OperatingPoint,
 ) error {
-	if info.Temp <= 0 || info.VRTemp <= 0 || info.Power <= 0 {
+	if !completeSafetyTelemetry(info) {
 		return fmt.Errorf("device safety telemetry is incomplete")
 	}
 	if hasPowerFault(info) {
 		return fmt.Errorf("device reports a power fault")
 	}
-	if info.OverHeatMode != 0 && kind != lib.MutationOverheatRecovery {
-		return fmt.Errorf("device is in firmware overheat mode")
+	kind := state.PendingKind
+	if kind == "" && state.MiningPending {
+		kind = lib.MutationMiningConfiguration
 	}
-	if _, failed := instantaneousSafetyFailure(info, settings); failed {
-		return fmt.Errorf("device is outside hard safety limits")
-	}
-	if kind == lib.MutationOverheatRecovery && !safeToRecover(info, settings) {
-		return fmt.Errorf("device is not cool enough for overheat recovery")
+	switch kind {
+	case lib.MutationOperatingPoint, lib.MutationMiningConfiguration:
+		assessment := assessInstantaneousSafety(
+			info,
+			settings,
+			operatingPointFromInfo(info),
+			minimum,
+		)
+		if assessment.action != safetyNormal {
+			return fmt.Errorf("device is outside hard safety limits")
+		}
+	case lib.MutationSafetyRollback:
+		if state.PendingPoint() == operatingPointFromInfo(info) {
+			return fmt.Errorf("safety target is already the configured live pair")
+		}
+		switch state.Phase {
+		case lib.PhaseCooldown:
+			if info.OverHeatMode != 0 {
+				return fmt.Errorf("device is in firmware overheat mode")
+			}
+			if info.Temp >= settings.TempCutoff {
+				return fmt.Errorf("ASIC temperature reached the host cutoff")
+			}
+			if knownFirmwareTripExceeded(info) {
+				return fmt.Errorf("telemetry exceeded a known AxeOS firmware trip boundary")
+			}
+		case lib.PhaseOverheat:
+			if info.OverHeatMode != 0 {
+				return fmt.Errorf("device is in firmware overheat mode")
+			}
+			if knownFirmwareTripExceeded(info) {
+				return fmt.Errorf("telemetry exceeded a known AxeOS firmware trip boundary")
+			}
+			if state.PendingPoint() != minimum {
+				return fmt.Errorf("host containment target is not the exact advertised minimum")
+			}
+		default:
+			return fmt.Errorf("safety rollback has no durable safety phase")
+		}
+	case lib.MutationOverheatRecovery:
+		if state.Phase != lib.PhaseOverheat {
+			return fmt.Errorf("overheat recovery has no durable emergency episode")
+		}
+		if state.PendingPoint() != minimum {
+			return fmt.Errorf("overheat recovery target is not the exact advertised minimum")
+		}
+		if !safeToRecover(info, settings) {
+			return fmt.Errorf("device is not cool enough for overheat recovery")
+		}
+	default:
+		return fmt.Errorf("unsupported mutation kind %q", kind)
 	}
 	return nil
 }
 
+func (coordinator *mutationCoordinator) validateMutationPreflight(
+	info lib.Info,
+	settings lib.Settings,
+	state lib.MinerState,
+	asic lib.ASICSettings,
+) error {
+	minimum := lib.OperatingPoint{}
+	if state.PendingKind != "" {
+		var err error
+		minimum, err = minimumAdvertisedPoint(asic)
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateKindSafety(info, settings, state, minimum); err != nil {
+		return err
+	}
+	if state.PendingKind != lib.MutationSafetyRollback ||
+		state.Phase != lib.PhaseCooldown ||
+		state.PendingPoint() == minimum {
+		return nil
+	}
+	records, err := coordinator.states.ListPoints(state.MacAddr)
+	if err != nil {
+		return fmt.Errorf("read safety rollback evidence: %w", err)
+	}
+	for _, record := range records {
+		if record.Point() == state.PendingPoint() &&
+			rollbackRecordEligible(
+				record,
+				operatingPointFromInfo(info),
+				asic,
+				settings,
+			) {
+			return nil
+		}
+	}
+	return fmt.Errorf("safety rollback target lacks current complete validated evidence")
+}
+
 func verifyMutationReadback(request mutationRequest, info lib.Info) error {
-	if err := validateMutationSafety(info, request.settings, request.kind); err != nil {
-		return fmt.Errorf("post-restart safety verification failed: %w", err)
+	if !completeSafetyTelemetry(info) {
+		return fmt.Errorf("post-restart safety telemetry is incomplete")
+	}
+	if hasPowerFault(info) {
+		return fmt.Errorf("post-restart device reports a power fault")
 	}
 	switch request.kind {
-	case lib.MutationOperatingPoint, lib.MutationOverheatRecovery:
+	case lib.MutationOperatingPoint,
+		lib.MutationSafetyRollback,
+		lib.MutationOverheatRecovery:
 		if operatingPointFromInfo(info) != request.point {
 			return fmt.Errorf("post-restart operating point does not match the pending pair")
 		}
-		if request.kind == lib.MutationOverheatRecovery && info.OverHeatMode != 0 {
+		if request.kind == lib.MutationOperatingPoint {
+			assessment := assessInstantaneousSafety(
+				info,
+				request.settings,
+				operatingPointFromInfo(info),
+				lib.OperatingPoint{},
+			)
+			if assessment.action != safetyNormal {
+				return fmt.Errorf("post-restart device is outside hard safety limits")
+			}
+		} else if request.kind == lib.MutationSafetyRollback &&
+			info.OverHeatMode != 0 {
+			return fmt.Errorf("post-restart firmware overheat mode is active")
+		} else if request.kind == lib.MutationOverheatRecovery &&
+			info.OverHeatMode != 0 {
 			return fmt.Errorf("post-restart firmware overheat flag remains set")
 		}
 	case lib.MutationMiningConfiguration:
+		assessment := assessInstantaneousSafety(
+			info,
+			request.settings,
+			operatingPointFromInfo(info),
+			lib.OperatingPoint{},
+		)
+		if assessment.action != safetyNormal {
+			return fmt.Errorf("post-restart device is outside hard safety limits")
+		}
 		if operatingPointFromInfo(info) != operatingPointFromInfo(request.info) {
 			return fmt.Errorf("post-restart operating point changed during mining configuration")
 		}
@@ -924,24 +1122,6 @@ func mutationStillPending(state lib.MinerState, request mutationRequest) bool {
 	return state.PendingKind == request.kind && state.PendingPoint() == request.point
 }
 
-func safetyMutation(observation *minerObservation) bool {
-	if observation == nil {
-		return false
-	}
-	switch observation.state.PendingKind {
-	case lib.MutationOverheatRecovery:
-		return true
-	case lib.MutationOperatingPoint:
-		if observation.state.Phase == lib.PhaseCooldown {
-			return true
-		}
-		_, unsafe := instantaneousSafetyFailure(observation.info, observation.settings)
-		return unsafe
-	default:
-		return false
-	}
-}
-
 func startupHealthy(info lib.Info, settings lib.Settings) bool {
 	if hasPowerFault(info) ||
 		info.OverHeatMode != 0 ||
@@ -951,7 +1131,13 @@ func startupHealthy(info lib.Info, settings lib.Settings) bool {
 		info.Power <= 0 {
 		return false
 	}
-	if _, failed := instantaneousSafetyFailure(info, settings); failed {
+	assessment := assessInstantaneousSafety(
+		info,
+		settings,
+		operatingPointFromInfo(info),
+		lib.OperatingPoint{},
+	)
+	if assessment.action != safetyNormal {
 		return false
 	}
 	return !settings.Mining.Enabled || info.IsUsingFallbackStratum == 0

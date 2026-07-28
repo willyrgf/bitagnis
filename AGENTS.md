@@ -120,10 +120,17 @@ These invariants are high risk if violated:
   confirmation. Safety is not deferred until an evaluation window completes.
 - Emergency and AxeOS overheat recovery take priority over normal rollback, pending trial
   reconciliation, and upward exploration.
-- Never learn or persist AxeOS emergency sentinel values such as `75 MHz / 4870 mV` as normal
-  operating points.
-- Emergency recovery waits until telemetry is safe, applies the minimum advertised complete pair,
-  clears the firmware overheat flag with that pair, resets samples, and enters cooldown.
+- `PhaseOverheat` is the canonical durable emergency episode and fleet safety block. Only a typed
+  pending mutation kind authorizes hardware; optimizer phase and live telemetry never do.
+- Never learn or persist AxeOS v2.8.1 emergency configured state `50 MHz / 1000 mV` as a normal
+  operating point.
+- Host cutoff containment immediately applies the exact minimum advertised complete pair without
+  clearing the firmware flag, then retains `PhaseOverheat` until recovery telemetry is safe.
+- AxeOS-overheat recovery waits until telemetry is safe, applies the exact minimum advertised
+  complete pair, clears the firmware overheat flag with that pair, resets samples, and enters
+  cooldown.
+- Unsafe telemetry at the exact minimum with no firmware flag creates a mutation-free durable
+  emergency hold; never replay PATCH or restart for the same pair.
 - Normal safety rollback chooses a validated point with thermal, VR-temperature, and power
   headroom; if no validated point qualifies, use the minimum advertised pair.
 - Persist a pending operating-point request before touching the device. Do not evaluate it until
@@ -147,11 +154,12 @@ code, settings, output, and tests.
 
 ## AxeOS Mutation Constraint
 
-AxeOS v2.8.1 `PATCH /api/system` persists settings but does not load them into the running miner
-without a restart. All current hardware writes therefore use the one coordinator-owned lifecycle:
+AxeOS v2.8.1 `PATCH /api/system` writes frequency and voltage separately to NVS, and the running
+power task may observe and apply either write before restart. Complete every validation before
+PATCH. All current hardware writes use the one coordinator-owned lifecycle:
 
-Do not expand the write surface or claim that a PATCH is active configuration without this complete
-lifecycle:
+Do not expand the write surface or claim that PATCH success or pre-restart configured readback
+proves active configuration. The configured pair is verified only after this complete lifecycle:
 
 ```text
 validate -> persist intent -> re-read identity and safety -> PATCH -> restart

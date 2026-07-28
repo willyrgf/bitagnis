@@ -189,8 +189,9 @@ type axeMiningPatch struct {
 	FallbackStratumPassword string `json:"fallbackStratumPassword"`
 }
 
-// PatchOperatingPoint persists one complete advertised operating-point pair.
-// The caller must restart and verify the device before treating it as active.
+// PatchOperatingPoint sends one complete operating-point pair. AxeOS may apply
+// NVS writes before restart; the caller must validate first, then restart and
+// prove exact configured readback after a new boot.
 func (client *BitaxeClient) PatchOperatingPoint(
 	ctx context.Context,
 	point OperatingPoint,
@@ -205,8 +206,9 @@ func (client *BitaxeClient) PatchOperatingPoint(
 	}, false)
 }
 
-// PatchOverheatRecovery persists one complete pair while clearing the firmware
-// overheat flag. The caller must restart and verify the device.
+// PatchOverheatRecovery sends one complete pair while clearing the firmware
+// overheat flag. The caller must validate first, then restart and prove exact
+// configured readback after a new boot.
 func (client *BitaxeClient) PatchOverheatRecovery(
 	ctx context.Context,
 	point OperatingPoint,

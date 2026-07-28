@@ -356,8 +356,7 @@ func (minerController *controller) pollMiners(
 
 	observations := make(map[string]*minerObservation, len(results))
 	handled := make(map[string]bool, len(results))
-	allowOptimization := minerController.mutations == nil ||
-		minerController.mutations.GateOpen()
+	allowOptimization := minerController.mutations == nil
 	for index := range results {
 		observation := results[index].observation
 		if observation == nil {
@@ -382,7 +381,9 @@ func (minerController *controller) pollMiners(
 		}
 	}
 	if minerController.mutations != nil {
-		if err := minerController.mutations.Advance(ctx, observations, now); err != nil {
+		var err error
+		allowOptimization, err = minerController.mutations.Advance(ctx, observations, now)
+		if err != nil {
 			minerController.logf("Mutation coordination failed: %s", err)
 		}
 	}
@@ -408,7 +409,7 @@ func (minerController *controller) pollMiners(
 		}
 	}
 	if minerController.mutations != nil && allowOptimization {
-		if err := minerController.mutations.Advance(ctx, observations, now); err != nil {
+		if _, err := minerController.mutations.Advance(ctx, observations, now); err != nil {
 			minerController.logf("Mutation coordination failed: %s", err)
 		}
 	}

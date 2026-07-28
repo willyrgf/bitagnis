@@ -65,8 +65,8 @@ func TestOptimizerStoreBootstrapsFromLiveOperatingPoint(t *testing.T) {
 func TestOptimizerStoreNeverTrustsEmergencyOperatingPoint(t *testing.T) {
 	store := openTestOptimizerStore(t)
 	info := normalInfo()
-	info.Frequency = 75
-	info.CoreVoltage = 4870
+	info.Frequency = 50
+	info.CoreVoltage = 1000
 	info.OverHeatMode = 1
 
 	state, created, err := store.LoadOrCreate(info, "192.0.2.10", time.Now())
@@ -76,7 +76,7 @@ func TestOptimizerStoreNeverTrustsEmergencyOperatingPoint(t *testing.T) {
 	if !created || state.CurrentPoint() != (OperatingPoint{}) {
 		t.Fatalf("emergency point was trusted: %+v", state)
 	}
-	if !state.OverheatPending || state.Phase != PhaseOverheat || state.OverheatCount != 1 {
+	if state.Phase != PhaseOverheat || state.OverheatCount != 1 {
 		t.Fatalf("overheat bootstrap state = %+v", state)
 	}
 }
@@ -94,6 +94,22 @@ func TestOptimizerStoreCreatesOnlyCurrentSchema(t *testing.T) {
 	if version != optimizerSchemaVersion ||
 		fmt.Sprint(tables) != "[operating_points optimizer_miners]" {
 		t.Fatalf("schema version/tables = %d/%v", version, tables)
+	}
+	columns, err := tableColumns(t.Context(), store.conn, "optimizer_miners")
+	if err != nil {
+		t.Fatalf("read optimizer_miners columns: %v", err)
+	}
+	for _, column := range columns {
+		lowerName := strings.ToLower(column.name)
+		switch {
+		case column.name == "overheat_pending":
+			t.Fatal("schema retained deleted overheat_pending column")
+		case strings.Contains(lowerName, "password") ||
+			strings.Contains(lowerName, "stratum") ||
+			strings.Contains(lowerName, "telemetry") ||
+			strings.Contains(lowerName, "sample"):
+			t.Fatalf("schema contains forbidden durable field %q", column.name)
+		}
 	}
 }
 
@@ -148,6 +164,7 @@ func TestOptimizerStorePersistsHistoryAndPendingObligationsAcrossReopen(t *testi
 		OperatingPoint{Frequency: 400, CoreVoltage: 1060},
 		now,
 	)
+	state.Phase = PhaseOverheat
 	state.MiningPending = true
 	state.OverheatCount = 3
 	state.CooldownUntil = now.Add(6 * time.Hour)
@@ -349,11 +366,148 @@ func TestOptimizerStoreRejectsInvalidPendingStateAndPoint(t *testing.T) {
 	err := store.SavePoint(&OperatingPointRecord{
 		MacAddr:     "aa:bb",
 		Frequency:   400,
-		CoreVoltage: 4870,
+		CoreVoltage: 2500,
 		Status:      PointUnstable,
 	})
 	if err == nil {
 		t.Fatal("SavePoint returned nil, want invalid voltage error")
+	}
+}
+
+func TestMinerStateRejectsInvalidSafetyKindPhaseCombinations(t *testing.T) {
+	now := time.Now()
+	base := MinerState{
+		MacAddr:            "aa:bb:cc:dd:ee:ff",
+		Hostname:           "bitaxe-alpha",
+		IP:                 "192.0.2.10",
+		Phase:              PhaseBaseline,
+		PhaseStartedAt:     now,
+		CurrentFrequency:   490,
+		CurrentCoreVoltage: 1100,
+	}
+	tests := []struct {
+		name  string
+		phase OptimizerPhase
+		kind  MutationKind
+	}{
+		{
+			name:  "safety rollback outside safety phase",
+			phase: PhaseBaseline,
+			kind:  MutationSafetyRollback,
+		},
+		{
+			name:  "overheat recovery outside emergency",
+			phase: PhaseCooldown,
+			kind:  MutationOverheatRecovery,
+		},
+		{
+			name:  "ordinary intent in emergency",
+			phase: PhaseOverheat,
+			kind:  MutationOperatingPoint,
+		},
+		{
+			name:  "unknown kind",
+			phase: PhaseCooldown,
+			kind:  MutationKind("unknown"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := base
+			state.Phase = test.phase
+			state.SetPendingMutation(
+				test.kind,
+				OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+				now,
+			)
+			if err := validateMinerState(state); err == nil {
+				t.Fatalf("invalid state was accepted: %+v", state)
+			}
+		})
+	}
+}
+
+func TestMutationFreeOverheatEpisodeSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().Round(time.Second)
+	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+	if err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+	state.Phase = PhaseOverheat
+	state.PhaseStartedAt = now.Add(time.Minute)
+	state.OverheatCount = 2
+	state.CooldownUntil = now.Add(4 * time.Hour)
+	state.ClearPendingMutation()
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatalf("save emergency hold: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, err := reopened.LoadMiner(state.MacAddr)
+	if err != nil {
+		t.Fatalf("load emergency hold: %v", err)
+	}
+	if got.Phase != PhaseOverheat ||
+		got.PendingKind != "" ||
+		!got.PhaseStartedAt.Equal(state.PhaseStartedAt) ||
+		!got.CooldownUntil.Equal(state.CooldownUntil) ||
+		got.OverheatCount != state.OverheatCount {
+		t.Fatalf("reopened emergency hold = %+v", got)
+	}
+}
+
+func TestPendingSafetyRollbackAgeSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().Round(time.Second)
+	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+	if err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+	pendingSince := now.Add(3 * time.Minute)
+	phaseStarted := now.Add(2 * time.Minute)
+	state.Phase = PhaseCooldown
+	state.PhaseStartedAt = phaseStarted
+	state.SetPendingMutation(
+		MutationSafetyRollback,
+		OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+		pendingSince,
+	)
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatalf("save safety rollback: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, err := reopened.LoadMiner(state.MacAddr)
+	if err != nil {
+		t.Fatalf("load safety rollback: %v", err)
+	}
+	if got.PendingKind != MutationSafetyRollback ||
+		!got.PendingSince.Equal(pendingSince) ||
+		!got.PhaseStartedAt.Equal(phaseStarted) {
+		t.Fatalf("reopened safety rollback = %+v", got)
 	}
 }
 

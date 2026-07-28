@@ -108,7 +108,7 @@ func waitForMutation(
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for mutation")
 		}
-		if err := coordinator.Advance(
+		if _, err := coordinator.Advance(
 			context.Background(),
 			observations(),
 			now,
@@ -179,6 +179,174 @@ func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *
 		t.Fatalf(
 			"device requests = %+v, restarts = %+v",
 			devices.operatingRequests(),
+			devices.restartRequests(),
+		)
+	}
+}
+
+func TestSafetyMutationsRunThroughRestartAndCompleteWithResidualHeat(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     lib.OptimizerPhase
+		temp      float64
+		wantPhase lib.OptimizerPhase
+	}{
+		{
+			name:      "ordinary hard-limit rollback",
+			phase:     lib.PhaseCooldown,
+			temp:      optimizerSettings().TempLimit + 1,
+			wantPhase: lib.PhaseCooldown,
+		},
+		{
+			name:      "host cutoff containment",
+			phase:     lib.PhaseOverheat,
+			temp:      optimizerSettings().TempCutoff,
+			wantPhase: lib.PhaseOverheat,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().Round(time.Second)
+			target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+			info := healthyInfo()
+			info.Frequency = 490
+			info.CoreVoltage = 1100
+			info.Temp = test.temp
+			state := optimizerState(now.Add(-time.Hour))
+			state.SetCurrentPoint(operatingPointFromInfo(info))
+			state.Phase = test.phase
+			state.PhaseStartedAt = now.Add(-30 * time.Minute)
+			state.SetPendingMutation(
+				lib.MutationSafetyRollback,
+				target,
+				now.Add(-20*time.Minute),
+			)
+			states := newMemoryOptimizerStore()
+			states.putState(state)
+			devices := &fakeDeviceAPI{
+				getInfo: func(context.Context, string) (lib.Info, error) {
+					return info, nil
+				},
+				asicSettings: gammaASIC(),
+			}
+			post := info
+			post.Frequency = target.Frequency
+			post.CoreVoltage = target.CoreVoltage
+			post.UpTimeSeconds = 1
+			coordinator := testMutationCoordinator(
+				devices,
+				states,
+				mutationSettings(false),
+				info,
+				nil,
+				func(context.Context, string) (lib.DiscoveredMiner, error) {
+					return discovered(post, "192.0.2.44"), nil
+				},
+				nil,
+				nil,
+			)
+			coordinator.now = func() time.Time { return now }
+			observations := func() map[string]*minerObservation {
+				return map[string]*minerObservation{
+					state.MacAddr: observation(
+						info,
+						states.getState(state.MacAddr),
+						mutationSettings(false),
+					),
+				}
+			}
+			waitForMutation(t, coordinator, observations, now, func() bool {
+				return states.getState(state.MacAddr).PendingKind == ""
+			})
+			got := states.getState(state.MacAddr)
+			if got.CurrentPoint() != target ||
+				got.Phase != test.wantPhase ||
+				len(devices.operatingRequests()) != 1 ||
+				devices.operatingRequests()[0].recovery ||
+				len(devices.restartRequests()) != 1 {
+				t.Fatalf(
+					"completed state/requests/restarts = %+v/%+v/%+v",
+					got,
+					devices.operatingRequests(),
+					devices.restartRequests(),
+				)
+			}
+		})
+	}
+}
+
+func TestFirmwareOverheatRecoveryUsesFlagClearingVerifiedLifecycle(t *testing.T) {
+	now := time.Now().Round(time.Second)
+	settings := mutationSettings(false)
+	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	info := healthyInfo()
+	info.Frequency = 50
+	info.CoreVoltage = 1000
+	info.OverHeatMode = 1
+	info.Temp = settings.RecoveryTemp
+	info.Power = settings.MaxPower - powerHeadroom
+	info.VRTemp = settings.VRTempHigh * vrExplorationFactor
+	state := optimizerState(now.Add(-time.Hour))
+	originalBest := state.BestPoint()
+	originalBestHash := state.BestHashRate
+	state.Phase = lib.PhaseOverheat
+	state.PhaseStartedAt = now.Add(-30 * time.Minute)
+	state.SetPendingMutation(
+		lib.MutationOverheatRecovery,
+		target,
+		now.Add(-20*time.Minute),
+	)
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	devices := &fakeDeviceAPI{
+		getInfo: func(context.Context, string) (lib.Info, error) {
+			return info, nil
+		},
+		asicSettings: gammaASIC(),
+	}
+	post := info
+	post.Frequency = target.Frequency
+	post.CoreVoltage = target.CoreVoltage
+	post.OverHeatMode = 0
+	post.UpTimeSeconds = 1
+	coordinator := testMutationCoordinator(
+		devices,
+		states,
+		settings,
+		info,
+		nil,
+		func(context.Context, string) (lib.DiscoveredMiner, error) {
+			return discovered(post, "192.0.2.44"), nil
+		},
+		nil,
+		nil,
+	)
+	coordinator.now = func() time.Time { return now }
+	observations := func() map[string]*minerObservation {
+		return map[string]*minerObservation{
+			state.MacAddr: observation(
+				info,
+				states.getState(state.MacAddr),
+				settings,
+			),
+		}
+	}
+	waitForMutation(t, coordinator, observations, now, func() bool {
+		return states.getState(state.MacAddr).PendingKind == ""
+	})
+	got := states.getState(state.MacAddr)
+	requests := devices.operatingRequests()
+	if got.CurrentPoint() != target ||
+		got.Phase != lib.PhaseCooldown ||
+		got.BestPoint() != originalBest ||
+		got.BestHashRate != originalBestHash ||
+		len(requests) != 1 ||
+		!requests[0].recovery ||
+		len(devices.restartRequests()) != 1 {
+		t.Fatalf(
+			"recovery state/requests/restarts = %+v/%+v/%+v",
+			got,
+			requests,
 			devices.restartRequests(),
 		)
 	}
@@ -372,7 +540,7 @@ func TestWrongMACPreflightNeverReachesPatch(t *testing.T) {
 			),
 		}
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("start mutation: %v", err)
 	}
 	waitForMutation(t, coordinator, observations, now, func() bool {
@@ -418,7 +586,7 @@ func TestNamedHostnameChangeBlocksNormalMutation(t *testing.T) {
 	coordinator.RequireHostnames(map[string]string{state.MacAddr: state.Hostname})
 	renamed := info
 	renamed.Hostname = "unexpected-name"
-	if err := coordinator.Advance(
+	if _, err := coordinator.Advance(
 		context.Background(),
 		map[string]*minerObservation{
 			state.MacAddr: observation(
@@ -446,10 +614,24 @@ func TestOfflinePendingMutationBlocksOtherNormalWork(t *testing.T) {
 	tests := []struct {
 		name          string
 		phase         lib.OptimizerPhase
+		kind          lib.MutationKind
 		miningPending bool
 	}{
-		{name: "offline safety", phase: lib.PhaseCooldown},
-		{name: "offline normal", phase: lib.PhaseUndervolt},
+		{
+			name:  "offline safety",
+			phase: lib.PhaseCooldown,
+			kind:  lib.MutationSafetyRollback,
+		},
+		{
+			name:  "offline overheat recovery",
+			phase: lib.PhaseOverheat,
+			kind:  lib.MutationOverheatRecovery,
+		},
+		{
+			name:  "offline normal",
+			phase: lib.PhaseUndervolt,
+			kind:  lib.MutationOperatingPoint,
+		},
 		{
 			name:          "offline mining",
 			phase:         lib.PhaseBaseline,
@@ -472,7 +654,7 @@ func TestOfflinePendingMutationBlocksOtherNormalWork(t *testing.T) {
 				firstState.MiningPending = true
 			} else {
 				firstState.SetPendingMutation(
-					lib.MutationOperatingPoint,
+					test.kind,
 					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
 					now,
 				)
@@ -512,7 +694,7 @@ func TestOfflinePendingMutationBlocksOtherNormalWork(t *testing.T) {
 				func(string) {},
 			)
 			coordinator.gateOpen = true
-			if err := coordinator.Advance(
+			if _, err := coordinator.Advance(
 				context.Background(),
 				map[string]*minerObservation{
 					secondState.MacAddr: observation(
@@ -575,7 +757,7 @@ func TestOperatingPointIntentIsRecheckedAfterASICRead(t *testing.T) {
 			),
 		}
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("start mutation: %v", err)
 	}
 	waitForMutation(t, coordinator, observations, now, func() bool {
@@ -620,16 +802,16 @@ func TestMatchingDefaultMiningConfigurationDoesNotResolveSecretsOrMutate(t *test
 		state.MacAddr: observation(info, state, mutationSettings(true)),
 	}
 
-	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations, now); err != nil {
 		t.Fatalf("first startup health poll: %v", err)
 	}
 	if coordinator.GateOpen() {
 		t.Fatal("startup gate opened after only one health poll")
 	}
-	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations, now); err != nil {
 		t.Fatalf("second startup health poll: %v", err)
 	}
-	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations, now); err != nil {
 		t.Fatalf("open startup gate: %v", err)
 	}
 	if !coordinator.GateOpen() ||
@@ -677,7 +859,7 @@ func TestPasswordFileFailureBlocksMiningMutationButNotSafetyPolling(t *testing.T
 		state.MacAddr: observation(info, state, mutationSettings(true)),
 	}
 
-	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations, now); err != nil {
 		t.Fatalf("Advance returned a password-file error: %v", err)
 	}
 	if passwordReads.Load() != 1 ||
@@ -773,7 +955,7 @@ func TestExistingMiningObligationConsumesReapplyWithoutDuplicateMutation(t *test
 		return !states.getState(state.MacAddr).MiningPending
 	})
 	for range 3 {
-		if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+		if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 			t.Fatalf("advance completed reapply: %v", err)
 		}
 	}
@@ -805,7 +987,7 @@ func TestDisabledMiningCannotAbandonDurableObligation(t *testing.T) {
 		nil,
 		nil,
 	)
-	if err := coordinator.Advance(
+	if _, err := coordinator.Advance(
 		context.Background(),
 		map[string]*minerObservation{
 			state.MacAddr: observation(
@@ -890,16 +1072,16 @@ func TestMiningDriftUsesCompleteRestartVerifiedFlowAndPrimaryHealth(t *testing.T
 	postObservations := map[string]*minerObservation{
 		state.MacAddr: observation(post, postState, mutationSettings(true)),
 	}
-	if err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
+	if _, err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
 		t.Fatalf("first primary health poll: %v", err)
 	}
 	if coordinator.GateOpen() {
 		t.Fatal("gate opened after one positive primary-health poll")
 	}
-	if err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
+	if _, err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
 		t.Fatalf("second primary health poll: %v", err)
 	}
-	if err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
+	if _, err := coordinator.Advance(context.Background(), postObservations, healthyAt); err != nil {
 		t.Fatalf("open gate: %v", err)
 	}
 	if !coordinator.GateOpen() {
@@ -948,10 +1130,10 @@ func TestStartupHealthFailureIsBounded(t *testing.T) {
 	observations := map[string]*minerObservation{
 		state.MacAddr: observation(info, state, mutationSettings(true)),
 	}
-	if err := coordinator.Advance(context.Background(), observations, now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations, now); err != nil {
 		t.Fatalf("start health deadline: %v", err)
 	}
-	if err := coordinator.Advance(
+	if _, err := coordinator.Advance(
 		context.Background(),
 		observations,
 		now.Add(2*time.Second),
@@ -989,7 +1171,7 @@ func TestStartupHealthWaitsForManualPointAdoptionAndRamp(t *testing.T) {
 	)
 	advance := func(observedState lib.MinerState, at time.Time) {
 		t.Helper()
-		if err := coordinator.Advance(
+		if _, err := coordinator.Advance(
 			context.Background(),
 			map[string]*minerObservation{
 				state.MacAddr: observation(
@@ -1103,7 +1285,7 @@ func TestFirstMinerMiningFailureStopsSecondAndRedactsSecrets(t *testing.T) {
 		return coordinator.startupBlocked == first.Hostname
 	})
 	for range 3 {
-		if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+		if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 			t.Fatalf("advance blocked rollout: %v", err)
 		}
 	}
@@ -1202,19 +1384,640 @@ func TestOverheatPreemptionPreservesMiningObligation(t *testing.T) {
 	info.OverHeatMode = 1
 	info.Temp = 60
 
-	if err := minerController.handleOverheat(
+	handled, err := minerController.enforceMinerSafety(
 		context.Background(),
 		&state,
 		info,
 		gammaASIC(),
 		optimizerSettings(),
 		now,
-	); err != nil {
-		t.Fatalf("handle overheat: %v", err)
+	)
+	if err != nil || !handled {
+		t.Fatalf("enforce overheat safety = %v, %v", handled, err)
 	}
 	got := states.getState(state.MacAddr)
 	if got.PendingKind != lib.MutationOverheatRecovery || !got.MiningPending {
 		t.Fatalf("preempted durable state = %+v", got)
+	}
+}
+
+func TestMutationKindSafetyAuthorization(t *testing.T) {
+	settings := mutationSettings(false)
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	live := healthyInfo()
+	live.Frequency = 490
+	live.CoreVoltage = 1100
+	hardLimit := live
+	hardLimit.Temp = settings.TempLimit + 0.1
+	tests := []struct {
+		name    string
+		info    lib.Info
+		state   lib.MinerState
+		wantErr bool
+	}{
+		{
+			name: "ordinary point blocked above hard limit",
+			info: hardLimit,
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationOperatingPoint,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseUndervolt
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "mining blocked above hard limit",
+			info: hardLimit,
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.MiningPending = true
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "rollback allowed above ordinary hard limit",
+			info: hardLimit,
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+		},
+		{
+			name: "rollback allowed at power limit",
+			info: func() lib.Info {
+				info := live
+				info.Power = settings.MaxPower
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+		},
+		{
+			name: "rollback allowed at VR limit",
+			info: func() lib.Info {
+				info := live
+				info.VRTemp = settings.VRTempHigh
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+		},
+		{
+			name: "rollback blocked at host cutoff",
+			info: func() lib.Info {
+				info := live
+				info.Temp = settings.TempCutoff
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "rollback blocked by firmware overheat",
+			info: func() lib.Info {
+				info := hardLimit
+				info.OverHeatMode = 1
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "host containment allowed at cutoff",
+			info: func() lib.Info {
+				info := live
+				info.Temp = settings.TempCutoff
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+		},
+		{
+			name: "host containment rejects non-minimum target",
+			info: func() lib.Info {
+				info := live
+				info.Temp = settings.TempCutoff
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "host containment rejects already active minimum",
+			info: func() lib.Info {
+				info := live
+				info.Frequency = minimum.Frequency
+				info.CoreVoltage = minimum.CoreVoltage
+				info.Temp = settings.TempCutoff
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "containment blocked beyond firmware trip",
+			info: func() lib.Info {
+				info := live
+				info.Temp = axeOSASICTripTemp + 0.1
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "containment blocked by firmware overheat",
+			info: func() lib.Info {
+				info := live
+				info.Temp = settings.TempCutoff
+				info.OverHeatMode = 1
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "firmware recovery allowed at every recovery boundary",
+			info: func() lib.Info {
+				info := live
+				info.OverHeatMode = 1
+				info.Temp = settings.RecoveryTemp
+				info.Power = settings.MaxPower - powerHeadroom
+				info.VRTemp = settings.VRTempHigh * vrExplorationFactor
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationOverheatRecovery,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+		},
+		{
+			name: "firmware recovery waits above a recovery boundary",
+			info: func() lib.Info {
+				info := live
+				info.OverHeatMode = 1
+				info.Temp = settings.RecoveryTemp + 0.1
+				info.Power = settings.MaxPower - powerHeadroom
+				info.VRTemp = settings.VRTempHigh * vrExplorationFactor
+				return info
+			}(),
+			state: func() lib.MinerState {
+				state := optimizerState(time.Now())
+				state.SetPendingMutation(
+					lib.MutationOverheatRecovery,
+					minimum,
+					time.Now(),
+				)
+				state.Phase = lib.PhaseOverheat
+				return state
+			}(),
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateKindSafety(test.info, settings, test.state, minimum)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("authorization error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestSafetyRollbackPreflightRevalidatesHistoricalEvidence(t *testing.T) {
+	now := time.Now()
+	info := healthyInfo()
+	info.Frequency = 600
+	info.CoreVoltage = 1150
+	target := lib.OperatingPoint{Frequency: 550, CoreVoltage: 1100}
+	state := optimizerState(now)
+	state.SetCurrentPoint(operatingPointFromInfo(info))
+	state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
+	state.Phase = lib.PhaseCooldown
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	record := lib.OperatingPointRecord{
+		MacAddr:     state.MacAddr,
+		Frequency:   target.Frequency,
+		CoreVoltage: target.CoreVoltage,
+		Status:      lib.PointValidated,
+		MedianHash:  900,
+		P95Temp:     62,
+		P95VRTemp:   50,
+		P95Power:    20,
+	}
+	states.putRecord(record)
+	coordinator := testMutationCoordinator(
+		&fakeDeviceAPI{},
+		states,
+		mutationSettings(false),
+		info,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err := coordinator.validateMutationPreflight(
+		info,
+		mutationSettings(false),
+		state,
+		gammaASIC(),
+	); err != nil {
+		t.Fatalf("valid rollback evidence was rejected: %v", err)
+	}
+
+	record.P95VRTemp = 0
+	states.putRecord(record)
+	if err := coordinator.validateMutationPreflight(
+		info,
+		mutationSettings(false),
+		state,
+		gammaASIC(),
+	); err == nil {
+		t.Fatal("rollback without complete VR evidence was authorized")
+	}
+	state.SetPendingMutation(
+		lib.MutationSafetyRollback,
+		lib.OperatingPoint{Frequency: 625, CoreVoltage: 1000},
+		now,
+	)
+	crossPair := record
+	crossPair.Frequency = 625
+	crossPair.CoreVoltage = 1000
+	crossPair.P95VRTemp = 50
+	states.putRecord(crossPair)
+	if err := coordinator.validateMutationPreflight(
+		info,
+		mutationSettings(false),
+		state,
+		gammaASIC(),
+	); err == nil {
+		t.Fatal("cross-pair rollback that raised frequency was authorized")
+	}
+}
+
+func TestPreflightEmergencyDurablySupersedesWeakerAuthority(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	tests := []struct {
+		name      string
+		preflight func(lib.Info) lib.Info
+		kind      lib.MutationKind
+		phase     lib.OptimizerPhase
+		target    lib.OperatingPoint
+		wantPhase lib.OptimizerPhase
+		wantKind  lib.MutationKind
+	}{
+		{
+			name: "firmware flag replaces ordinary point with recovery",
+			preflight: func(info lib.Info) lib.Info {
+				info.OverHeatMode = 1
+				info.Temp = optimizerSettings().RecoveryTemp
+				return info
+			},
+			kind:      lib.MutationOperatingPoint,
+			phase:     lib.PhaseUndervolt,
+			target:    lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+			wantPhase: lib.PhaseOverheat,
+			wantKind:  lib.MutationOverheatRecovery,
+		},
+		{
+			name: "unlatched firmware trip replaces ordinary point with hold",
+			preflight: func(info lib.Info) lib.Info {
+				info.Temp = axeOSASICTripTemp + 0.1
+				return info
+			},
+			kind:      lib.MutationOperatingPoint,
+			phase:     lib.PhaseUndervolt,
+			target:    lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+			wantPhase: lib.PhaseOverheat,
+		},
+		{
+			name: "host cutoff retains rollback for fleet replacement",
+			preflight: func(info lib.Info) lib.Info {
+				info.Temp = optimizerSettings().TempCutoff
+				return info
+			},
+			kind:      lib.MutationSafetyRollback,
+			phase:     lib.PhaseCooldown,
+			target:    minimum,
+			wantPhase: lib.PhaseCooldown,
+			wantKind:  lib.MutationSafetyRollback,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fleetInfo := healthyInfo()
+			fleetInfo.Frequency = 490
+			fleetInfo.CoreVoltage = 1100
+			preflight := test.preflight(fleetInfo)
+			state := optimizerState(now.Add(-time.Hour))
+			state.SetCurrentPoint(operatingPointFromInfo(fleetInfo))
+			state.SetPendingMutation(test.kind, test.target, now.Add(-time.Minute))
+			state.Phase = test.phase
+			states := newMemoryOptimizerStore()
+			states.putState(state)
+			devices := &fakeDeviceAPI{
+				getInfo: func(context.Context, string) (lib.Info, error) {
+					return preflight, nil
+				},
+				asicSettings: gammaASIC(),
+			}
+			coordinator := testMutationCoordinator(
+				devices,
+				states,
+				mutationSettings(false),
+				fleetInfo,
+				nil,
+				nil,
+				nil,
+				nil,
+			)
+			coordinator.now = func() time.Time { return now }
+			result := coordinator.execute(context.Background(), mutationRequest{
+				macAddr:  state.MacAddr,
+				hostname: state.Hostname,
+				ip:       state.IP,
+				kind:     test.kind,
+				point:    test.target,
+				info:     fleetInfo,
+				settings: mutationSettings(false),
+			})
+			if result.err == nil {
+				t.Fatal("unsafe preflight unexpectedly reached a successful result")
+			}
+			got := states.getState(state.MacAddr)
+			if got.Phase != test.wantPhase ||
+				got.PendingKind != test.wantKind ||
+				len(devices.operatingRequests()) != 0 ||
+				len(devices.restartRequests()) != 0 {
+				t.Fatalf(
+					"superseded state/requests/restarts = %+v/%+v/%+v",
+					got,
+					devices.operatingRequests(),
+					devices.restartRequests(),
+				)
+			}
+			if test.wantKind == lib.MutationOverheatRecovery &&
+				got.PendingPoint() != minimum {
+				t.Fatalf("firmware recovery target = %+v", got.PendingPoint())
+			}
+		})
+	}
+}
+
+func TestSafetyCompletionSeparatesReadbackFromResidualHeat(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	info := healthyInfo()
+	info.Frequency = minimum.Frequency
+	info.CoreVoltage = minimum.CoreVoltage
+	info.Temp = optimizerSettings().TempLimit + 1
+	info.Power = optimizerSettings().MaxPower
+	info.VRTemp = optimizerSettings().VRTempHigh
+	request := mutationRequest{
+		kind:     lib.MutationSafetyRollback,
+		point:    minimum,
+		info:     healthyInfo(),
+		settings: mutationSettings(false),
+	}
+	if err := verifyMutationReadback(request, info); err != nil {
+		t.Fatalf("exact safety readback rejected residual heat: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		phase     lib.OptimizerPhase
+		kind      lib.MutationKind
+		wantPhase lib.OptimizerPhase
+	}{
+		{
+			name:      "ordinary rollback retains cooldown",
+			phase:     lib.PhaseCooldown,
+			kind:      lib.MutationSafetyRollback,
+			wantPhase: lib.PhaseCooldown,
+		},
+		{
+			name:      "host containment retains emergency",
+			phase:     lib.PhaseOverheat,
+			kind:      lib.MutationSafetyRollback,
+			wantPhase: lib.PhaseOverheat,
+		},
+		{
+			name:      "firmware recovery enters cooldown",
+			phase:     lib.PhaseOverheat,
+			kind:      lib.MutationOverheatRecovery,
+			wantPhase: lib.PhaseCooldown,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := optimizerState(now.Add(-time.Hour))
+			state.Phase = test.phase
+			state.PhaseStartedAt = now.Add(-30 * time.Minute)
+			state.SetCurrentPoint(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100})
+			state.SetPendingMutation(test.kind, minimum, now.Add(-20*time.Minute))
+			originalBest := state.BestPoint()
+			originalBestHash := state.BestHashRate
+			states := newMemoryOptimizerStore()
+			states.putState(state)
+			coordinator := testMutationCoordinator(
+				&fakeDeviceAPI{},
+				states,
+				mutationSettings(false),
+				healthyInfo(),
+				nil,
+				nil,
+				nil,
+				nil,
+			)
+			coordinator.now = func() time.Time { return now }
+			result := mutationResult{
+				macAddr:  state.MacAddr,
+				hostname: state.Hostname,
+				kind:     test.kind,
+				point:    minimum,
+				miner:    discovered(info, state.IP),
+			}
+			if err := coordinator.completeMutationLocked(result); err != nil {
+				t.Fatalf("complete safety mutation: %v", err)
+			}
+			got := states.getState(state.MacAddr)
+			if got.PendingKind != "" ||
+				got.CurrentPoint() != minimum ||
+				got.Phase != test.wantPhase {
+				t.Fatalf("completed state = %+v", got)
+			}
+			if test.kind == lib.MutationSafetyRollback &&
+				!got.PhaseStartedAt.Equal(state.PhaseStartedAt) {
+				t.Fatalf("safety completion refreshed durable episode age: %+v", got)
+			}
+			if got.BestPoint() != originalBest ||
+				got.BestHashRate != originalBestHash {
+				t.Fatalf("safety completion deleted evaluated history: %+v", got)
+			}
+		})
+	}
+}
+
+func TestMutationFreeEmergencyBlocksOptimizationAndNormalWork(t *testing.T) {
+	now := time.Now()
+	firstInfo := healthyInfo()
+	firstInfo.MacAddr = "00:00:00:00:00:01"
+	firstInfo.Hostname = "miner-one"
+	secondInfo := healthyInfo()
+	secondInfo.MacAddr = "00:00:00:00:00:02"
+	secondInfo.Hostname = "miner-two"
+	firstState := optimizerState(now)
+	firstState.MacAddr = firstInfo.MacAddr
+	firstState.Hostname = firstInfo.Hostname
+	firstState.Phase = lib.PhaseOverheat
+	firstState.ClearPendingMutation()
+	secondState := optimizerState(now)
+	secondState.MacAddr = secondInfo.MacAddr
+	secondState.Hostname = secondInfo.Hostname
+	secondState.IP = "192.0.2.11"
+	secondState.SetPendingMutation(
+		lib.MutationOperatingPoint,
+		lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+		now,
+	)
+	secondState.Phase = lib.PhaseUndervolt
+	states := newMemoryOptimizerStore()
+	states.putState(firstState)
+	states.putState(secondState)
+	devices := &fakeDeviceAPI{}
+	coordinator := newMutationCoordinator(
+		devices,
+		states,
+		lib.SettingsFile{Defaults: mutationSettings(false)},
+		[]lib.DiscoveredMiner{
+			discovered(firstInfo, firstState.IP),
+			discovered(secondInfo, secondState.IP),
+		},
+		nil,
+		nil,
+		nil,
+		nil,
+		func(string) {},
+	)
+	coordinator.gateOpen = true
+	allowOptimization, err := coordinator.Advance(
+		context.Background(),
+		map[string]*minerObservation{
+			secondState.MacAddr: observation(
+				secondInfo,
+				secondState,
+				mutationSettings(false),
+			),
+		},
+		now,
+	)
+	if err != nil {
+		t.Fatalf("advance coordinator: %v", err)
+	}
+	if allowOptimization ||
+		len(devices.operatingRequests()) != 0 {
+		t.Fatalf(
+			"emergency hold allowed optimization/work: %v/%d",
+			allowOptimization,
+			len(devices.operatingRequests()),
+		)
 	}
 }
 
@@ -1260,7 +2063,7 @@ func TestSafetyIntentCancelsActiveMiningWithoutBlockingReplay(t *testing.T) {
 			),
 		}
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("start mining mutation: %v", err)
 	}
 	select {
@@ -1270,15 +2073,15 @@ func TestSafetyIntentCancelsActiveMiningWithoutBlockingReplay(t *testing.T) {
 	}
 	safetyState := states.getState(state.MacAddr)
 	safetyState.SetPendingMutation(
-		lib.MutationOperatingPoint,
-		lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
+		lib.MutationSafetyRollback,
+		lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000},
 		now,
 	)
 	safetyState.Phase = lib.PhaseCooldown
 	if err := states.SaveMiner(&safetyState); err != nil {
 		t.Fatalf("record safety intent: %v", err)
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("preempt mining mutation: %v", err)
 	}
 	waitForMutation(t, coordinator, observations, now, func() bool {
@@ -1292,7 +2095,7 @@ func TestSafetyIntentCancelsActiveMiningWithoutBlockingReplay(t *testing.T) {
 	coordinator.mu.Unlock()
 	if blocked != "" ||
 		!got.MiningPending ||
-		got.PendingKind != lib.MutationOperatingPoint {
+		got.PendingKind != lib.MutationSafetyRollback {
 		t.Fatalf("preempted state/block = %+v/%q", got, blocked)
 	}
 }
@@ -1430,6 +2233,97 @@ func TestStartupGateSuppressesExplorationWhileSafetyPollingContinues(t *testing.
 	}
 }
 
+func TestSamePollSafetyArbitrationPreventsNormalCandidateCreation(t *testing.T) {
+	now := time.Now().Round(time.Second)
+	settings := mutationSettings(false)
+	firstInfo := healthyInfo()
+	firstInfo.MacAddr = "00:00:00:00:00:01"
+	firstInfo.Hostname = "miner-one"
+	firstInfo.Frequency = 490
+	firstInfo.CoreVoltage = 1100
+	firstInfo.Temp = settings.TempCutoff
+	secondInfo := healthyInfo()
+	secondInfo.MacAddr = "00:00:00:00:00:02"
+	secondInfo.Hostname = "miner-two"
+	firstState := optimizerState(now.Add(-time.Hour))
+	firstState.MacAddr = firstInfo.MacAddr
+	firstState.Hostname = firstInfo.Hostname
+	firstState.IP = "192.0.2.10"
+	firstState.SetCurrentPoint(operatingPointFromInfo(firstInfo))
+	secondState := optimizerState(now.Add(-time.Hour))
+	secondState.MacAddr = secondInfo.MacAddr
+	secondState.Hostname = secondInfo.Hostname
+	secondState.IP = "192.0.2.11"
+	secondState.RampUntil = time.Time{}
+	states := newMemoryOptimizerStore()
+	states.putState(firstState)
+	states.putState(secondState)
+	devices := &fakeDeviceAPI{
+		getInfo: func(_ context.Context, ip string) (lib.Info, error) {
+			if ip == firstState.IP {
+				return firstInfo, nil
+			}
+			return secondInfo, nil
+		},
+		asicSettings: gammaASIC(),
+	}
+	minerController := testController(devices, states, nil)
+	minerController.settings = lib.SettingsFile{Defaults: settings}
+	miners := []lib.DiscoveredMiner{
+		discovered(firstInfo, firstState.IP),
+		discovered(secondInfo, secondState.IP),
+	}
+	minerController.mutations = newMutationCoordinator(
+		devices,
+		states,
+		minerController.settings,
+		miners,
+		nil,
+		func(context.Context, string) (lib.DiscoveredMiner, error) {
+			return lib.DiscoveredMiner{}, errMinerNotFound
+		},
+		nil,
+		nil,
+		minerController.resetRuntime,
+	)
+	minerController.mutations.gateOpen = true
+	sample := telemetrySample{
+		hashRate:     secondInfo.HashRate,
+		expectedHash: secondInfo.ExpectedHashRate,
+		temp:         secondInfo.Temp,
+		vrTemp:       secondInfo.VRTemp,
+		power:        secondInfo.Power,
+	}
+	minerController.runtimes[secondState.MacAddr] = &minerRuntime{
+		samples: make(
+			[]telemetrySample,
+			targetSampleCount(settings)-1,
+		),
+	}
+	for index := range minerController.runtimes[secondState.MacAddr].samples {
+		minerController.runtimes[secondState.MacAddr].samples[index] = sample
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	minerController.pollMiners(ctx, miners, now)
+
+	gotFirst := states.getState(firstState.MacAddr)
+	gotSecond := states.getState(secondState.MacAddr)
+	if gotFirst.Phase != lib.PhaseOverheat ||
+		gotFirst.PendingKind != lib.MutationSafetyRollback {
+		t.Fatalf("same-poll safety state = %+v", gotFirst)
+	}
+	if gotSecond.PendingKind != "" {
+		t.Fatalf("normal candidate was queued behind safety work: %+v", gotSecond)
+	}
+	minerController.runtimeMu.Lock()
+	sampleCount := len(minerController.runtimes[secondState.MacAddr].samples)
+	minerController.runtimeMu.Unlock()
+	if sampleCount != targetSampleCount(settings)-1 {
+		t.Fatalf("normal optimizer consumed a sample behind safety work: %d", sampleCount)
+	}
+}
+
 func TestDurableIntentSurvivesFailureAfterVerifiedDeviceRestart(t *testing.T) {
 	now := time.Now()
 	info := healthyInfo()
@@ -1471,13 +2365,13 @@ func TestDurableIntentSurvivesFailureAfterVerifiedDeviceRestart(t *testing.T) {
 			),
 		}
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("start mutation: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	var completionError error
 	for completionError == nil && time.Now().Before(deadline) {
-		completionError = coordinator.Advance(context.Background(), observations(), now)
+		_, completionError = coordinator.Advance(context.Background(), observations(), now)
 		time.Sleep(time.Millisecond)
 	}
 	if completionError == nil ||
@@ -1527,13 +2421,13 @@ func TestMiningCompletionFailureDoesNotRetryInSameLaunch(t *testing.T) {
 			),
 		}
 	}
-	if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+	if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 		t.Fatalf("start mining mutation: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	var completionError error
 	for completionError == nil && time.Now().Before(deadline) {
-		completionError = coordinator.Advance(context.Background(), observations(), now)
+		_, completionError = coordinator.Advance(context.Background(), observations(), now)
 		time.Sleep(time.Millisecond)
 	}
 	if completionError == nil ||
@@ -1544,7 +2438,7 @@ func TestMiningCompletionFailureDoesNotRetryInSameLaunch(t *testing.T) {
 	states.saveErr = nil
 	states.mu.Unlock()
 	for range 3 {
-		if err := coordinator.Advance(context.Background(), observations(), now); err != nil {
+		if _, err := coordinator.Advance(context.Background(), observations(), now); err != nil {
 			t.Fatalf("advance blocked mining mutation: %v", err)
 		}
 	}

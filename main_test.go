@@ -183,7 +183,6 @@ func (store *memoryOptimizerStore) LoadOrCreate(
 		state.SetCurrentPoint(point)
 	} else if info.OverHeatMode != 0 {
 		state.Phase = lib.PhaseOverheat
-		state.OverheatPending = true
 		state.OverheatCount = 1
 	}
 	store.states[state.MacAddr] = state
@@ -730,7 +729,7 @@ func TestThermalVoltageRollsBackToActualHashBest(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evaluateWindow returned an error: %v", err)
 	}
-	if state.PendingKind != lib.MutationOperatingPoint ||
+	if state.PendingKind != lib.MutationSafetyRollback ||
 		state.PendingPoint() != (lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}) {
 		t.Fatalf("thermal rollback intent = %+v", state)
 	}
@@ -793,7 +792,7 @@ func TestSafetyRollbackChangesFrequencyAndVoltageTogether(t *testing.T) {
 	); err != nil {
 		t.Fatalf("controlMiner returned an error: %v", err)
 	}
-	if state.PendingKind != lib.MutationOperatingPoint ||
+	if state.PendingKind != lib.MutationSafetyRollback ||
 		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
 		t.Fatalf("safety rollback intent = %+v", state)
 	}
@@ -823,9 +822,447 @@ func TestSafetyWithoutHistoryUsesMinimumAdvertisedPair(t *testing.T) {
 	); err != nil {
 		t.Fatalf("controlMiner returned an error: %v", err)
 	}
-	if state.PendingKind != lib.MutationOperatingPoint ||
+	if state.PendingKind != lib.MutationSafetyRollback ||
 		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
 		t.Fatalf("minimum safety intent = %+v", state)
+	}
+}
+
+func TestInstantaneousSafetyBoundaries(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	oldPhaseStarted := now.Add(-time.Hour)
+	tests := []struct {
+		name          string
+		mutate        func(*lib.Info)
+		handled       bool
+		phase         lib.OptimizerPhase
+		kind          lib.MutationKind
+		overheatCount int
+	}{
+		{
+			name:    "exactly temperature limit",
+			mutate:  func(info *lib.Info) { info.Temp = 66 },
+			handled: false,
+			phase:   lib.PhaseHold,
+		},
+		{
+			name:    "incomplete otherwise normal telemetry",
+			mutate:  func(info *lib.Info) { info.Power = 0 },
+			handled: true,
+			phase:   lib.PhaseHold,
+		},
+		{
+			name:    "immediately above temperature limit",
+			mutate:  func(info *lib.Info) { info.Temp = 66.001 },
+			handled: true,
+			phase:   lib.PhaseCooldown,
+			kind:    lib.MutationSafetyRollback,
+		},
+		{
+			name:    "immediately below host cutoff",
+			mutate:  func(info *lib.Info) { info.Temp = 69.999 },
+			handled: true,
+			phase:   lib.PhaseCooldown,
+			kind:    lib.MutationSafetyRollback,
+		},
+		{
+			name:          "exactly host cutoff",
+			mutate:        func(info *lib.Info) { info.Temp = 70 },
+			handled:       true,
+			phase:         lib.PhaseOverheat,
+			kind:          lib.MutationSafetyRollback,
+			overheatCount: 1,
+		},
+		{
+			name:          "exactly AxeOS ASIC trip boundary",
+			mutate:        func(info *lib.Info) { info.Temp = 75 },
+			handled:       true,
+			phase:         lib.PhaseOverheat,
+			kind:          lib.MutationSafetyRollback,
+			overheatCount: 1,
+		},
+		{
+			name:          "above AxeOS ASIC trip boundary",
+			mutate:        func(info *lib.Info) { info.Temp = 75.001 },
+			handled:       true,
+			phase:         lib.PhaseOverheat,
+			overheatCount: 1,
+		},
+		{
+			name:    "power immediately below limit",
+			mutate:  func(info *lib.Info) { info.Power = 23.999 },
+			handled: false,
+			phase:   lib.PhaseHold,
+		},
+		{
+			name:    "power exactly at limit",
+			mutate:  func(info *lib.Info) { info.Power = 24 },
+			handled: true,
+			phase:   lib.PhaseCooldown,
+			kind:    lib.MutationSafetyRollback,
+		},
+		{
+			name:    "VR immediately below limit",
+			mutate:  func(info *lib.Info) { info.VRTemp = 96.999 },
+			handled: false,
+			phase:   lib.PhaseHold,
+		},
+		{
+			name:    "VR exactly at limit",
+			mutate:  func(info *lib.Info) { info.VRTemp = 97 },
+			handled: true,
+			phase:   lib.PhaseCooldown,
+			kind:    lib.MutationSafetyRollback,
+		},
+		{
+			name:    "exactly AxeOS VR trip boundary",
+			mutate:  func(info *lib.Info) { info.VRTemp = 105 },
+			handled: true,
+			phase:   lib.PhaseCooldown,
+			kind:    lib.MutationSafetyRollback,
+		},
+		{
+			name:          "above AxeOS VR trip boundary",
+			mutate:        func(info *lib.Info) { info.VRTemp = 105.001 },
+			handled:       true,
+			phase:         lib.PhaseOverheat,
+			overheatCount: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := optimizerState(oldPhaseStarted)
+			state.SetCurrentPoint(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100})
+			state.PhaseStartedAt = oldPhaseStarted
+			states := newMemoryOptimizerStore()
+			states.putState(state)
+			minerController := testController(&fakeDeviceAPI{}, states, nil)
+			info := healthyInfo()
+			info.Frequency = 490
+			info.CoreVoltage = 1100
+			test.mutate(&info)
+
+			handled, err := minerController.enforceMinerSafety(
+				context.Background(),
+				&state,
+				info,
+				gammaASIC(),
+				optimizerSettings(),
+				now,
+			)
+			if err != nil {
+				t.Fatalf("enforce safety: %v", err)
+			}
+			if handled != test.handled ||
+				state.Phase != test.phase ||
+				state.PendingKind != test.kind ||
+				state.OverheatCount != test.overheatCount {
+				t.Fatalf("safety state = handled %v, %+v", handled, state)
+			}
+			if test.kind != "" {
+				if state.PendingPoint() != (lib.OperatingPoint{
+					Frequency:   400,
+					CoreVoltage: 1000,
+				}) || !state.PendingSince.Equal(now) {
+					t.Fatalf("pending safety intent = %+v", state)
+				}
+			} else if !state.PendingSince.IsZero() {
+				t.Fatalf("unexpected pending age = %s", state.PendingSince)
+			}
+			if test.overheatCount != 0 {
+				if !state.PhaseStartedAt.Equal(now) ||
+					!state.CooldownUntil.Equal(now.Add(2*time.Hour)) {
+					t.Fatalf("emergency episode age/cooldown = %+v", state)
+				}
+			} else if test.kind == "" && !state.PhaseStartedAt.Equal(oldPhaseStarted) {
+				t.Fatalf("normal observation refreshed phase age: %+v", state)
+			}
+		})
+	}
+}
+
+func TestRecoveryBoundariesRequireEveryPredicate(t *testing.T) {
+	settings := optimizerSettings()
+	base := healthyInfo()
+	base.Temp = settings.RecoveryTemp
+	base.Power = settings.MaxPower - powerHeadroom
+	base.VRTemp = settings.VRTempHigh * vrExplorationFactor
+	tests := []struct {
+		name   string
+		mutate func(*lib.Info)
+		safe   bool
+	}{
+		{name: "all exact boundaries", safe: true, mutate: func(*lib.Info) {}},
+		{
+			name:   "temperature immediately above",
+			mutate: func(info *lib.Info) { info.Temp += 0.001 },
+		},
+		{
+			name:   "power immediately above",
+			mutate: func(info *lib.Info) { info.Power += 0.001 },
+		},
+		{
+			name:   "VR temperature immediately above",
+			mutate: func(info *lib.Info) { info.VRTemp += 0.001 },
+		},
+		{
+			name: "power fault",
+			mutate: func(info *lib.Info) {
+				fault := "synthetic fault"
+				info.PowerFault = &fault
+			},
+		},
+		{
+			name:   "unsupported identity",
+			mutate: func(info *lib.Info) { info.Version = "unsupported" },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			info := base
+			test.mutate(&info)
+			if got := safeToRecover(info, settings); got != test.safe {
+				t.Fatalf("safeToRecover = %v, want %v", got, test.safe)
+			}
+		})
+	}
+}
+
+func TestHostEmergencyAtMinimumHoldsThenRecoversWithoutMutation(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	state := optimizerState(now.Add(-time.Hour))
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state.SetCurrentPoint(minimum)
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	devices := &fakeDeviceAPI{}
+	minerController := testController(devices, states, nil)
+	info := healthyInfo()
+	info.Frequency = minimum.Frequency
+	info.CoreVoltage = minimum.CoreVoltage
+	info.Temp = optimizerSettings().TempCutoff
+
+	handled, err := minerController.enforceMinerSafety(
+		context.Background(),
+		&state,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now,
+	)
+	if err != nil || !handled {
+		t.Fatalf("enter minimum hold = %v, %v", handled, err)
+	}
+	episodeStarted := state.PhaseStartedAt
+	cooldownUntil := state.CooldownUntil
+	if state.Phase != lib.PhaseOverheat ||
+		state.PendingKind != "" ||
+		state.OverheatCount != 1 {
+		t.Fatalf("minimum emergency hold = %+v", state)
+	}
+
+	recoveredAt := now.Add(15 * time.Minute)
+	info.Temp = optimizerSettings().RecoveryTemp
+	info.Power = optimizerSettings().MaxPower - powerHeadroom
+	info.VRTemp = optimizerSettings().VRTempHigh * vrExplorationFactor
+	handled, err = minerController.enforceMinerSafety(
+		context.Background(),
+		&state,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		recoveredAt,
+	)
+	if err != nil || !handled {
+		t.Fatalf("recover minimum hold = %v, %v", handled, err)
+	}
+	if state.Phase != lib.PhaseCooldown ||
+		state.PendingKind != "" ||
+		state.OverheatCount != 1 ||
+		!state.CooldownUntil.Equal(cooldownUntil) ||
+		state.PhaseStartedAt.Equal(episodeStarted) ||
+		len(devices.operatingRequests()) != 0 ||
+		len(devices.restartRequests()) != 0 {
+		t.Fatalf("host recovery without mutation = %+v", state)
+	}
+}
+
+func TestContainmentReadbackBeforeRebootProofDoesNotClearIntent(t *testing.T) {
+	now := time.Now()
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state := optimizerState(now.Add(-time.Hour))
+	state.SetCurrentPoint(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100})
+	state.Phase = lib.PhaseOverheat
+	state.PhaseStartedAt = now.Add(-30 * time.Minute)
+	state.SetPendingMutation(
+		lib.MutationSafetyRollback,
+		minimum,
+		now.Add(-20*time.Minute),
+	)
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	minerController := testController(&fakeDeviceAPI{}, states, nil)
+	info := healthyInfo()
+	info.Frequency = minimum.Frequency
+	info.CoreVoltage = minimum.CoreVoltage
+	info.Temp = optimizerSettings().RecoveryTemp
+	info.Power = optimizerSettings().MaxPower - powerHeadroom
+	info.VRTemp = optimizerSettings().VRTempHigh * vrExplorationFactor
+
+	if _, err := minerController.enforceMinerSafety(
+		context.Background(),
+		&state,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now,
+	); err != nil {
+		t.Fatalf("enforce pending containment: %v", err)
+	}
+	if state.PendingKind != lib.MutationSafetyRollback ||
+		state.PendingPoint() != minimum ||
+		state.Phase != lib.PhaseOverheat ||
+		state.CurrentPoint() == minimum {
+		t.Fatalf("pre-proof readback cleared or completed containment: %+v", state)
+	}
+}
+
+func TestRepeatedSafetyObservationPreservesPendingAndEpisodeAge(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	state := optimizerState(now.Add(-time.Hour))
+	state.SetCurrentPoint(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100})
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	minerController := testController(&fakeDeviceAPI{}, states, nil)
+	info := healthyInfo()
+	info.Frequency = 490
+	info.CoreVoltage = 1100
+	info.Temp = optimizerSettings().TempCutoff
+
+	if _, err := minerController.enforceMinerSafety(
+		context.Background(),
+		&state,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now,
+	); err != nil {
+		t.Fatalf("first emergency observation: %v", err)
+	}
+	pendingSince := state.PendingSince
+	phaseStarted := state.PhaseStartedAt
+	cooldownUntil := state.CooldownUntil
+	if _, err := minerController.enforceMinerSafety(
+		context.Background(),
+		&state,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now.Add(time.Minute),
+	); err != nil {
+		t.Fatalf("repeated emergency observation: %v", err)
+	}
+	if !state.PendingSince.Equal(pendingSince) ||
+		!state.PhaseStartedAt.Equal(phaseStarted) ||
+		!state.CooldownUntil.Equal(cooldownUntil) ||
+		state.OverheatCount != 1 {
+		t.Fatalf("repeated observation refreshed emergency state: %+v", state)
+	}
+
+	rollbackState := optimizerState(now.Add(-time.Hour))
+	rollbackState.SetCurrentPoint(
+		lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100},
+	)
+	rollbackStates := newMemoryOptimizerStore()
+	rollbackStates.putState(rollbackState)
+	rollbackController := testController(
+		&fakeDeviceAPI{},
+		rollbackStates,
+		nil,
+	)
+	info.Temp = optimizerSettings().TempLimit + 0.1
+	if _, err := rollbackController.enforceMinerSafety(
+		context.Background(),
+		&rollbackState,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now,
+	); err != nil {
+		t.Fatalf("first rollback observation: %v", err)
+	}
+	rollbackPendingSince := rollbackState.PendingSince
+	rollbackPhaseStarted := rollbackState.PhaseStartedAt
+	if _, err := rollbackController.enforceMinerSafety(
+		context.Background(),
+		&rollbackState,
+		info,
+		gammaASIC(),
+		optimizerSettings(),
+		now.Add(time.Minute),
+	); err != nil {
+		t.Fatalf("repeated rollback observation: %v", err)
+	}
+	if !rollbackState.PendingSince.Equal(rollbackPendingSince) ||
+		!rollbackState.PhaseStartedAt.Equal(rollbackPhaseStarted) {
+		t.Fatalf("repeated rollback refreshed durable age: %+v", rollbackState)
+	}
+}
+
+func TestRollbackSelectionRequiresCompleteStrictlyDeescalatingEvidence(t *testing.T) {
+	now := time.Now()
+	state := optimizerState(now)
+	live := lib.OperatingPoint{Frequency: 600, CoreVoltage: 1150}
+	state.SetCurrentPoint(live)
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	record := func(
+		point lib.OperatingPoint,
+		hash float64,
+	) lib.OperatingPointRecord {
+		return lib.OperatingPointRecord{
+			MacAddr:     state.MacAddr,
+			Frequency:   point.Frequency,
+			CoreVoltage: point.CoreVoltage,
+			Status:      lib.PointValidated,
+			MedianHash:  hash,
+			P95Temp:     62,
+			P95VRTemp:   50,
+			P95Power:    20,
+		}
+	}
+	for _, candidate := range []lib.OperatingPointRecord{
+		record(lib.OperatingPoint{Frequency: 550, CoreVoltage: 1100}, 800),
+		record(lib.OperatingPoint{Frequency: 525, CoreVoltage: 1060}, 900),
+		record(lib.OperatingPoint{Frequency: 625, CoreVoltage: 1000}, 2000),
+		record(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1200}, 1900),
+		record(lib.OperatingPoint{Frequency: 575, CoreVoltage: 1100}, 1800),
+	} {
+		states.putRecord(candidate)
+	}
+	missingVR := record(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1100}, 1700)
+	missingVR.P95VRTemp = 0
+	states.putRecord(missingVR)
+	missingPower := record(lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}, 1600)
+	missingPower.P95Power = 0
+	states.putRecord(missingPower)
+	missingTemp := record(lib.OperatingPoint{Frequency: 400, CoreVoltage: 1100}, 1500)
+	missingTemp.P95Temp = 0
+	states.putRecord(missingTemp)
+
+	minerController := testController(&fakeDeviceAPI{}, states, nil)
+	got, err := minerController.bestRollbackPoint(
+		&state,
+		live,
+		gammaASIC(),
+		optimizerSettings(),
+	)
+	if err != nil {
+		t.Fatalf("select rollback: %v", err)
+	}
+	want := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1060}
+	if got != want {
+		t.Fatalf("rollback target = %+v, want %+v", got, want)
 	}
 }
 
@@ -837,30 +1274,31 @@ func TestOverheatRecoveryIgnoresEmergencySentinel(t *testing.T) {
 	devices := &fakeDeviceAPI{}
 	minerController := testController(devices, states, nil)
 	info := healthyInfo()
-	info.Frequency = 75
-	info.CoreVoltage = 4870
+	info.Frequency = 50
+	info.CoreVoltage = 1000
 	info.HashRate = 0
 	info.ExpectedHashRate = 0
 	info.Temp = 60
 	info.VRTemp = 49
 	info.OverHeatMode = 1
 
-	if err := minerController.handleOverheat(
+	handled, err := minerController.enforceMinerSafety(
 		context.Background(),
 		&state,
 		info,
 		gammaASIC(),
 		optimizerSettings(),
 		now,
-	); err != nil {
-		t.Fatalf("handleOverheat returned an error: %v", err)
+	)
+	if err != nil || !handled {
+		t.Fatalf("enforceMinerSafety = %v, %v", handled, err)
 	}
 	if state.PendingKind != lib.MutationOverheatRecovery ||
 		state.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}) {
 		t.Fatalf("overheat recovery intent = %+v", state)
 	}
 	saved := states.getState(state.MacAddr)
-	if saved.PendingPoint().CoreVoltage == 4870 {
+	if saved.CurrentPoint() == (lib.OperatingPoint{Frequency: 50, CoreVoltage: 1000}) {
 		t.Fatalf("emergency sentinel entered optimizer state: %+v", saved)
 	}
 }
@@ -876,15 +1314,16 @@ func TestOverheatRecoveryWaitsUntilCool(t *testing.T) {
 	info.OverHeatMode = 1
 	info.Temp = 65
 
-	if err := minerController.handleOverheat(
+	handled, err := minerController.enforceMinerSafety(
 		context.Background(),
 		&state,
 		info,
 		gammaASIC(),
 		optimizerSettings(),
 		now,
-	); err != nil {
-		t.Fatalf("handleOverheat returned an error: %v", err)
+	)
+	if err != nil || !handled {
+		t.Fatalf("enforceMinerSafety = %v, %v", handled, err)
 	}
 	if len(devices.operatingRequests()) != 0 {
 		t.Fatal("optimizer touched the device while recording recovery")
@@ -983,7 +1422,7 @@ func TestAutomatedRequestRejectsOffGridOperatingPoint(t *testing.T) {
 		&state,
 		lib.OperatingPoint{Frequency: 425, CoreVoltage: 1090},
 		lib.PhaseFrequencyTest,
-		false,
+		lib.MutationOperatingPoint,
 		now,
 	)
 	if err == nil || !strings.Contains(err.Error(), "not advertised") {
@@ -1212,7 +1651,7 @@ func TestOperatingPointRequestReturnsPersistenceFailureWithoutTouchingDevice(t *
 		&state,
 		lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060},
 		lib.PhaseUndervolt,
-		false,
+		lib.MutationOperatingPoint,
 		now,
 	)
 	if err == nil || !strings.Contains(err.Error(), "disk full") {

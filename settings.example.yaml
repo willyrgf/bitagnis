@@ -1,12 +1,14 @@
 defaults:
   # Explore below the target, hold between target and limit, and roll back
-  # above the limit. The cutoff remains the emergency threshold.
+  # above the limit. Host cutoff containment must remain at or below the
+  # AxeOS v2.8.1 strict 75°C ASIC trip boundary.
   recoveryTemp: 61
   targetTemp: 65
   tempLimit: 66
   tempCutoff: 70
 
   # Board limits. New trials require 2 W and 10% VR-temperature headroom.
+  # vrTempHigh must remain at or below the strict 105°C firmware trip boundary.
   maxPower: 24
   vrTempHigh: 97
 

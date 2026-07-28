@@ -42,17 +42,31 @@ The default policy:
 - explores while p95 ASIC temperature is below the 65°C target, power is at
   most 22 W, and VR temperature is below 90% of its limit;
 - accepts a faster point but stops exploring between 65°C and the 66°C limit;
-- rolls back above 66°C, at 24 W, or at 97°C VR temperature; and
-- treats 70°C or AxeOS `overheat_mode` as an emergency.
+- rolls back above 66°C, at 24 W, or at 97°C VR temperature;
+- treats 70°C as a host emergency and immediately contains a still-running
+  miner at the exact minimum advertised pair; and
+- treats AxeOS `overheat_mode` as a firmware emergency that must cool before
+  the flag is cleared with that same minimum pair.
 
-Normal rollback selects the validated point with the highest actual hash and
-safety headroom, changing frequency and voltage together. Emergency recovery
-uses the lowest frequency/voltage pair advertised by AxeOS.
+Normal rollback selects the validated point with the highest actual hash,
+complete ASIC/VR/power headroom evidence, and no frequency or voltage increase
+relative to the failed live pair. If no such record exists, it uses the exact
+minimum advertised pair. A rollback can run while the failed point remains
+above an ordinary hard limit; ordinary point and mining changes cannot.
 
-Bitagnis never learns emergency AxeOS values such as `75 MHz / 4870 mV`.
-Overheat recovery waits for the ASIC to cool to `recoveryTemp`, applies a
-complete safe pair, clears the firmware flag, and pauses exploration. Repeated
-overheats extend the cooldown up to 24 hours.
+AxeOS v2.8.1 trips strictly above 75°C ASIC temperature or 105°C VR
+temperature and stores the unadvertised emergency state `50 MHz / 1000 mV`.
+Bitagnis never adopts or evaluates that firmware state. Firmware recovery
+requires positive, finite ASIC temperature, VR temperature, and power; every
+recovery boundary; no power fault; and supported device identity. Repeated
+emergency episodes extend cooldown up to 24 hours.
+
+`OVERHEAT` is the one durable emergency episode and fleet safety block. A
+typed `safety_rollback` or `overheat_recovery` intent is the only authority for
+the corresponding PATCH. If the exact minimum is already active and remains
+unsafe without a firmware flag, Bitagnis holds the emergency without replaying
+PATCH or restart. Once a host-contained miner at the minimum reports complete
+recovery telemetry, it enters cooldown without another hardware request.
 
 ## Hardware mutations and startup
 
@@ -64,17 +78,22 @@ validate -> persist intent -> recheck identity and safety -> PATCH -> restart
          -> rediscover the same MAC -> prove a new boot -> verify -> ramp
 ```
 
-AxeOS v2.8.1 does not load `PATCH /api/system` changes into the running miner,
-so configured-value readback alone never completes a mutation. Bitagnis keeps
-durable intent after PATCH, restart, identity, reboot-proof, or readback
-ambiguity and replays it after restart. It rejects redirects and permits
-automated operating-point targets only from the complete AxeOS-advertised grid.
+AxeOS v2.8.1 writes frequency and voltage separately to NVS, and its running
+power task may observe and apply those writes before restart. Bitagnis
+therefore completes every identity, telemetry, grid, durable-authority, and
+rollback-evidence check before PATCH. PATCH success or pre-restart configured
+readback never proves active configuration. Completion still requires restart,
+same-MAC rediscovery, a proven new boot, and exact configured NVS pair readback;
+AxeOS exposes no measured active-frequency field.
 
 Fleet polling begins immediately in safety-only mode. Emergency recovery and
-hard rollback outrank normal work. Enabled mining settings reconcile one miner
-at a time in MAC order, and optimization opens only after every selected miner
-has two consecutive safe, positive-hash startup polls. A mining failure blocks
-the next normal miner while safety polling continues.
+hard rollback outrank normal work and may run concurrently for different
+miners. Any selected miner with an emergency episode or typed safety intent,
+including an offline miner or a mutation-free emergency hold, suppresses new
+normal fleet work without stopping polling. Enabled mining settings reconcile
+one miner at a time in MAC order, and optimization opens only after every
+selected miner has two consecutive safe, positive-hash startup polls. A mining
+failure blocks the next normal miner while safety polling continues.
 
 ## State
 
@@ -82,12 +101,19 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is one versioned baseline with no migration or compatibility
-reader. An old, partial, or unknown database is rejected without modification;
-move it aside or remove it to create the current baseline. Evaluated history,
-cooldown, and pending mutation obligations persist across ordinary restarts
-after that baseline is created. Raw telemetry and Stratum credentials are never
-stored in the optimizer database.
+The current schema is version 2, with a typed `safety_rollback` mutation and no
+legacy `overheat_pending` field. It has no migration or compatibility reader.
+An old, partial, or unknown database is rejected without modification; move it
+aside or remove it to create the current baseline. Evaluated history, cooldown,
+pending mutation ages, and emergency episode ages persist across ordinary
+restarts after that baseline is created. Raw telemetry and Stratum credentials
+are never stored in the optimizer database.
+
+Before replacing an older baseline, stop the old controller, prove it is no
+longer issuing requests, record every selected miner's exact MAC, live complete
+pair, uptime, and safe telemetry, and resolve every old pending obligation.
+Archive the old database as owner-only diagnostic state and start the new
+baseline only after the live fleet state is understood.
 
 If AxeOS settings are changed manually while Bitagnis is running, two consecutive
 polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
@@ -222,7 +248,22 @@ supply. AxeOS thermal protection remains the final safety layer.
 
 AxeOS v2.8.1 uses plain HTTP, cannot positively read back pool passwords, may
 log a string value when an NVS write fails, and does not prove individual NVS
-writes succeeded.
+writes succeeded. `tempCutoff` may not exceed 75°C and `vrTempHigh` may not
+exceed 105°C for this supported firmware and board profile.
+
+## Safety-write canary
+
+Device-level verification requires separate explicit authorization for one
+named canary, its recorded MAC, live complete pair, uptime, safe telemetry, and
+an owner-approved recovery plan. Never heat a miner deliberately or raise a
+safety threshold. A lowered host cutoff may exercise containment while the
+device remains inside its normal approved envelope.
+
+Require exactly the typed minimum-pair PATCH, one restart, same-MAC return,
+proven uptime discontinuity, exact configured pair readback, durable intent
+clear only after proof, retained `OVERHEAT` until recovery telemetry is safe,
+no same-pair restart at the minimum, and no change to a second miner. Canary
+authorization never permits a fleet rollout.
 
 ## Mining-write canary
 

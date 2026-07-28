@@ -103,6 +103,7 @@ func TestOperatingPointPatchesAreCompleteAndDistinct(t *testing.T) {
 		t.Fatalf("PatchOverheatRecovery returned an error: %v", err)
 	}
 	if len(patches) != 2 ||
+		len(patches[0]) != 2 ||
 		patches[0]["frequency"] != 490 ||
 		patches[0]["coreVoltage"] != 1060 {
 		t.Fatalf("operating-point patches = %+v", patches)
@@ -110,7 +111,10 @@ func TestOperatingPointPatchesAreCompleteAndDistinct(t *testing.T) {
 	if _, exists := patches[0]["overheat_mode"]; exists {
 		t.Fatal("normal patch unexpectedly cleared overheat mode")
 	}
-	if patches[1]["overheat_mode"] != 0 {
+	if len(patches[1]) != 3 ||
+		patches[1]["frequency"] != 490 ||
+		patches[1]["coreVoltage"] != 1060 ||
+		patches[1]["overheat_mode"] != 0 {
 		t.Fatalf("recovery patch = %+v", patches[1])
 	}
 }
