@@ -1015,8 +1015,45 @@ func (minerController *controller) formatWindow(
 	settings lib.Settings,
 	now time.Time,
 ) string {
-	if state.PendingKind != "" || state.MiningPending {
-		return "apply"
+	if state.Phase == lib.PhaseOverheat {
+		switch state.PendingKind {
+		case lib.MutationSafetyRollback:
+			return fmt.Sprintf(
+				"contain %s %s",
+				formatOperatingPoint(state.PendingPoint()),
+				formatStateAge(state.PendingSince, now),
+			)
+		case lib.MutationOverheatRecovery:
+			return fmt.Sprintf(
+				"wait cool %s",
+				formatStateAge(state.PhaseStartedAt, now),
+			)
+		default:
+			minerController.asicMu.Lock()
+			asic, ok := minerController.asicCache[state.MacAddr]
+			minerController.asicMu.Unlock()
+			minimum, err := minimumAdvertisedPoint(asic)
+			if ok && err == nil && state.CurrentPoint() == minimum {
+				return fmt.Sprintf(
+					"min active / wait cool %s",
+					formatStateAge(state.PhaseStartedAt, now),
+				)
+			}
+			return fmt.Sprintf(
+				"wait cool %s",
+				formatStateAge(state.PhaseStartedAt, now),
+			)
+		}
+	}
+	if state.PendingKind != "" {
+		return fmt.Sprintf(
+			"%s %s",
+			formatOperatingPoint(state.PendingPoint()),
+			formatStateAge(state.PendingSince, now),
+		)
+	}
+	if state.MiningPending {
+		return "mining"
 	}
 	if now.Before(state.RampUntil) {
 		remaining := state.RampUntil.Sub(now)
@@ -1032,6 +1069,17 @@ func (minerController *controller) formatWindow(
 	}
 	minerController.runtimeMu.Unlock()
 	return fmt.Sprintf("%d/%d", count, targetSampleCount(settings))
+}
+
+func formatOperatingPoint(point lib.OperatingPoint) string {
+	return fmt.Sprintf("%d/%d", point.Frequency, point.CoreVoltage)
+}
+
+func formatStateAge(since time.Time, now time.Time) string {
+	if since.IsZero() || now.Before(since) {
+		return "0s"
+	}
+	return now.Sub(since).Truncate(time.Second).String()
 }
 
 func (minerController *controller) saveWindowRecord(

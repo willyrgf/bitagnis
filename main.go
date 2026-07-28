@@ -659,8 +659,10 @@ func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 	switch {
 	case info.OverHeatMode != 0 || state.Phase == lib.PhaseOverheat:
 		return colorize(colorRed, string(lib.PhaseOverheat))
+	case state.PendingKind == lib.MutationSafetyRollback:
+		return colorize(colorRed, "ROLLBACK")
 	case state.PendingKind != "" || state.MiningPending:
-		return colorize(colorYellow, "APPLYING")
+		return colorize(colorYellow, "PENDING")
 	case now.Before(state.CooldownUntil):
 		return colorize(colorYellow, string(lib.PhaseCooldown))
 	case state.Phase == lib.PhaseHold:

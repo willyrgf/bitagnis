@@ -1596,6 +1596,144 @@ func TestPollMinersRendersTableAfterPollLogs(t *testing.T) {
 	}
 }
 
+func TestPendingAndEmergencyOutputUsesDurableTruthAndStableAge(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 10, 0, 0, time.UTC)
+	since := now.Add(-5 * time.Minute)
+	minerController := testController(
+		&fakeDeviceAPI{},
+		newMemoryOptimizerStore(),
+		nil,
+	)
+	info := healthyInfo()
+	tests := []struct {
+		name       string
+		state      lib.MinerState
+		wantState  string
+		wantWindow string
+	}{
+		{
+			name: "ordinary operating point",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.SetPendingMutation(
+					lib.MutationOperatingPoint,
+					lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060},
+					since,
+				)
+				return state
+			}(),
+			wantState:  "PENDING",
+			wantWindow: "490/1060 5m0s",
+		},
+		{
+			name: "mining only",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.MiningPending = true
+				return state
+			}(),
+			wantState:  "PENDING",
+			wantWindow: "mining",
+		},
+		{
+			name: "safety rollback",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+					since,
+				)
+				state.Phase = lib.PhaseCooldown
+				return state
+			}(),
+			wantState:  "ROLLBACK",
+			wantWindow: "400/1000 5m0s",
+		},
+		{
+			name: "host containment",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.SetPendingMutation(
+					lib.MutationSafetyRollback,
+					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+					since,
+				)
+				state.Phase = lib.PhaseOverheat
+				state.PhaseStartedAt = since.Add(-time.Minute)
+				return state
+			}(),
+			wantState:  "OVERHEAT",
+			wantWindow: "contain 400/1000 5m0s",
+		},
+		{
+			name: "firmware recovery",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.SetPendingMutation(
+					lib.MutationOverheatRecovery,
+					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+					since,
+				)
+				state.Phase = lib.PhaseOverheat
+				state.PhaseStartedAt = since
+				return state
+			}(),
+			wantState:  "OVERHEAT",
+			wantWindow: "wait cool 5m0s",
+		},
+		{
+			name: "minimum active emergency hold",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.SetCurrentPoint(
+					lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000},
+				)
+				state.Phase = lib.PhaseOverheat
+				state.PhaseStartedAt = since
+				return state
+			}(),
+			wantState:  "OVERHEAT",
+			wantWindow: "min active / wait cool 5m0s",
+		},
+		{
+			name: "cooldown without intent",
+			state: func() lib.MinerState {
+				state := optimizerState(now)
+				state.Phase = lib.PhaseCooldown
+				state.CooldownUntil = now.Add(time.Hour)
+				return state
+			}(),
+			wantState:  "COOLDOWN",
+			wantWindow: "0/6",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotState := formatState(test.state, info, now)
+			gotWindow := minerController.formatWindow(
+				test.state,
+				optimizerSettings(),
+				now,
+			)
+			if !strings.Contains(gotState, test.wantState) ||
+				gotWindow != test.wantWindow {
+				t.Fatalf(
+					"state/window = %q/%q, want %q/%q",
+					gotState,
+					gotWindow,
+					test.wantState,
+					test.wantWindow,
+				)
+			}
+			if strings.Contains(gotState, "APPLYING") ||
+				gotWindow == "apply" {
+				t.Fatalf("obsolete applying output returned: %q/%q", gotState, gotWindow)
+			}
+		})
+	}
+}
+
 func TestPollMinersUsesBoundedWorkerPool(t *testing.T) {
 	var active atomic.Int32
 	var maximum atomic.Int32

@@ -211,7 +211,16 @@ Optimizer states are:
 - `VOLT_TEST`: testing whether one higher voltage improves a new frequency;
 - `HOLD`: running the best currently safe point;
 - `COOLDOWN`: monitoring without upward exploration; and
-- `OVERHEAT`: waiting for safe recovery.
+- `OVERHEAT`: containing or waiting for safe recovery.
+
+Durable ordinary work is shown as `PENDING`, typed hard-limit work as
+`ROLLBACK`, host containment as `OVERHEAT / contain <pair>`, firmware cooling
+as `OVERHEAT / wait cool`, and a minimum-pair hold as
+`OVERHEAT / min active / wait cool`. Target and episode ages come from durable
+timestamps. These labels report obligations, not an unproven in-process PATCH
+stage. The hash column remains live AxeOS actual/expected telemetry, so values
+above 100% expected are possible. Only median actual hash from a completed
+evaluation window is optimized; pending work never evaluates a trial point.
 
 ## Running
 
