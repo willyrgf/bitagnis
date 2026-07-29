@@ -145,16 +145,19 @@ func (fake *fakeDeviceAPI) restartRequests() []string {
 }
 
 type memoryOptimizerStore struct {
-	mu      sync.Mutex
-	states  map[string]lib.MinerState
-	records map[string]lib.OperatingPointRecord
-	saveErr error
+	mu          sync.Mutex
+	states      map[string]lib.MinerState
+	records     map[string]lib.OperatingPointRecord
+	attempts    map[int64]lib.MutationAttempt
+	nextAttempt int64
+	saveErr     error
 }
 
 func newMemoryOptimizerStore() *memoryOptimizerStore {
 	return &memoryOptimizerStore{
-		states:  make(map[string]lib.MinerState),
-		records: make(map[string]lib.OperatingPointRecord),
+		states:   make(map[string]lib.MinerState),
+		records:  make(map[string]lib.OperatingPointRecord),
+		attempts: make(map[int64]lib.MutationAttempt),
 	}
 }
 
@@ -235,6 +238,130 @@ func (store *memoryOptimizerStore) ListPoints(
 		}
 	}
 	return records, nil
+}
+
+func (store *memoryOptimizerStore) StartMutationAttempt(
+	attempt *lib.MutationAttempt,
+) (int64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for id, existing := range store.attempts {
+		if existing.MacAddr != attempt.MacAddr ||
+			!existing.FailedAt.IsZero() ||
+			!existing.MiningResumedAt.IsZero() {
+			continue
+		}
+		existing.FailedAt = attempt.StartedAt
+		if existing.CompletedAt.IsZero() {
+			existing.FailureStage = lib.MutationFailureInterrupted
+		} else {
+			existing.FailureStage = lib.MutationFailureMiningSuperseded
+		}
+		store.attempts[id] = existing
+	}
+	store.nextAttempt++
+	attempt.ID = store.nextAttempt
+	store.attempts[attempt.ID] = *attempt
+	return attempt.ID, nil
+}
+
+func (store *memoryOptimizerStore) AdvanceMutationAttempt(
+	id int64,
+	milestone lib.MutationMilestone,
+	at time.Time,
+) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	attempt, ok := store.attempts[id]
+	if !ok {
+		return fmt.Errorf("missing mutation attempt %d", id)
+	}
+	switch milestone {
+	case lib.MutationMilestonePatchRequested:
+		attempt.PatchRequestedAt = at
+	case lib.MutationMilestoneRestartRequested:
+		attempt.RestartRequestedAt = at
+	case lib.MutationMilestoneRebootVerified:
+		attempt.RebootVerifiedAt = at
+	case lib.MutationMilestoneMiningResumed:
+		attempt.MiningResumedAt = at
+	default:
+		return fmt.Errorf("unknown mutation milestone %q", milestone)
+	}
+	store.attempts[id] = attempt
+	return nil
+}
+
+func (store *memoryOptimizerStore) FailMutationAttempt(
+	id int64,
+	stage lib.MutationFailureStage,
+	at time.Time,
+) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	attempt, ok := store.attempts[id]
+	if !ok {
+		return fmt.Errorf("missing mutation attempt %d", id)
+	}
+	if attempt.FailedAt.IsZero() {
+		attempt.FailedAt = at
+		attempt.FailureStage = stage
+		store.attempts[id] = attempt
+	}
+	return nil
+}
+
+func (store *memoryOptimizerStore) CompleteMutationAttempt(
+	state *lib.MinerState,
+	id int64,
+	at time.Time,
+) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.saveErr != nil {
+		return store.saveErr
+	}
+	attempt, ok := store.attempts[id]
+	if !ok {
+		return fmt.Errorf("missing mutation attempt %d", id)
+	}
+	store.states[state.MacAddr] = *state
+	attempt.CompletedAt = at
+	store.attempts[id] = attempt
+	return nil
+}
+
+func (store *memoryOptimizerStore) PendingMutationResume(
+	macAddr string,
+) (lib.MutationAttempt, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var latest lib.MutationAttempt
+	for _, attempt := range store.attempts {
+		if attempt.MacAddr == macAddr &&
+			!attempt.CompletedAt.IsZero() &&
+			attempt.MiningResumedAt.IsZero() &&
+			attempt.FailedAt.IsZero() &&
+			attempt.ID > latest.ID {
+			latest = attempt
+		}
+	}
+	return latest, latest.ID != 0, nil
+}
+
+func (store *memoryOptimizerStore) mutationAttempts(
+	macAddr string,
+) []lib.MutationAttempt {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var attempts []lib.MutationAttempt
+	for id := int64(1); id <= store.nextAttempt; id++ {
+		attempt := store.attempts[id]
+		if attempt.MacAddr == macAddr {
+			attempts = append(attempts, attempt)
+		}
+	}
+	return attempts
 }
 
 func (store *memoryOptimizerStore) putState(state lib.MinerState) {

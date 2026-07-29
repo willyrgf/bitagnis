@@ -119,6 +119,44 @@ func waitForMutation(
 	}
 }
 
+func verifiedMutationAttempt(
+	t *testing.T,
+	states *memoryOptimizerStore,
+	state lib.MinerState,
+	kind lib.MutationKind,
+	target lib.OperatingPoint,
+	now time.Time,
+) int64 {
+	t.Helper()
+	if kind == lib.MutationMiningConfiguration {
+		target = lib.OperatingPoint{}
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr:           state.MacAddr,
+		Kind:              kind,
+		FromFrequency:     state.CurrentFrequency,
+		FromCoreVoltage:   state.CurrentCoreVoltage,
+		TargetFrequency:   target.Frequency,
+		TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt:   now.Add(-time.Minute),
+		StartedAt:         now.Add(-30 * time.Second),
+	}
+	id, err := states.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatalf("start verified mutation attempt: %v", err)
+	}
+	for _, milestone := range []lib.MutationMilestone{
+		lib.MutationMilestonePatchRequested,
+		lib.MutationMilestoneRestartRequested,
+		lib.MutationMilestoneRebootVerified,
+	} {
+		if err := states.AdvanceMutationAttempt(id, milestone, now); err != nil {
+			t.Fatalf("advance verified mutation attempt: %v", err)
+		}
+	}
+	return id
+}
+
 func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *testing.T) {
 	now := time.Now().Round(time.Second)
 	info := healthyInfo()
@@ -130,6 +168,7 @@ func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *
 	states.putState(state)
 
 	persistedBeforePatch := false
+	historyBeforePatch := false
 	devices := &fakeDeviceAPI{
 		getInfo: func(context.Context, string) (lib.Info, error) {
 			return info, nil
@@ -137,9 +176,15 @@ func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *
 		asicSettings: gammaASIC(),
 		patchHook: func(kind lib.MutationKind, point lib.OperatingPoint) {
 			got := states.getState(state.MacAddr)
+			attempts := states.mutationAttempts(state.MacAddr)
 			persistedBeforePatch = kind == lib.MutationOperatingPoint &&
 				got.PendingKind == kind &&
 				got.PendingPoint() == point
+			historyBeforePatch = len(attempts) == 1 &&
+				attempts[0].Kind == kind &&
+				attempts[0].TargetPoint() == point &&
+				!attempts[0].PatchRequestedAt.IsZero() &&
+				attempts[0].RestartRequestedAt.IsZero()
 		},
 	}
 	post := info
@@ -169,10 +214,16 @@ func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *
 	})
 	got := states.getState(state.MacAddr)
 	if !persistedBeforePatch ||
+		!historyBeforePatch ||
 		got.CurrentPoint() != target ||
 		got.IP != "192.0.2.44" ||
 		!got.RampUntil.After(now) {
-		t.Fatalf("completed state = %+v, persisted before patch = %v", got, persistedBeforePatch)
+		t.Fatalf(
+			"completed state = %+v, durable intent/history before patch = %v/%v",
+			got,
+			persistedBeforePatch,
+			historyBeforePatch,
+		)
 	}
 	if len(devices.operatingRequests()) != 1 ||
 		len(devices.restartRequests()) != 1 {
@@ -181,6 +232,93 @@ func TestOperatingPointMutationPersistsBeforePatchAndRequiresVerifiedRestart(t *
 			devices.operatingRequests(),
 			devices.restartRequests(),
 		)
+	}
+	attempts := states.mutationAttempts(state.MacAddr)
+	if len(attempts) != 1 ||
+		attempts[0].Kind != lib.MutationOperatingPoint ||
+		attempts[0].FromPoint() != operatingPointFromInfo(info) ||
+		attempts[0].TargetPoint() != target ||
+		attempts[0].PatchRequestedAt.IsZero() ||
+		attempts[0].RestartRequestedAt.IsZero() ||
+		attempts[0].RebootVerifiedAt.IsZero() ||
+		attempts[0].CompletedAt.IsZero() ||
+		!attempts[0].MiningResumedAt.IsZero() ||
+		!attempts[0].FailedAt.IsZero() {
+		t.Fatalf("completed mutation history = %+v", attempts)
+	}
+
+	for index, healthyAt := range []time.Time{
+		now.Add(10 * time.Second),
+		now.Add(20 * time.Second),
+	} {
+		if _, err := coordinator.Advance(
+			context.Background(),
+			map[string]*minerObservation{
+				state.MacAddr: observation(
+					post,
+					states.getState(state.MacAddr),
+					mutationSettings(false),
+				),
+			},
+			healthyAt,
+		); err != nil {
+			t.Fatalf("advance healthy mining poll %d: %v", index+1, err)
+		}
+	}
+	attempts = states.mutationAttempts(state.MacAddr)
+	if !attempts[0].MiningResumedAt.Equal(now.Add(20 * time.Second)) {
+		t.Fatalf("mining resume history = %+v", attempts[0])
+	}
+}
+
+func TestMutationHistoryRecordsPatchFailureWithoutRestart(t *testing.T) {
+	now := time.Now().Round(time.Second)
+	info := healthyInfo()
+	state := optimizerState(now)
+	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}
+	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
+	state.Phase = lib.PhaseUndervolt
+	states := newMemoryOptimizerStore()
+	states.putState(state)
+	devices := &fakeDeviceAPI{
+		getInfo:      func(context.Context, string) (lib.Info, error) { return info, nil },
+		asicSettings: gammaASIC(),
+		setError:     errors.New("synthetic PATCH failure"),
+	}
+	coordinator := testMutationCoordinator(
+		devices,
+		states,
+		mutationSettings(false),
+		info,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	coordinator.now = func() time.Time { return now }
+	observations := func() map[string]*minerObservation {
+		return map[string]*minerObservation{
+			state.MacAddr: observation(
+				info,
+				states.getState(state.MacAddr),
+				mutationSettings(false),
+			),
+		}
+	}
+	waitForMutation(t, coordinator, observations, now, func() bool {
+		attempts := states.mutationAttempts(state.MacAddr)
+		return len(attempts) == 1 && !attempts[0].FailedAt.IsZero()
+	})
+	attempts := states.mutationAttempts(state.MacAddr)
+	if attempts[0].FailureStage != lib.MutationFailurePatch ||
+		attempts[0].PatchRequestedAt.IsZero() ||
+		!attempts[0].RestartRequestedAt.IsZero() ||
+		!attempts[0].RebootVerifiedAt.IsZero() ||
+		!attempts[0].CompletedAt.IsZero() ||
+		len(devices.operatingRequests()) != 1 ||
+		len(devices.restartRequests()) != 0 ||
+		states.getState(state.MacAddr).PendingKind != lib.MutationOperatingPoint {
+		t.Fatalf("PATCH failure history/state = %+v / %+v", attempts[0], states.getState(state.MacAddr))
 	}
 }
 
@@ -1927,12 +2065,21 @@ func TestSafetyCompletionSeparatesReadbackFromResidualHeat(t *testing.T) {
 				nil,
 			)
 			coordinator.now = func() time.Time { return now }
+			attemptID := verifiedMutationAttempt(
+				t,
+				states,
+				state,
+				test.kind,
+				minimum,
+				now,
+			)
 			result := mutationResult{
-				macAddr:  state.MacAddr,
-				hostname: state.Hostname,
-				kind:     test.kind,
-				point:    minimum,
-				miner:    discovered(info, state.IP),
+				attemptID: attemptID,
+				macAddr:   state.MacAddr,
+				hostname:  state.Hostname,
+				kind:      test.kind,
+				point:     minimum,
+				miner:     discovered(info, state.IP),
 			}
 			if err := coordinator.completeMutationLocked(result); err != nil {
 				t.Fatalf("complete safety mutation: %v", err)
@@ -2493,12 +2640,21 @@ func TestDurableCompletionPrecedesTelemetryReset(t *testing.T) {
 	post.CoreVoltage = target.CoreVoltage
 	post.UpTimeSeconds = 1
 	coordinator.now = func() time.Time { return now }
+	attemptID := verifiedMutationAttempt(
+		t,
+		states,
+		state,
+		lib.MutationOperatingPoint,
+		target,
+		now,
+	)
 	if err := coordinator.completeMutationLocked(mutationResult{
-		macAddr:  state.MacAddr,
-		hostname: state.Hostname,
-		kind:     lib.MutationOperatingPoint,
-		point:    target,
-		miner:    discovered(post, "192.0.2.88"),
+		attemptID: attemptID,
+		macAddr:   state.MacAddr,
+		hostname:  state.Hostname,
+		kind:      lib.MutationOperatingPoint,
+		point:     target,
+		miner:     discovered(post, "192.0.2.88"),
 	}); err != nil {
 		t.Fatalf("complete mutation: %v", err)
 	}

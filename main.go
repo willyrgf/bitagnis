@@ -63,6 +63,11 @@ type optimizerStateStore interface {
 	SaveMiner(*lib.MinerState) error
 	SavePoint(*lib.OperatingPointRecord) error
 	ListPoints(string) ([]lib.OperatingPointRecord, error)
+	StartMutationAttempt(*lib.MutationAttempt) (int64, error)
+	AdvanceMutationAttempt(int64, lib.MutationMilestone, time.Time) error
+	FailMutationAttempt(int64, lib.MutationFailureStage, time.Time) error
+	CompleteMutationAttempt(*lib.MinerState, int64, time.Time) error
+	PendingMutationResume(string) (lib.MutationAttempt, bool, error)
 }
 
 type controller struct {

@@ -92,23 +92,25 @@ func TestOptimizerStoreCreatesOnlyCurrentSchema(t *testing.T) {
 		t.Fatalf("read schema tables: %v", err)
 	}
 	if version != optimizerSchemaVersion ||
-		fmt.Sprint(tables) != "[operating_points optimizer_miners]" {
+		fmt.Sprint(tables) != "[mutation_attempts operating_points optimizer_miners]" {
 		t.Fatalf("schema version/tables = %d/%v", version, tables)
 	}
-	columns, err := tableColumns(t.Context(), store.conn, "optimizer_miners")
-	if err != nil {
-		t.Fatalf("read optimizer_miners columns: %v", err)
-	}
-	for _, column := range columns {
-		lowerName := strings.ToLower(column.name)
-		switch {
-		case column.name == "overheat_pending":
-			t.Fatal("schema retained deleted overheat_pending column")
-		case strings.Contains(lowerName, "password") ||
-			strings.Contains(lowerName, "stratum") ||
-			strings.Contains(lowerName, "telemetry") ||
-			strings.Contains(lowerName, "sample"):
-			t.Fatalf("schema contains forbidden durable field %q", column.name)
+	for _, table := range tables {
+		columns, err := tableColumns(t.Context(), store.conn, table)
+		if err != nil {
+			t.Fatalf("read %s columns: %v", table, err)
+		}
+		for _, column := range columns {
+			lowerName := strings.ToLower(column.name)
+			switch {
+			case column.name == "overheat_pending":
+				t.Fatal("schema retained deleted overheat_pending column")
+			case strings.Contains(lowerName, "password") ||
+				strings.Contains(lowerName, "stratum") ||
+				strings.Contains(lowerName, "telemetry") ||
+				strings.Contains(lowerName, "sample"):
+				t.Fatalf("schema contains forbidden durable field %q", column.name)
+			}
 		}
 	}
 }
@@ -218,6 +220,165 @@ func TestOptimizerStorePersistsHistoryAndPendingObligationsAcrossReopen(t *testi
 	}
 }
 
+func TestMutationAttemptLifecyclePersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().Round(time.Second)
+	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+	if err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+	target := OperatingPoint{Frequency: 400, CoreVoltage: 1060}
+	state.Phase = PhaseUndervolt
+	state.SetPendingMutation(MutationOperatingPoint, target, now)
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatalf("save pending state: %v", err)
+	}
+	attempt := MutationAttempt{
+		MacAddr:           state.MacAddr,
+		Kind:              MutationOperatingPoint,
+		FromFrequency:     state.CurrentFrequency,
+		FromCoreVoltage:   state.CurrentCoreVoltage,
+		TargetFrequency:   target.Frequency,
+		TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt:   now,
+		StartedAt:         now.Add(time.Second),
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatalf("start attempt: %v", err)
+	}
+	if id <= 0 || attempt.ID != id {
+		t.Fatalf("attempt ID = %d/%d", id, attempt.ID)
+	}
+	if err := store.AdvanceMutationAttempt(
+		id,
+		MutationMilestoneRestartRequested,
+		now.Add(2*time.Second),
+	); err == nil {
+		t.Fatal("restart milestone without PATCH was accepted")
+	}
+	milestones := []struct {
+		milestone MutationMilestone
+		at        time.Time
+	}{
+		{MutationMilestonePatchRequested, now.Add(2 * time.Second)},
+		{MutationMilestoneRestartRequested, now.Add(3 * time.Second)},
+		{MutationMilestoneRebootVerified, now.Add(20 * time.Second)},
+	}
+	for _, milestone := range milestones {
+		if err := store.AdvanceMutationAttempt(
+			id,
+			milestone.milestone,
+			milestone.at,
+		); err != nil {
+			t.Fatalf("advance %s: %v", milestone.milestone, err)
+		}
+	}
+	state.SetCurrentPoint(target)
+	state.ClearPendingMutation()
+	completedAt := now.Add(21 * time.Second)
+	if err := store.CompleteMutationAttempt(&state, id, completedAt); err != nil {
+		t.Fatalf("complete attempt: %v", err)
+	}
+	pending, found, err := store.PendingMutationResume(state.MacAddr)
+	if err != nil {
+		t.Fatalf("load pending resume: %v", err)
+	}
+	if !found || pending.ID != id || !pending.CompletedAt.Equal(completedAt) {
+		t.Fatalf("pending resume = %+v, found = %v", pending, found)
+	}
+	resumedAt := now.Add(40 * time.Second)
+	if err := store.AdvanceMutationAttempt(
+		id,
+		MutationMilestoneMiningResumed,
+		resumedAt,
+	); err != nil {
+		t.Fatalf("resume mining: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	attempts, err := reopened.ListMutationAttempts(state.MacAddr)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	got := attempts[0]
+	if got.ID != id ||
+		got.Kind != MutationOperatingPoint ||
+		got.FromPoint() != (OperatingPoint{Frequency: 400, CoreVoltage: 1100}) ||
+		got.TargetPoint() != target ||
+		!got.PatchRequestedAt.Equal(milestones[0].at) ||
+		!got.RestartRequestedAt.Equal(milestones[1].at) ||
+		!got.RebootVerifiedAt.Equal(milestones[2].at) ||
+		!got.CompletedAt.Equal(completedAt) ||
+		!got.MiningResumedAt.Equal(resumedAt) ||
+		!got.FailedAt.IsZero() ||
+		got.FailureStage != "" {
+		t.Fatalf("reopened mutation attempt = %+v", got)
+	}
+}
+
+func TestStartingMutationClosesInterruptedAttempt(t *testing.T) {
+	store := openTestOptimizerStore(t)
+	now := time.Now().Round(time.Second)
+	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+	if err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+	first := MutationAttempt{
+		MacAddr:           state.MacAddr,
+		Kind:              MutationOperatingPoint,
+		FromFrequency:     400,
+		FromCoreVoltage:   1100,
+		TargetFrequency:   400,
+		TargetCoreVoltage: 1060,
+		IntentCreatedAt:   now,
+		StartedAt:         now,
+	}
+	firstID, err := store.StartMutationAttempt(&first)
+	if err != nil {
+		t.Fatalf("start first attempt: %v", err)
+	}
+	if err := store.AdvanceMutationAttempt(
+		firstID,
+		MutationMilestonePatchRequested,
+		now.Add(time.Second),
+	); err != nil {
+		t.Fatalf("advance first attempt: %v", err)
+	}
+	second := first
+	second.ID = 0
+	second.TargetCoreVoltage = 1150
+	second.IntentCreatedAt = now.Add(time.Minute)
+	second.StartedAt = now.Add(time.Minute)
+	if _, err := store.StartMutationAttempt(&second); err != nil {
+		t.Fatalf("start second attempt: %v", err)
+	}
+	attempts, err := store.ListMutationAttempts(state.MacAddr)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 2 ||
+		attempts[0].FailureStage != MutationFailureInterrupted ||
+		!attempts[0].FailedAt.Equal(second.StartedAt) ||
+		!attempts[1].FailedAt.IsZero() {
+		t.Fatalf("attempts after interruption = %+v", attempts)
+	}
+}
+
 func TestOptimizerStoreRejectsIncompatibleSchemaWithoutModification(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -230,6 +391,10 @@ func TestOptimizerStoreRejectsIncompatibleSchemaWithoutModification(t *testing.T
 		{
 			name:   "unknown version",
 			schema: `PRAGMA user_version = 99; CREATE TABLE marker (value TEXT);`,
+		},
+		{
+			name:   "previous version",
+			schema: `PRAGMA user_version = 2; CREATE TABLE marker (value TEXT);`,
 		},
 		{
 			name: "partial current",

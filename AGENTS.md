@@ -96,14 +96,14 @@ solution is not possible, report the blocker instead of approximating it.
 - `optimizer.go` owns thermal-frontier search, telemetry windows, safety evaluation, rollback,
   cooldown, overheat policy, and operating-point target selection.
 - `mutation.go` owns mutation priority, durable-intent coordination, preflight checks, PATCH/restart
-  ordering, same-MAC rediscovery, reboot proof, readback, startup mining reconciliation, and the
-  optimization gate.
+  ordering, durable mutation-attempt milestones, same-MAC rediscovery, reboot proof, readback,
+  healthy-mining resumption, startup mining reconciliation, and the optimization gate.
 - `lib/bitaxe.go` owns AxeOS HTTP transport, response validation, advertised ASIC settings, and local
   network discovery primitives.
 - `lib/settings.go` owns strict YAML decoding, defaults, hostname overrides, and safety-setting
   validation.
 - `lib/state.go` owns durable optimizer and pending-mutation state, evaluated operating-point
-  records, exclusive SQLite ownership, and exact schema validation.
+  records, mutation-attempt history, exclusive SQLite ownership, and exact schema validation.
 - `*_test.go` files own executable behavior contracts. Keep controller/optimizer tests in the root
   package and library boundary tests in `lib`.
 
@@ -135,10 +135,13 @@ These invariants are high risk if violated:
   headroom; if no validated point qualifies, use the minimum advertised pair.
 - Persist a pending operating-point request before touching the device. Do not evaluate it until
   the same MAC returns after proven reboot and exact complete-pair readback.
+- Persist one mutation-attempt record before hardware work, record PATCH and restart milestones
+  before their requests, atomically complete the attempt with durable state reconciliation, and
+  close mining resumption only after two consecutive safe positive-hash polls.
 - A manual operating-point change requires two consecutive observations before adoption. Adoption
   starts a fresh baseline ramp and telemetry window.
-- Telemetry samples remain in memory. Durable state contains optimizer control state and evaluated
-  summaries, not raw polling history.
+- Telemetry samples remain in memory. Durable state contains optimizer control state, evaluated
+  summaries, and credential-free mutation lifecycle timestamps, not raw polling history.
 - Preserve evaluated-point history across overheat recovery and ordinary process restarts unless a
   deliberate schema or policy change says otherwise.
 - Repeated overheats extend cooldown, capped at 24 hours. Do not remove this backoff accidentally.

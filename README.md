@@ -74,8 +74,10 @@ Every operating-point, rollback, overheat-recovery, and enabled mining-setting
 change uses one restart-verified lifecycle:
 
 ```text
-validate -> persist intent -> recheck identity and safety -> PATCH -> restart
-         -> rediscover the same MAC -> prove a new boot -> verify -> ramp
+validate -> persist intent and attempt -> recheck identity and safety
+         -> record PATCH milestone -> PATCH -> record restart milestone
+         -> restart -> rediscover the same MAC -> prove a new boot -> verify
+         -> atomically complete state and attempt -> two healthy mining polls
 ```
 
 AxeOS v2.8.1 writes frequency and voltage separately to NVS, and its running
@@ -101,13 +103,38 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 2, with a typed `safety_rollback` mutation and no
-legacy `overheat_pending` field. It has no migration or compatibility reader.
-An old, partial, or unknown database is rejected without modification; move it
-aside or remove it to create the current baseline. Evaluated history, cooldown,
-pending mutation ages, and emergency episode ages persist across ordinary
-restarts after that baseline is created. Raw telemetry and Stratum credentials
-are never stored in the optimizer database.
+The current schema is version 3, with typed pending mutations and one durable
+`mutation_attempts` row per controller-owned hardware attempt. It has no legacy
+`overheat_pending` field, migration, or compatibility reader. An old, partial,
+or unknown database is rejected without modification; move it aside or remove
+it to create the current baseline. Evaluated history, cooldown, pending
+mutation ages, emergency episode ages, and mutation attempts persist across
+ordinary restarts after that baseline is created.
+
+Mutation history records the mutation kind, complete source and target pair,
+intent/start time, pre-request PATCH and restart milestones, reboot proof,
+durable completion, two-poll healthy-mining resumption, and a deterministic
+failure stage. An interrupted process leaves durable evidence, and replay
+creates a new attempt instead of overwriting the old one. This supports
+long-term restart counts and restart-to-healthy-mining duration by miner and
+mutation kind. It does not record external/manual reboots, raw telemetry,
+free-form errors, Stratum settings, or credentials.
+
+For a credential-free restart summary:
+
+```sql
+SELECT
+  kind,
+  SUM(restart_requested_at != 0) AS restart_requests,
+  SUM(mining_resumed_at != 0) AS healthy_resumptions,
+  ROUND(AVG(CASE
+    WHEN mining_resumed_at != 0
+    THEN (mining_resumed_at - restart_requested_at) / 1000000000.0
+  END), 1) AS average_restart_to_healthy_seconds
+FROM mutation_attempts
+GROUP BY kind
+ORDER BY kind;
+```
 
 Before replacing an older baseline, stop the old controller, prove it is no
 longer issuing requests, record every selected miner's exact MAC, live complete

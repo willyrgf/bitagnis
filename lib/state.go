@@ -15,7 +15,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 2
+const optimizerSchemaVersion = 3
 
 type OptimizerPhase string
 
@@ -172,6 +172,74 @@ func (record OperatingPointRecord) Point() OperatingPoint {
 	return OperatingPoint{
 		Frequency:   record.Frequency,
 		CoreVoltage: record.CoreVoltage,
+	}
+}
+
+// MutationMilestone identifies one durable stage in a controller-owned
+// hardware mutation attempt.
+type MutationMilestone string
+
+const (
+	MutationMilestonePatchRequested   MutationMilestone = "patch_requested"
+	MutationMilestoneRestartRequested MutationMilestone = "restart_requested"
+	MutationMilestoneRebootVerified   MutationMilestone = "reboot_verified"
+	MutationMilestoneMiningResumed    MutationMilestone = "mining_resumed"
+)
+
+// MutationFailureStage identifies the stage at which a mutation attempt
+// stopped without confirmed healthy mining.
+type MutationFailureStage string
+
+const (
+	MutationFailureInterrupted        MutationFailureStage = "interrupted"
+	MutationFailureCanceled           MutationFailureStage = "canceled"
+	MutationFailurePreflight          MutationFailureStage = "preflight"
+	MutationFailurePatch              MutationFailureStage = "patch"
+	MutationFailureRestart            MutationFailureStage = "restart"
+	MutationFailureRebootVerification MutationFailureStage = "reboot_verification"
+	MutationFailureCompletion         MutationFailureStage = "completion"
+	MutationFailureMiningResume       MutationFailureStage = "mining_resume"
+	MutationFailureMiningSuperseded   MutationFailureStage = "mining_superseded"
+)
+
+// MutationAttempt is one durable controller-owned hardware mutation
+// lifecycle. It records only lifecycle summaries, never credentials or raw
+// telemetry.
+type MutationAttempt struct {
+	ID      int64
+	MacAddr string
+	Kind    MutationKind
+
+	FromFrequency     int
+	FromCoreVoltage   int
+	TargetFrequency   int
+	TargetCoreVoltage int
+
+	IntentCreatedAt    time.Time
+	StartedAt          time.Time
+	PatchRequestedAt   time.Time
+	RestartRequestedAt time.Time
+	RebootVerifiedAt   time.Time
+	CompletedAt        time.Time
+	MiningResumedAt    time.Time
+	FailedAt           time.Time
+	FailureStage       MutationFailureStage
+}
+
+// FromPoint returns the configured operating point observed before mutation.
+func (attempt MutationAttempt) FromPoint() OperatingPoint {
+	return OperatingPoint{
+		Frequency:   attempt.FromFrequency,
+		CoreVoltage: attempt.FromCoreVoltage,
+	}
+}
+
+// TargetPoint returns the complete requested operating point. Mining-only
+// attempts return the zero point because their operating point is unchanged.
+func (attempt MutationAttempt) TargetPoint() OperatingPoint {
+	return OperatingPoint{
+		Frequency:   attempt.TargetFrequency,
+		CoreVoltage: attempt.TargetCoreVoltage,
 	}
 }
 
@@ -448,6 +516,352 @@ func (store *OptimizerStore) ListPoints(macAddr string) ([]OperatingPointRecord,
 	return records, nil
 }
 
+// StartMutationAttempt durably records a mutation attempt before hardware work.
+// Any older unfinished attempt for the miner is closed as interrupted, and a
+// completed attempt that never returned to healthy mining is superseded.
+func (store *OptimizerStore) StartMutationAttempt(
+	attempt *MutationAttempt,
+) (int64, error) {
+	if attempt == nil {
+		return 0, fmt.Errorf("start mutation attempt: attempt is nil")
+	}
+	if attempt.ID != 0 {
+		return 0, fmt.Errorf("start mutation attempt: ID must be zero")
+	}
+	if err := validateMutationAttempt(*attempt, false); err != nil {
+		return 0, fmt.Errorf("start mutation attempt: %w", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("start mutation attempt"); err != nil {
+		return 0, err
+	}
+	tx, err := store.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("start mutation attempt: begin transaction: %w", err)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := queryMiner(tx, attempt.MacAddr); errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("start mutation attempt: miner does not exist")
+	} else if err != nil {
+		return 0, fmt.Errorf("start mutation attempt: load miner: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		context.Background(),
+		`UPDATE mutation_attempts
+		SET failed_at = ?, failure_stage = ?
+		WHERE mac_addr = ? AND completed_at = 0 AND failed_at = 0`,
+		timeValue(attempt.StartedAt),
+		MutationFailureInterrupted,
+		attempt.MacAddr,
+	); err != nil {
+		return 0, fmt.Errorf("start mutation attempt: close interrupted attempt: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		context.Background(),
+		`UPDATE mutation_attempts
+		SET failed_at = ?, failure_stage = ?
+		WHERE mac_addr = ? AND completed_at != 0 AND mining_resumed_at = 0
+			AND failed_at = 0`,
+		timeValue(attempt.StartedAt),
+		MutationFailureMiningSuperseded,
+		attempt.MacAddr,
+	); err != nil {
+		return 0, fmt.Errorf("start mutation attempt: supersede mining recovery: %w", err)
+	}
+	result, err := tx.ExecContext(
+		context.Background(),
+		`INSERT INTO mutation_attempts (
+			mac_addr, kind, from_frequency, from_core_voltage,
+			target_frequency, target_core_voltage, intent_created_at,
+			started_at, patch_requested_at, restart_requested_at,
+			reboot_verified_at, completed_at, mining_resumed_at,
+			failed_at, failure_stage
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, '')`,
+		attempt.MacAddr,
+		attempt.Kind,
+		attempt.FromFrequency,
+		attempt.FromCoreVoltage,
+		attempt.TargetFrequency,
+		attempt.TargetCoreVoltage,
+		timeValue(attempt.IntentCreatedAt),
+		timeValue(attempt.StartedAt),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("start mutation attempt: insert: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("start mutation attempt: read ID: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("start mutation attempt: commit: %w", err)
+	}
+	rollback = false
+	attempt.ID = id
+	return id, nil
+}
+
+// AdvanceMutationAttempt records one ordered mutation lifecycle milestone.
+func (store *OptimizerStore) AdvanceMutationAttempt(
+	id int64,
+	milestone MutationMilestone,
+	at time.Time,
+) error {
+	if id <= 0 {
+		return fmt.Errorf("advance mutation attempt: ID must be positive")
+	}
+	if at.IsZero() {
+		return fmt.Errorf("advance mutation attempt: timestamp is required")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("advance mutation attempt"); err != nil {
+		return err
+	}
+	attempt, err := queryMutationAttempt(store.conn, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("advance mutation attempt: attempt %d does not exist", id)
+	}
+	if err != nil {
+		return fmt.Errorf("advance mutation attempt: %w", err)
+	}
+	if !attempt.FailedAt.IsZero() {
+		return fmt.Errorf("advance mutation attempt: attempt %d already failed", id)
+	}
+	switch milestone {
+	case MutationMilestonePatchRequested:
+		if !attempt.PatchRequestedAt.IsZero() {
+			return nil
+		}
+		attempt.PatchRequestedAt = at
+	case MutationMilestoneRestartRequested:
+		if !attempt.RestartRequestedAt.IsZero() {
+			return nil
+		}
+		attempt.RestartRequestedAt = at
+	case MutationMilestoneRebootVerified:
+		if !attempt.RebootVerifiedAt.IsZero() {
+			return nil
+		}
+		attempt.RebootVerifiedAt = at
+	case MutationMilestoneMiningResumed:
+		if !attempt.MiningResumedAt.IsZero() {
+			return nil
+		}
+		attempt.MiningResumedAt = at
+	default:
+		return fmt.Errorf("advance mutation attempt: milestone %q is invalid", milestone)
+	}
+	if err := validateMutationAttempt(attempt, true); err != nil {
+		return fmt.Errorf("advance mutation attempt: %w", err)
+	}
+	_, err = store.conn.ExecContext(
+		context.Background(),
+		`UPDATE mutation_attempts SET
+			patch_requested_at = ?, restart_requested_at = ?,
+			reboot_verified_at = ?, mining_resumed_at = ?
+		WHERE id = ?`,
+		timeValue(attempt.PatchRequestedAt),
+		timeValue(attempt.RestartRequestedAt),
+		timeValue(attempt.RebootVerifiedAt),
+		timeValue(attempt.MiningResumedAt),
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("advance mutation attempt: update: %w", err)
+	}
+	return nil
+}
+
+// FailMutationAttempt closes an attempt at a deterministic lifecycle stage.
+func (store *OptimizerStore) FailMutationAttempt(
+	id int64,
+	stage MutationFailureStage,
+	at time.Time,
+) error {
+	if id <= 0 {
+		return fmt.Errorf("fail mutation attempt: ID must be positive")
+	}
+	if at.IsZero() {
+		return fmt.Errorf("fail mutation attempt: timestamp is required")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("fail mutation attempt"); err != nil {
+		return err
+	}
+	attempt, err := queryMutationAttempt(store.conn, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("fail mutation attempt: attempt %d does not exist", id)
+	}
+	if err != nil {
+		return fmt.Errorf("fail mutation attempt: %w", err)
+	}
+	if !attempt.MiningResumedAt.IsZero() {
+		return fmt.Errorf("fail mutation attempt: attempt %d already resumed mining", id)
+	}
+	if !attempt.FailedAt.IsZero() {
+		return nil
+	}
+	attempt.FailedAt = at
+	attempt.FailureStage = stage
+	if err := validateMutationAttempt(attempt, true); err != nil {
+		return fmt.Errorf("fail mutation attempt: %w", err)
+	}
+	_, err = store.conn.ExecContext(
+		context.Background(),
+		`UPDATE mutation_attempts
+		SET failed_at = ?, failure_stage = ?
+		WHERE id = ?`,
+		timeValue(attempt.FailedAt),
+		attempt.FailureStage,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("fail mutation attempt: update: %w", err)
+	}
+	return nil
+}
+
+// CompleteMutationAttempt atomically saves the verified device state and
+// records that the mutation lifecycle completed.
+func (store *OptimizerStore) CompleteMutationAttempt(
+	state *MinerState,
+	id int64,
+	at time.Time,
+) error {
+	if state == nil {
+		return fmt.Errorf("complete mutation attempt: state is nil")
+	}
+	if id <= 0 {
+		return fmt.Errorf("complete mutation attempt: ID must be positive")
+	}
+	if at.IsZero() {
+		return fmt.Errorf("complete mutation attempt: timestamp is required")
+	}
+	if err := validateMinerState(*state); err != nil {
+		return fmt.Errorf("complete mutation attempt: %w", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("complete mutation attempt"); err != nil {
+		return err
+	}
+	tx, err := store.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("complete mutation attempt: begin transaction: %w", err)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+	attempt, err := queryMutationAttempt(tx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("complete mutation attempt: attempt %d does not exist", id)
+	}
+	if err != nil {
+		return fmt.Errorf("complete mutation attempt: %w", err)
+	}
+	if attempt.MacAddr != state.MacAddr {
+		return fmt.Errorf("complete mutation attempt: miner does not match attempt")
+	}
+	if attempt.Kind == MutationMiningConfiguration {
+		if state.MiningPending {
+			return fmt.Errorf("complete mutation attempt: mining obligation remains pending")
+		}
+	} else if state.PendingKind != "" || state.CurrentPoint() != attempt.TargetPoint() {
+		return fmt.Errorf("complete mutation attempt: operating-point state does not match attempt")
+	}
+	if !attempt.FailedAt.IsZero() {
+		return fmt.Errorf("complete mutation attempt: attempt already failed")
+	}
+	if !attempt.CompletedAt.IsZero() {
+		return nil
+	}
+	attempt.CompletedAt = at
+	if err := validateMutationAttempt(attempt, true); err != nil {
+		return fmt.Errorf("complete mutation attempt: %w", err)
+	}
+	if err := saveMiner(tx, state); err != nil {
+		return fmt.Errorf("complete mutation attempt: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		context.Background(),
+		"UPDATE mutation_attempts SET completed_at = ? WHERE id = ?",
+		timeValue(attempt.CompletedAt),
+		id,
+	); err != nil {
+		return fmt.Errorf("complete mutation attempt: update history: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("complete mutation attempt: commit: %w", err)
+	}
+	rollback = false
+	return nil
+}
+
+// PendingMutationResume returns the completed attempt still waiting for two
+// consecutive healthy mining observations.
+func (store *OptimizerStore) PendingMutationResume(
+	macAddr string,
+) (MutationAttempt, bool, error) {
+	if strings.TrimSpace(macAddr) == "" {
+		return MutationAttempt{}, false, fmt.Errorf(
+			"pending mutation resume: MAC address is empty",
+		)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("pending mutation resume"); err != nil {
+		return MutationAttempt{}, false, err
+	}
+	attempt, err := queryPendingMutationResume(store.conn, macAddr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MutationAttempt{}, false, nil
+	}
+	if err != nil {
+		return MutationAttempt{}, false, fmt.Errorf("pending mutation resume: %w", err)
+	}
+	return attempt, true, nil
+}
+
+// ListMutationAttempts returns durable mutation attempts in creation order.
+func (store *OptimizerStore) ListMutationAttempts(
+	macAddr string,
+) ([]MutationAttempt, error) {
+	if strings.TrimSpace(macAddr) == "" {
+		return nil, fmt.Errorf("list mutation attempts: MAC address is empty")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("list mutation attempts"); err != nil {
+		return nil, err
+	}
+	rows, err := store.conn.QueryContext(
+		context.Background(),
+		mutationAttemptSelect+` WHERE mac_addr = ? ORDER BY id`,
+		macAddr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list mutation attempts: %w", err)
+	}
+	defer rows.Close()
+	attempts, err := scanMutationAttempts(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list mutation attempts: %w", err)
+	}
+	return attempts, nil
+}
+
 func scanPointRows(rows *sql.Rows) ([]OperatingPointRecord, error) {
 	var records []OperatingPointRecord
 	for rows.Next() {
@@ -487,6 +901,104 @@ func scanPointRows(rows *sql.Rows) ([]OperatingPointRecord, error) {
 		return nil, err
 	}
 	return records, nil
+}
+
+const mutationAttemptSelect = `SELECT
+	id, mac_addr, kind, from_frequency, from_core_voltage,
+	target_frequency, target_core_voltage, intent_created_at, started_at,
+	patch_requested_at, restart_requested_at, reboot_verified_at,
+	completed_at, mining_resumed_at, failed_at, failure_stage
+	FROM mutation_attempts`
+
+func queryMutationAttempt(queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, id int64) (MutationAttempt, error) {
+	return scanMutationAttempt(
+		queryer.QueryRowContext(
+			context.Background(),
+			mutationAttemptSelect+" WHERE id = ?",
+			id,
+		),
+	)
+}
+
+func queryPendingMutationResume(queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, macAddr string) (MutationAttempt, error) {
+	return scanMutationAttempt(
+		queryer.QueryRowContext(
+			context.Background(),
+			mutationAttemptSelect+`
+			WHERE mac_addr = ? AND completed_at != 0
+				AND mining_resumed_at = 0 AND failed_at = 0
+			ORDER BY id DESC LIMIT 1`,
+			macAddr,
+		),
+	)
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanMutationAttempt(row rowScanner) (MutationAttempt, error) {
+	var attempt MutationAttempt
+	var kind string
+	var failureStage string
+	var intentCreatedAt int64
+	var startedAt int64
+	var patchRequestedAt int64
+	var restartRequestedAt int64
+	var rebootVerifiedAt int64
+	var completedAt int64
+	var miningResumedAt int64
+	var failedAt int64
+	if err := row.Scan(
+		&attempt.ID,
+		&attempt.MacAddr,
+		&kind,
+		&attempt.FromFrequency,
+		&attempt.FromCoreVoltage,
+		&attempt.TargetFrequency,
+		&attempt.TargetCoreVoltage,
+		&intentCreatedAt,
+		&startedAt,
+		&patchRequestedAt,
+		&restartRequestedAt,
+		&rebootVerifiedAt,
+		&completedAt,
+		&miningResumedAt,
+		&failedAt,
+		&failureStage,
+	); err != nil {
+		return MutationAttempt{}, err
+	}
+	attempt.Kind = MutationKind(kind)
+	attempt.IntentCreatedAt = storedTime(intentCreatedAt)
+	attempt.StartedAt = storedTime(startedAt)
+	attempt.PatchRequestedAt = storedTime(patchRequestedAt)
+	attempt.RestartRequestedAt = storedTime(restartRequestedAt)
+	attempt.RebootVerifiedAt = storedTime(rebootVerifiedAt)
+	attempt.CompletedAt = storedTime(completedAt)
+	attempt.MiningResumedAt = storedTime(miningResumedAt)
+	attempt.FailedAt = storedTime(failedAt)
+	attempt.FailureStage = MutationFailureStage(failureStage)
+	return attempt, nil
+}
+
+func scanMutationAttempts(rows *sql.Rows) ([]MutationAttempt, error) {
+	var attempts []MutationAttempt
+	for rows.Next() {
+		attempt, err := scanMutationAttempt(rows)
+		if err != nil {
+			return nil, err
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return attempts, nil
 }
 
 func (store *OptimizerStore) Close() error {
@@ -659,6 +1171,24 @@ type schemaColumn struct {
 }
 
 var optimizerSchema = map[string][]schemaColumn{
+	"mutation_attempts": {
+		{name: "id", sqlType: "INTEGER", notNull: 1, pk: 1},
+		{name: "mac_addr", sqlType: "TEXT", notNull: 1},
+		{name: "kind", sqlType: "TEXT", notNull: 1},
+		{name: "from_frequency", sqlType: "INTEGER", notNull: 1},
+		{name: "from_core_voltage", sqlType: "INTEGER", notNull: 1},
+		{name: "target_frequency", sqlType: "INTEGER", notNull: 1},
+		{name: "target_core_voltage", sqlType: "INTEGER", notNull: 1},
+		{name: "intent_created_at", sqlType: "INTEGER", notNull: 1},
+		{name: "started_at", sqlType: "INTEGER", notNull: 1},
+		{name: "patch_requested_at", sqlType: "INTEGER", notNull: 1},
+		{name: "restart_requested_at", sqlType: "INTEGER", notNull: 1},
+		{name: "reboot_verified_at", sqlType: "INTEGER", notNull: 1},
+		{name: "completed_at", sqlType: "INTEGER", notNull: 1},
+		{name: "mining_resumed_at", sqlType: "INTEGER", notNull: 1},
+		{name: "failed_at", sqlType: "INTEGER", notNull: 1},
+		{name: "failure_stage", sqlType: "TEXT", notNull: 1},
+	},
 	"optimizer_miners": {
 		{name: "mac_addr", sqlType: "TEXT", notNull: 1, pk: 1},
 		{name: "hostname", sqlType: "TEXT", notNull: 1},
@@ -706,6 +1236,26 @@ var optimizerSchema = map[string][]schemaColumn{
 }
 
 const createOptimizerSchema = `
+CREATE TABLE mutation_attempts (
+	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+	mac_addr TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	from_frequency INTEGER NOT NULL,
+	from_core_voltage INTEGER NOT NULL,
+	target_frequency INTEGER NOT NULL,
+	target_core_voltage INTEGER NOT NULL,
+	intent_created_at INTEGER NOT NULL,
+	started_at INTEGER NOT NULL,
+	patch_requested_at INTEGER NOT NULL,
+	restart_requested_at INTEGER NOT NULL,
+	reboot_verified_at INTEGER NOT NULL,
+	completed_at INTEGER NOT NULL,
+	mining_resumed_at INTEGER NOT NULL,
+	failed_at INTEGER NOT NULL,
+	failure_stage TEXT NOT NULL
+);
+CREATE INDEX mutation_attempts_mac_started
+	ON mutation_attempts (mac_addr, started_at);
 CREATE TABLE optimizer_miners (
 	mac_addr TEXT NOT NULL PRIMARY KEY,
 	hostname TEXT NOT NULL,
@@ -751,7 +1301,7 @@ CREATE TABLE operating_points (
 	retry_after INTEGER NOT NULL,
 	PRIMARY KEY (mac_addr, frequency, core_voltage)
 );
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -913,6 +1463,27 @@ func validateStoredOptimizerData(ctx context.Context, conn *sql.Conn) error {
 			)
 		}
 	}
+
+	rows, err = conn.QueryContext(
+		ctx,
+		mutationAttemptSelect+" ORDER BY id",
+	)
+	if err != nil {
+		return err
+	}
+	attempts, err := scanMutationAttempts(rows)
+	closeErr = rows.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, attempt := range attempts {
+		if err := validateMutationAttempt(attempt, true); err != nil {
+			return fmt.Errorf("mutation attempt %d: %w", attempt.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -1058,6 +1629,135 @@ func validatePointRecord(record OperatingPointRecord) error {
 		return fmt.Errorf("error percentage is invalid")
 	default:
 		return nil
+	}
+}
+
+func validateMutationAttempt(attempt MutationAttempt, requireID bool) error {
+	normalizedMAC, macErr := normalizeMAC(attempt.MacAddr)
+	target := attempt.TargetPoint()
+	switch {
+	case requireID && attempt.ID <= 0:
+		return fmt.Errorf("ID must be positive")
+	case !requireID && attempt.ID != 0:
+		return fmt.Errorf("ID must be zero before insertion")
+	case macErr != nil || normalizedMAC != attempt.MacAddr:
+		return fmt.Errorf("MAC address is invalid or non-canonical")
+	case !validMutationKind(attempt.Kind):
+		return fmt.Errorf("mutation kind %q is invalid", attempt.Kind)
+	case !validStoredPoint(attempt.FromPoint()):
+		return fmt.Errorf("source operating point is invalid")
+	case attempt.Kind == MutationMiningConfiguration &&
+		target != (OperatingPoint{}):
+		return fmt.Errorf("mining mutation has an operating-point target")
+	case attempt.Kind != MutationMiningConfiguration &&
+		!validStoredPoint(target):
+		return fmt.Errorf("target operating point is invalid")
+	case attempt.IntentCreatedAt.IsZero():
+		return fmt.Errorf("intent timestamp is required")
+	case attempt.StartedAt.IsZero():
+		return fmt.Errorf("start timestamp is required")
+	case attempt.IntentCreatedAt.After(attempt.StartedAt):
+		return fmt.Errorf("intent timestamp is after attempt start")
+	case !orderedOptionalTime(attempt.StartedAt, attempt.PatchRequestedAt):
+		return fmt.Errorf("PATCH timestamp is before attempt start")
+	case !attempt.RestartRequestedAt.IsZero() &&
+		attempt.PatchRequestedAt.IsZero():
+		return fmt.Errorf("restart timestamp exists without PATCH timestamp")
+	case !orderedOptionalTime(
+		attempt.PatchRequestedAt,
+		attempt.RestartRequestedAt,
+	):
+		return fmt.Errorf("restart timestamp is before PATCH timestamp")
+	case !attempt.RebootVerifiedAt.IsZero() &&
+		attempt.RestartRequestedAt.IsZero():
+		return fmt.Errorf("reboot proof exists without restart timestamp")
+	case !orderedOptionalTime(
+		attempt.RestartRequestedAt,
+		attempt.RebootVerifiedAt,
+	):
+		return fmt.Errorf("reboot proof is before restart timestamp")
+	case !attempt.CompletedAt.IsZero() && attempt.RebootVerifiedAt.IsZero():
+		return fmt.Errorf("completion exists without reboot proof")
+	case !orderedOptionalTime(attempt.RebootVerifiedAt, attempt.CompletedAt):
+		return fmt.Errorf("completion is before reboot proof")
+	case !attempt.MiningResumedAt.IsZero() && attempt.CompletedAt.IsZero():
+		return fmt.Errorf("mining resume exists without completion")
+	case !orderedOptionalTime(attempt.CompletedAt, attempt.MiningResumedAt):
+		return fmt.Errorf("mining resume is before completion")
+	case attempt.FailedAt.IsZero() && attempt.FailureStage != "":
+		return fmt.Errorf("failure stage exists without failure timestamp")
+	case !attempt.FailedAt.IsZero() && attempt.FailureStage == "":
+		return fmt.Errorf("failure timestamp exists without failure stage")
+	case attempt.FailureStage != "" &&
+		!validMutationFailureStage(attempt.FailureStage):
+		return fmt.Errorf("failure stage %q is invalid", attempt.FailureStage)
+	case !attempt.FailedAt.IsZero() &&
+		attempt.FailedAt.Before(attempt.StartedAt):
+		return fmt.Errorf("failure timestamp is before attempt start")
+	case !attempt.FailedAt.IsZero() &&
+		attempt.FailedAt.Before(latestMutationProgress(attempt)):
+		return fmt.Errorf("failure timestamp is before the latest mutation milestone")
+	case !attempt.MiningResumedAt.IsZero() && !attempt.FailedAt.IsZero():
+		return fmt.Errorf("resumed mutation attempt is also failed")
+	case !attempt.CompletedAt.IsZero() &&
+		!attempt.FailedAt.IsZero() &&
+		attempt.FailureStage != MutationFailureMiningResume &&
+		attempt.FailureStage != MutationFailureMiningSuperseded:
+		return fmt.Errorf("completed mutation has invalid failure stage %q", attempt.FailureStage)
+	case !attempt.CompletedAt.IsZero() &&
+		!attempt.FailedAt.IsZero() &&
+		attempt.FailedAt.Before(attempt.CompletedAt):
+		return fmt.Errorf("post-completion failure is before completion")
+	default:
+		return nil
+	}
+}
+
+func latestMutationProgress(attempt MutationAttempt) time.Time {
+	latest := attempt.StartedAt
+	for _, candidate := range []time.Time{
+		attempt.PatchRequestedAt,
+		attempt.RestartRequestedAt,
+		attempt.RebootVerifiedAt,
+		attempt.CompletedAt,
+	} {
+		if candidate.After(latest) {
+			latest = candidate
+		}
+	}
+	return latest
+}
+
+func orderedOptionalTime(previous time.Time, current time.Time) bool {
+	return current.IsZero() || (!previous.IsZero() && !current.Before(previous))
+}
+
+func validMutationKind(kind MutationKind) bool {
+	switch kind {
+	case MutationOperatingPoint,
+		MutationSafetyRollback,
+		MutationOverheatRecovery,
+		MutationMiningConfiguration:
+		return true
+	default:
+		return false
+	}
+}
+
+func validMutationFailureStage(stage MutationFailureStage) bool {
+	switch stage {
+	case MutationFailureInterrupted,
+		MutationFailureCanceled,
+		MutationFailurePreflight,
+		MutationFailurePatch,
+		MutationFailureRestart,
+		MutationFailureRebootVerification,
+		MutationFailureCompletion,
+		MutationFailureMiningResume,
+		MutationFailureMiningSuperseded:
+		return true
+	default:
+		return false
 	}
 }
 

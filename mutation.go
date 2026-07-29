@@ -59,6 +59,7 @@ type mutationCoordinator struct {
 	startupIndex       int
 	startupHealth      map[string]int
 	startupHealthSince map[string]time.Time
+	resumeHealth       map[string]mutationResumeHealth
 	startupBlocked     string
 	gateOpen           bool
 	reapply            map[string]bool
@@ -75,35 +76,43 @@ type mutationCoordinator struct {
 }
 
 type activeMutation struct {
-	id     uint64
-	kind   lib.MutationKind
-	point  lib.OperatingPoint
-	normal bool
-	cancel context.CancelFunc
+	id        uint64
+	attemptID int64
+	kind      lib.MutationKind
+	point     lib.OperatingPoint
+	normal    bool
+	cancel    context.CancelFunc
 }
 
 type mutationRequest struct {
-	id       uint64
-	macAddr  string
-	hostname string
-	ip       string
-	kind     lib.MutationKind
-	point    lib.OperatingPoint
-	info     lib.Info
-	settings lib.Settings
+	id        uint64
+	attemptID int64
+	macAddr   string
+	hostname  string
+	ip        string
+	kind      lib.MutationKind
+	point     lib.OperatingPoint
+	info      lib.Info
+	settings  lib.Settings
 
 	primaryPassword  string
 	fallbackPassword string
 }
 
 type mutationResult struct {
-	id       uint64
-	macAddr  string
-	hostname string
-	kind     lib.MutationKind
-	point    lib.OperatingPoint
-	miner    lib.DiscoveredMiner
-	err      error
+	id        uint64
+	attemptID int64
+	macAddr   string
+	hostname  string
+	kind      lib.MutationKind
+	point     lib.OperatingPoint
+	miner     lib.DiscoveredMiner
+	err       error
+}
+
+type mutationResumeHealth struct {
+	attemptID int64
+	count     int
 }
 
 func newMutationCoordinator(
@@ -148,6 +157,7 @@ func newMutationCoordinator(
 		selected:           selected,
 		startupHealth:      make(map[string]int),
 		startupHealthSince: make(map[string]time.Time),
+		resumeHealth:       make(map[string]mutationResumeHealth),
 		reapply:            cloneBoolMap(reapply),
 		active:             make(map[string]*activeMutation),
 		results:            make(chan mutationResult, max(len(discovered)*2, 8)),
@@ -217,6 +227,9 @@ func (coordinator *mutationCoordinator) Advance(
 		}
 		observation.state = state
 	}
+	if err := coordinator.advanceMiningResumeLocked(observations, now); err != nil {
+		return false, err
+	}
 	coordinator.cancelSupersededLocked(observations)
 
 	pendingWithoutObservation := false
@@ -255,7 +268,9 @@ func (coordinator *mutationCoordinator) Advance(
 				continue
 			}
 			if !appliedResult && coordinator.canStartLocked(observation) {
-				coordinator.startLocked(ctx, observation, "", "")
+				if err := coordinator.startLocked(ctx, observation, "", ""); err != nil {
+					return false, err
+				}
 			}
 		}
 	}
@@ -302,7 +317,9 @@ func (coordinator *mutationCoordinator) Advance(
 		if !appliedResult &&
 			coordinator.normalActive == "" &&
 			coordinator.canStartLocked(observation) {
-			coordinator.startLocked(ctx, observation, "", "")
+			if err := coordinator.startLocked(ctx, observation, "", ""); err != nil {
+				return false, err
+			}
 		}
 		return false, nil
 	}
@@ -316,6 +333,61 @@ func (coordinator *mutationCoordinator) Advance(
 		}
 	}
 	return coordinator.gateOpen, nil
+}
+
+func (coordinator *mutationCoordinator) advanceMiningResumeLocked(
+	observations map[string]*minerObservation,
+	now time.Time,
+) error {
+	for _, macAddr := range sortedObservationMACs(observations) {
+		attempt, pending, err := coordinator.states.PendingMutationResume(macAddr)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			delete(coordinator.resumeHealth, macAddr)
+			continue
+		}
+		observation := observations[macAddr]
+		healthy := !now.Before(attempt.CompletedAt) &&
+			operatingPointFromInfo(observation.info) ==
+				observation.state.CurrentPoint() &&
+			observation.state.ObservedCount == 0 &&
+			startupHealthy(observation.info, observation.settings)
+		health := coordinator.resumeHealth[macAddr]
+		if health.attemptID != attempt.ID {
+			health = mutationResumeHealth{attemptID: attempt.ID}
+		}
+		if !healthy {
+			health.count = 0
+			coordinator.resumeHealth[macAddr] = health
+			if now.Sub(attempt.CompletedAt) >= coordinator.healthDeadline {
+				if err := coordinator.states.FailMutationAttempt(
+					attempt.ID,
+					lib.MutationFailureMiningResume,
+					now,
+				); err != nil {
+					return err
+				}
+				delete(coordinator.resumeHealth, macAddr)
+			}
+			continue
+		}
+		health.count++
+		if health.count < startupHealthyPolls {
+			coordinator.resumeHealth[macAddr] = health
+			continue
+		}
+		if err := coordinator.states.AdvanceMutationAttempt(
+			attempt.ID,
+			lib.MutationMilestoneMiningResumed,
+			now,
+		); err != nil {
+			return err
+		}
+		delete(coordinator.resumeHealth, macAddr)
+	}
+	return nil
 }
 
 func (coordinator *mutationCoordinator) advanceStartupLocked(
@@ -379,12 +451,14 @@ func (coordinator *mutationCoordinator) advanceStartupLocked(
 			return nil
 		}
 		if coordinator.canStartLocked(observation) {
-			coordinator.startLocked(
+			if err := coordinator.startLocked(
 				ctx,
 				observation,
 				primaryPassword,
 				fallbackPassword,
-			)
+			); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -508,21 +582,49 @@ func (coordinator *mutationCoordinator) startLocked(
 	observation *minerObservation,
 	primaryPassword string,
 	fallbackPassword string,
-) {
+) error {
 	kind := observation.state.PendingKind
 	point := observation.state.PendingPoint()
 	if kind == "" && observation.state.MiningPending {
 		kind = lib.MutationMiningConfiguration
 	}
 	if kind == "" {
-		return
+		return nil
+	}
+	startedAt := coordinator.now()
+	intentCreatedAt := observation.state.PendingSince
+	if intentCreatedAt.IsZero() {
+		intentCreatedAt = startedAt
+	}
+	target := point
+	if kind == lib.MutationMiningConfiguration {
+		target = lib.OperatingPoint{}
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr:           observation.state.MacAddr,
+		Kind:              kind,
+		FromFrequency:     observation.info.Frequency,
+		FromCoreVoltage:   observation.info.CoreVoltage,
+		TargetFrequency:   target.Frequency,
+		TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt:   intentCreatedAt,
+		StartedAt:         startedAt,
+	}
+	attemptID, err := coordinator.states.StartMutationAttempt(&attempt)
+	if err != nil {
+		return fmt.Errorf(
+			"persist mutation attempt for %s: %w",
+			observation.state.Hostname,
+			err,
+		)
 	}
 	coordinator.nextMutation++
 	flowContext, cancel := context.WithCancel(ctx)
 	active := &activeMutation{
-		id:    coordinator.nextMutation,
-		kind:  kind,
-		point: point,
+		id:        coordinator.nextMutation,
+		attemptID: attemptID,
+		kind:      kind,
+		point:     point,
 		normal: kind == lib.MutationOperatingPoint ||
 			kind == lib.MutationMiningConfiguration,
 		cancel: cancel,
@@ -533,6 +635,7 @@ func (coordinator *mutationCoordinator) startLocked(
 	}
 	request := mutationRequest{
 		id:               active.id,
+		attemptID:        attemptID,
 		macAddr:          observation.state.MacAddr,
 		hostname:         observation.state.Hostname,
 		ip:               observation.state.IP,
@@ -550,6 +653,7 @@ func (coordinator *mutationCoordinator) startLocked(
 		case <-ctx.Done():
 		}
 	}()
+	return nil
 }
 
 func (coordinator *mutationCoordinator) execute(
@@ -557,13 +661,24 @@ func (coordinator *mutationCoordinator) execute(
 	request mutationRequest,
 ) mutationResult {
 	result := mutationResult{
-		id:       request.id,
-		macAddr:  request.macAddr,
-		hostname: request.hostname,
-		kind:     request.kind,
-		point:    request.point,
+		id:        request.id,
+		attemptID: request.attemptID,
+		macAddr:   request.macAddr,
+		hostname:  request.hostname,
+		kind:      request.kind,
+		point:     request.point,
 	}
-	fail := func(err error) mutationResult {
+	fail := func(stage lib.MutationFailureStage, err error) mutationResult {
+		if errors.Is(err, context.Canceled) {
+			stage = lib.MutationFailureCanceled
+		}
+		if historyErr := coordinator.states.FailMutationAttempt(
+			request.attemptID,
+			stage,
+			coordinator.now(),
+		); historyErr != nil {
+			err = fmt.Errorf("%w; persist mutation failure: %v", err, historyErr)
+		}
 		result.err = redactMutationError(
 			err,
 			request.primaryPassword,
@@ -579,52 +694,76 @@ func (coordinator *mutationCoordinator) execute(
 		var err error
 		asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 		if err != nil {
-			return fail(fmt.Errorf("read advertised operating points: %w", err))
+			return fail(
+				lib.MutationFailurePreflight,
+				fmt.Errorf("read advertised operating points: %w", err),
+			)
 		}
 		if asic.ASICModel != supportedASICModel ||
 			!operatingPointAdvertised(asic, request.point) {
-			return fail(fmt.Errorf("pending operating point is not advertised by the supported ASIC"))
+			return fail(
+				lib.MutationFailurePreflight,
+				fmt.Errorf("pending operating point is not advertised by the supported ASIC"),
+			)
 		}
 	}
 	preflight, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
 	if err != nil {
-		return fail(fmt.Errorf("pre-PATCH information read failed: %w", err))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("pre-PATCH information read failed: %w", err),
+		)
 	}
 	preflightObservedAt := coordinator.now()
 	if err := validateMutationIdentity(preflight, request.macAddr); err != nil {
-		return fail(err)
+		return fail(lib.MutationFailurePreflight, err)
 	}
 	if operatingPointFromInfo(preflight) != operatingPointFromInfo(request.info) {
-		return fail(fmt.Errorf("operating point changed before PATCH"))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("operating point changed before PATCH"),
+		)
 	}
 	if request.kind == lib.MutationMiningConfiguration &&
 		!sameMiningReadback(preflight, request.info) {
-		return fail(fmt.Errorf("readable mining settings changed before PATCH"))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("readable mining settings changed before PATCH"),
+		)
 	}
 	current, err := coordinator.states.LoadMiner(request.macAddr)
 	if err != nil {
-		return fail(err)
+		return fail(lib.MutationFailurePreflight, err)
 	}
 	if !mutationStillPending(current, request) {
-		return fail(fmt.Errorf("durable mutation intent changed before PATCH"))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("durable mutation intent changed before PATCH"),
+		)
 	}
 	if request.kind != lib.MutationOverheatRecovery &&
 		(preflight.OverHeatMode != 0 || knownFirmwareTripExceeded(preflight)) {
 		if len(asic.FrequencyOptions) == 0 || len(asic.VoltageOptions) == 0 {
 			asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 			if err != nil {
-				return fail(fmt.Errorf(
-					"read advertised operating points for emergency supersession: %w",
-					err,
-				))
+				return fail(
+					lib.MutationFailurePreflight,
+					fmt.Errorf(
+						"read advertised operating points for emergency supersession: %w",
+						err,
+					),
+				)
 			}
 		}
 		if asic.ASICModel != supportedASICModel {
-			return fail(fmt.Errorf("emergency supersession ASIC identity is unsupported"))
+			return fail(
+				lib.MutationFailurePreflight,
+				fmt.Errorf("emergency supersession ASIC identity is unsupported"),
+			)
 		}
 		minimum, err := minimumAdvertisedPoint(asic)
 		if err != nil {
-			return fail(err)
+			return fail(lib.MutationFailurePreflight, err)
 		}
 		assessment := assessInstantaneousSafety(
 			preflight,
@@ -641,13 +780,19 @@ func (coordinator *mutationCoordinator) execute(
 			assessment,
 			false,
 		); err != nil {
-			return fail(err)
+			return fail(lib.MutationFailurePreflight, err)
 		}
 		if err := coordinator.states.SaveMiner(&current); err != nil {
-			return fail(fmt.Errorf("persist preflight emergency supersession: %w", err))
+			return fail(
+				lib.MutationFailurePreflight,
+				fmt.Errorf("persist preflight emergency supersession: %w", err),
+			)
 		}
 		coordinator.reset(request.macAddr)
-		return fail(fmt.Errorf("preflight emergency superseded the pending mutation"))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("preflight emergency superseded the pending mutation"),
+		)
 	}
 	if err := coordinator.validateMutationPreflight(
 		preflight,
@@ -655,9 +800,19 @@ func (coordinator *mutationCoordinator) execute(
 		current,
 		asic,
 	); err != nil {
-		return fail(err)
+		return fail(lib.MutationFailurePreflight, err)
 	}
 	request.info = preflight
+	if err := coordinator.states.AdvanceMutationAttempt(
+		request.attemptID,
+		lib.MutationMilestonePatchRequested,
+		coordinator.now(),
+	); err != nil {
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("persist pre-PATCH mutation milestone: %w", err),
+		)
+	}
 
 	switch request.kind {
 	case lib.MutationOperatingPoint,
@@ -669,7 +824,10 @@ func (coordinator *mutationCoordinator) execute(
 			err = coordinator.devices.PatchOperatingPoint(ctx, request.point, request.ip)
 		}
 		if err != nil {
-			return fail(fmt.Errorf("operating-point PATCH failed: %w", err))
+			return fail(
+				lib.MutationFailurePatch,
+				fmt.Errorf("operating-point PATCH failed: %w", err),
+			)
 		}
 	case lib.MutationMiningConfiguration:
 		err = coordinator.devices.PatchMiningConfiguration(
@@ -680,15 +838,34 @@ func (coordinator *mutationCoordinator) execute(
 			request.ip,
 		)
 		if err != nil {
-			return fail(fmt.Errorf("mining configuration PATCH failed: %w", err))
+			return fail(
+				lib.MutationFailurePatch,
+				fmt.Errorf("mining configuration PATCH failed: %w", err),
+			)
 		}
 	default:
-		return fail(fmt.Errorf("unsupported mutation kind %q", request.kind))
+		return fail(
+			lib.MutationFailurePreflight,
+			fmt.Errorf("unsupported mutation kind %q", request.kind),
+		)
 	}
 
 	restartRequestedAt := coordinator.now()
+	if err := coordinator.states.AdvanceMutationAttempt(
+		request.attemptID,
+		lib.MutationMilestoneRestartRequested,
+		restartRequestedAt,
+	); err != nil {
+		return fail(
+			lib.MutationFailureRestart,
+			fmt.Errorf("persist pre-restart mutation milestone: %w", err),
+		)
+	}
 	if err := coordinator.devices.Restart(ctx, request.ip); err != nil {
-		return fail(fmt.Errorf("restart request was ambiguous: %w", err))
+		return fail(
+			lib.MutationFailureRestart,
+			fmt.Errorf("restart request was ambiguous: %w", err),
+		)
 	}
 	miner, err := coordinator.waitForVerifiedBoot(
 		ctx,
@@ -697,7 +874,17 @@ func (coordinator *mutationCoordinator) execute(
 		restartRequestedAt,
 	)
 	if err != nil {
-		return fail(err)
+		return fail(lib.MutationFailureRebootVerification, err)
+	}
+	if err := coordinator.states.AdvanceMutationAttempt(
+		request.attemptID,
+		lib.MutationMilestoneRebootVerified,
+		coordinator.now(),
+	); err != nil {
+		return fail(
+			lib.MutationFailureRebootVerification,
+			fmt.Errorf("persist reboot verification milestone: %w", err),
+		)
 	}
 	result.miner = miner
 	return result
@@ -820,6 +1007,13 @@ func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
 				continue
 			}
 			if err := coordinator.completeMutationLocked(result); err != nil {
+				if historyErr := coordinator.states.FailMutationAttempt(
+					result.attemptID,
+					lib.MutationFailureCompletion,
+					coordinator.now(),
+				); historyErr != nil {
+					err = fmt.Errorf("%w; persist completion failure: %v", err, historyErr)
+				}
 				if result.kind == lib.MutationMiningConfiguration {
 					coordinator.startupBlocked = result.hostname
 				}
@@ -843,7 +1037,11 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 		lib.MutationSafetyRollback,
 		lib.MutationOverheatRecovery:
 		if state.PendingKind != result.kind || state.PendingPoint() != result.point {
-			return nil
+			return coordinator.states.FailMutationAttempt(
+				result.attemptID,
+				lib.MutationFailureCanceled,
+				coordinator.now(),
+			)
 		}
 		state.SetCurrentPoint(result.point)
 		state.ClearPendingMutation()
@@ -853,7 +1051,11 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 		}
 	case lib.MutationMiningConfiguration:
 		if !state.MiningPending {
-			return nil
+			return coordinator.states.FailMutationAttempt(
+				result.attemptID,
+				lib.MutationFailureCanceled,
+				coordinator.now(),
+			)
 		}
 		state.MiningPending = false
 	default:
@@ -872,7 +1074,11 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 	state.ObservedFrequency = 0
 	state.ObservedCoreVoltage = 0
 	state.ObservedCount = 0
-	if err := coordinator.states.SaveMiner(&state); err != nil {
+	if err := coordinator.states.CompleteMutationAttempt(
+		&state,
+		result.attemptID,
+		completedAt,
+	); err != nil {
 		return fmt.Errorf("complete mutation for %s: %w", state.Hostname, err)
 	}
 	coordinator.routes[result.macAddr] = result.miner
