@@ -245,6 +245,7 @@ func (coordinator *mutationCoordinator) Advance(
 	if err := coordinator.cancelSupersededLocked(observations, now); err != nil {
 		return false, err
 	}
+	coordinator.trackRetuneDeadlineLocked(observations, now)
 
 	pendingWithoutObservation := false
 	safetyBlocked := false
@@ -364,6 +365,7 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 	observations map[string]*minerObservation,
 	now time.Time,
 ) (bool, error) {
+	coordinator.trackRetuneDeadlineLocked(observations, now)
 	var observation *minerObservation
 	for _, candidate := range observations {
 		if candidate.info.Hostname == coordinator.retuneHost {
@@ -376,17 +378,6 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 		}
 	}
 	if observation == nil {
-		return false, nil
-	}
-	if coordinator.retuneFirstSeen.IsZero() {
-		coordinator.retuneFirstSeen = now
-	}
-	if now.Sub(coordinator.retuneFirstSeen) >= 3*time.Minute {
-		if !coordinator.retuneRefused {
-			coordinator.logger.Printf("Retune refused for %s: qualification deadline expired", coordinator.retuneHost)
-			coordinator.retuneRefused = true
-		}
-		coordinator.retuneHost = ""
 		return false, nil
 	}
 	if coordinator.normalActive != "" || len(coordinator.active) != 0 {
@@ -418,6 +409,40 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 	coordinator.retuneHealthyCount = 0
 	coordinator.retuneFirstSeen = time.Time{}
 	return true, nil
+}
+
+func (coordinator *mutationCoordinator) trackRetuneDeadlineLocked(
+	observations map[string]*minerObservation,
+	now time.Time,
+) {
+	if coordinator.retuneHost == "" {
+		return
+	}
+	var matched int
+	for _, observation := range observations {
+		if observation.info.Hostname == coordinator.retuneHost {
+			matched++
+		}
+	}
+	if matched > 1 {
+		coordinator.logger.Printf("Retune refused for %s: hostname maps to multiple observations", coordinator.retuneHost)
+		coordinator.retuneHost = ""
+		coordinator.retuneHealthyCount = 0
+		return
+	}
+	if coordinator.retuneFirstSeen.IsZero() && matched == 1 {
+		coordinator.retuneFirstSeen = now
+	}
+	if !coordinator.retuneFirstSeen.IsZero() &&
+		!now.Before(coordinator.retuneFirstSeen.Add(3*time.Minute)) {
+		if !coordinator.retuneRefused {
+			coordinator.logger.Printf("Retune refused for %s: qualification deadline expired", coordinator.retuneHost)
+			coordinator.retuneRefused = true
+		}
+		coordinator.retuneHost = ""
+		coordinator.retuneHealthyCount = 0
+		coordinator.retuneFirstSeen = time.Time{}
+	}
 }
 
 func (coordinator *mutationCoordinator) advanceMiningResumeLocked(

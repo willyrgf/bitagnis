@@ -593,8 +593,7 @@ func (store *OptimizerStore) resetOptimizationPass(
 	if state.PendingKind != "" || state.MiningPending {
 		return fmt.Errorf("start optimization pass: miner has pending mutation work")
 	}
-	if state.Phase != PhaseHold || state.HoldReason == HoldBlocked || state.HoldReason == HoldSafety ||
-		state.SafetyReason != "" || state.SettledAt.IsZero() {
+	if state.Phase != PhaseHold || state.HoldReason == HoldBlocked || state.SettledAt.IsZero() {
 		return fmt.Errorf("start optimization pass: miner is not settled in HOLD")
 	}
 	if state.CurrentPoint() != point {

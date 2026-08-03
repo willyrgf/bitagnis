@@ -439,7 +439,7 @@ func TestReopenRejectsInvalidPassReferenceSnapshot(t *testing.T) {
 	}
 }
 
-func TestResetOptimizationPassRejectsSafetyHold(t *testing.T) {
+func TestResetOptimizationPassAcceptsSettledSafetyHold(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	state.Phase = PhaseHold
@@ -454,8 +454,16 @@ func TestResetOptimizationPassRejectsSafetyHold(t *testing.T) {
 	if err := store.ResetOptimizationPass(
 		testMAC, state.CurrentPoint(), now.Add(2*time.Hour),
 		now.Add(3*time.Hour), now.Add(23*time.Hour),
-	); err == nil {
-		t.Fatal("retune was accepted from a safety-derived hold")
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != PhaseBaseline || loaded.PassTrigger != PassOperator ||
+		loaded.SafetyReason != "" || loaded.PassReferenceHash != 0 {
+		t.Fatalf("safety retune state = %+v", loaded)
 	}
 }
 

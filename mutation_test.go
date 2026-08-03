@@ -198,6 +198,66 @@ func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 	}
 }
 
+func TestRetuneDeadlineStartsOnDiscoveryAndExpiresWhileAbsent(t *testing.T) {
+	coordinator := &mutationCoordinator{
+		retuneHost: "root-test",
+		logger:     log.New(io.Discard, "", 0),
+	}
+	first := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	coordinator.trackRetuneDeadlineLocked(nil, first)
+	if !coordinator.retuneFirstSeen.IsZero() {
+		t.Fatal("retune timer started without a successful discovery")
+	}
+	observation := &minerObservation{info: lib.Info{Hostname: "root-test"}}
+	coordinator.trackRetuneDeadlineLocked(map[string]*minerObservation{"mac": observation}, first.Add(time.Hour))
+	if !coordinator.retuneFirstSeen.Equal(first.Add(time.Hour)) {
+		t.Fatalf("retune first discovery = %v", coordinator.retuneFirstSeen)
+	}
+	coordinator.trackRetuneDeadlineLocked(nil, first.Add(time.Hour+3*time.Minute))
+	if coordinator.retuneHost != "" || !coordinator.retuneFirstSeen.IsZero() || !coordinator.retuneRefused {
+		t.Fatalf("expired retune request = host:%q first:%v refused:%t", coordinator.retuneHost, coordinator.retuneFirstSeen, coordinator.retuneRefused)
+	}
+}
+
+func TestRetuneAcceptsSettledSafetyHoldAfterTwoHealthyPolls(t *testing.T) {
+	store, _, state, now := newRootMutationStore(t)
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldSafety
+	state.SafetyReason = lib.SafetyReasonASICLimit
+	state.SettledAt = now.Add(-time.Second)
+	state.RampUntil = now.Add(-time.Minute)
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	settings := rootTestSettings(t)
+	info := rootTestInfo(state.CurrentPoint(), 100)
+	asic := rootTestASIC()
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: info}}, nil,
+		state.Hostname, nil, nil, log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.retuneHost = state.Hostname
+	observations := map[string]*minerObservation{
+		state.MacAddr: {miner: lib.DiscoveredMiner{IP: state.IP, Info: info}, info: info, asic: asic, settings: settings, state: state},
+	}
+	accepted, err := coordinator.advanceRetuneLocked(observations, now)
+	if err != nil || accepted {
+		t.Fatalf("first safety retune poll = accepted:%t err:%v", accepted, err)
+	}
+	accepted, err = coordinator.advanceRetuneLocked(observations, now.Add(time.Second))
+	if err != nil || !accepted {
+		t.Fatalf("second safety retune poll = accepted:%t err:%v", accepted, err)
+	}
+	loaded, err := store.LoadMiner(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != lib.PhaseBaseline || loaded.SafetyReason != "" || loaded.PassTrigger != lib.PassOperator {
+		t.Fatalf("accepted safety retune state = %+v", loaded)
+	}
+}
+
 func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
