@@ -914,9 +914,31 @@ func (minerController *controller) verifiedSettledObservation(
 	settings lib.Settings,
 	now time.Time,
 ) bool {
-	if (state.HoldReason != lib.HoldOptimized && state.HoldReason != lib.HoldSafety) ||
-		state.Phase != lib.PhaseHold || state.SettledAt.IsZero() || !state.EvidenceDeadlineAt.IsZero() ||
-		state.PendingKind != "" || state.MiningPending || now.Before(state.RampUntil) ||
+	return qualifiesSettledObservation(minerController.states, state, info, asic, settings, now, false)
+}
+
+func qualifiesSettledObservation(
+	states optimizerStateStore,
+	state lib.MinerState,
+	info lib.Info,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+	allowManual bool,
+) bool {
+	switch state.HoldReason {
+	case lib.HoldOptimized, lib.HoldSafety:
+	case lib.HoldManual:
+		if !allowManual {
+			return false
+		}
+	default:
+		return false
+	}
+	if states == nil || state.Phase != lib.PhaseHold || state.SettledAt.IsZero() ||
+		state.RampUntil.IsZero() || now.Before(state.SettledAt) || now.Before(state.RampUntil) ||
+		now.Before(state.CooldownUntil) || !state.EvidenceDeadlineAt.IsZero() ||
+		state.PendingKind != "" || state.MiningPending ||
 		info.MacAddr != state.MacAddr || operatingPointFromInfo(info) != state.CurrentPoint() ||
 		canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, state.CurrentPoint()) ||
 		!completeSafetyTelemetry(info) || hasPowerFault(info) {
@@ -926,7 +948,7 @@ func (minerController *controller) verifiedSettledObservation(
 	if err != nil || assessInstantaneousSafety(info, settings, state.CurrentPoint(), minimum).action != safetyNormal {
 		return false
 	}
-	attempts, err := minerController.states.ListMutationAttempts(state.MacAddr)
+	attempts, err := states.ListMutationAttempts(state.MacAddr)
 	if err != nil {
 		return false
 	}
@@ -935,20 +957,27 @@ func (minerController *controller) verifiedSettledObservation(
 			return false
 		}
 	}
-	if state.HoldReason == lib.HoldSafety {
+	switch state.HoldReason {
+	case lib.HoldSafety:
 		return state.SafetyReason != ""
-	}
-	if state.SafetyReason != "" {
+	case lib.HoldManual:
+		return state.SafetyReason == ""
+	case lib.HoldOptimized:
+		if state.SafetyReason != "" {
+			return false
+		}
+		records, err := states.ListPoints(state.MacAddr)
+		if err != nil {
+			return false
+		}
+		selected, selectedOK := selectFinalPoint(records, asic, settings)
+		best, bestOK := selectBestPoint(records, asic, settings)
+		return selectedOK && bestOK && selected.Point() == state.CurrentPoint() &&
+			selected.Status == lib.PointValidated && best.MedianHash == state.BestHashRate &&
+			best.Point() == state.BestPoint()
+	default:
 		return false
 	}
-	records, err := minerController.states.ListPoints(state.MacAddr)
-	if err != nil {
-		return false
-	}
-	selected, ok := selectFinalPoint(records, asic, settings)
-	best, bestOK := selectBestPoint(records, asic, settings)
-	return ok && bestOK && selected.Point() == state.CurrentPoint() && selected.Status == lib.PointValidated &&
-		best.MedianHash == state.BestHashRate && best.Point() == state.BestPoint()
 }
 
 func (minerController *controller) pollMinerSafely(

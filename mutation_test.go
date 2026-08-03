@@ -147,6 +147,90 @@ func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 	}
 }
 
+func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
+	store, _, state, now := newRootMutationStore(t)
+	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
+	record.EnteredAt = now
+	record.MeasuredAt = now.Add(time.Minute)
+	record.ReferenceHash = 0
+	if err := store.FinalizeBaseline(&state, record, false, record.MeasuredAt); err != nil {
+		t.Fatal(err)
+	}
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldOptimized
+	state.SettledAt = now.Add(-time.Second)
+	state.RampUntil = now.Add(-time.Minute)
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	settings := rootTestSettings(t)
+	info := rootTestInfo(state.CurrentPoint(), 100)
+	asic := rootTestASIC()
+	if !qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
+		t.Fatal("verified optimized hold was rejected")
+	}
+	state.RampUntil = now.Add(time.Minute)
+	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
+		t.Fatal("retune qualification ignored an active ramp")
+	}
+	state.RampUntil = now.Add(-time.Minute)
+	state.SetBestPoint(lib.OperatingPoint{Frequency: 550, CoreVoltage: 1000})
+	state.BestHashRate = 200
+	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
+		t.Fatal("retune qualification ignored a stronger non-selected validated point")
+	}
+
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: info}}, nil,
+		state.Hostname, nil, nil, log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.now = func() time.Time { return now }
+	coordinator.retuneHost = state.Hostname
+	accepted, err := coordinator.advanceRetuneLocked(map[string]*minerObservation{
+		state.MacAddr: {miner: lib.DiscoveredMiner{IP: state.IP, Info: info}, info: info, asic: asic, settings: settings, state: state},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted || coordinator.retuneHealthyCount != 0 {
+		t.Fatal("retune advanced from an unverified final selection")
+	}
+}
+
+func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
+	store, settings, state, now := newRootMutationStore(t)
+	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
+	record.EnteredAt = now
+	record.MeasuredAt = now.Add(time.Minute)
+	record.ReferenceHash = 0
+	if err := store.FinalizeBaseline(&state, record, false, record.MeasuredAt); err != nil {
+		t.Fatal(err)
+	}
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldOptimized
+	state.SettledAt = now
+	state.RampUntil = now.Add(-time.Minute)
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	controller := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	offGrid := lib.OperatingPoint{Frequency: 500, CoreVoltage: 1000}
+	if err := controller.observeExternalPoint(&state, offGrid, rootTestASIC(), settings, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if state.CurrentPoint() == offGrid || state.ObservedCount != 1 {
+		t.Fatalf("first off-grid observation = %+v", state)
+	}
+	if err := controller.observeExternalPoint(&state, offGrid, rootTestASIC(), settings, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if state.CurrentPoint() != offGrid || state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldBlocked {
+		t.Fatalf("second off-grid observation = %+v", state)
+	}
+}
+
 func TestPostRediscoveryASICReadUsesTheRediscoveredIP(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}

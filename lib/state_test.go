@@ -382,6 +382,19 @@ func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
 	}
 }
 
+func TestUnsettledManualHoldPersistsWithoutEvidenceDeadline(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldManual
+	state.SettledAt = time.Time{}
+	state.EvidenceDeadlineAt = time.Time{}
+	state.RampUntil = now
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatalf("unsettled manual hold: %v", err)
+	}
+}
+
 func TestReopenRejectsInvalidPassReferenceSnapshot(t *testing.T) {
 	cases := []struct {
 		name   string

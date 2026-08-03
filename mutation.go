@@ -393,25 +393,9 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 		return false, nil
 	}
 	state := observation.state
-	if state.Phase != lib.PhaseHold || state.HoldReason == lib.HoldBlocked || state.HoldReason == lib.HoldSafety ||
-		state.SafetyReason != "" || state.SettledAt.IsZero() ||
-		state.PendingKind != "" || state.MiningPending || now.Before(state.CooldownUntil) ||
-		state.Phase == lib.PhaseOverheat || state.SafetyReason == lib.SafetyReasonFirmwareOverheat ||
-		state.SafetyReason == lib.SafetyReasonFirmwareTrip || state.SafetyReason == lib.SafetyReasonMutationUncertain {
-		coordinator.retuneHealthyCount = 0
-		return false, nil
-	}
-	if observation.info.MacAddr != state.MacAddr || operatingPointFromInfo(observation.info) != state.CurrentPoint() ||
-		canonicalASICGrid(observation.asic) != nil || !operatingPointAdvertised(observation.asic, operatingPointFromInfo(observation.info)) ||
-		!startupHealthy(observation.info, observation.settings) {
-		coordinator.retuneHealthyCount = 0
-		return false, nil
-	}
-	attempt, unfinished, err := coordinator.states.UnfinishedMutationAttempt(state.MacAddr)
-	if err != nil {
-		return false, err
-	}
-	if unfinished || attempt.ID != 0 {
+	if !qualifiesSettledObservation(
+		coordinator.states, state, observation.info, observation.asic, observation.settings, now, true,
+	) || !startupHealthy(observation.info, observation.settings) {
 		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}

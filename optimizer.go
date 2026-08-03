@@ -407,6 +407,16 @@ func (minerController *controller) observeExternalPoint(
 		return nil
 	}
 	if canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, livePoint) {
+		if state.ObservedFrequency == livePoint.Frequency && state.ObservedCoreVoltage == livePoint.CoreVoltage {
+			state.ObservedCount++
+		} else {
+			state.ObservedFrequency = livePoint.Frequency
+			state.ObservedCoreVoltage = livePoint.CoreVoltage
+			state.ObservedCount = 1
+		}
+		if state.ObservedCount < manualConfirmationPolls {
+			return minerController.states.SaveMiner(state)
+		}
 		state.SetCurrentPoint(livePoint)
 		state.ObservedFrequency = 0
 		state.ObservedCoreVoltage = 0
