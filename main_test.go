@@ -411,6 +411,8 @@ type scriptedMutationDevice struct {
 	target       lib.Info
 	patched      bool
 	restarted    bool
+	infoCalls    int
+	asicCalls    int
 	patchCount   int
 	restartCount int
 	restartErr   error
@@ -430,6 +432,7 @@ func (device *stagedReadbackMutationDevice) GetSystemInfo(context.Context, strin
 }
 
 func (device *scriptedMutationDevice) GetSystemInfo(context.Context, string) (lib.Info, error) {
+	device.infoCalls++
 	if device.patched {
 		return device.target, nil
 	}
@@ -437,6 +440,7 @@ func (device *scriptedMutationDevice) GetSystemInfo(context.Context, string) (li
 }
 
 func (device *scriptedMutationDevice) GetASICSettings(context.Context, string) (lib.ASICSettings, error) {
+	device.asicCalls++
 	return device.asic, nil
 }
 
@@ -571,6 +575,101 @@ func TestReopenedConfiguredStageUsesItsOwnDeadline(t *testing.T) {
 	}
 	if device.patchCount != 0 || device.restartCount != 1 {
 		t.Fatalf("reopened hardware requests patch/restart = %d/%d", device.patchCount, device.restartCount)
+	}
+}
+
+func TestReopenedPatchStageOwnsConfiguredReadbackDeadline(t *testing.T) {
+	startedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	device := &scriptedMutationDevice{
+		asic:   rootTestASIC(),
+		source: rootTestInfo(target, 100),
+		target: rootTestInfo(target, 100),
+	}
+	coordinator := newMutationCoordinator(
+		device, nil, lib.SettingsFile{}, nil, nil, "", nil, nil,
+		log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.now = func() time.Time { return startedAt.Add(defaultRebootDeadline) }
+	result := coordinator.execute(context.Background(), mutationRequest{
+		macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
+		point: target, settings: rootTestSettings(t), attempt: lib.MutationAttempt{
+			MacAddr: rootTestMAC, Kind: lib.MutationOperatingPoint,
+			FromFrequency: 525, FromCoreVoltage: 1150,
+			TargetFrequency: 525, TargetCoreVoltage: 1100,
+			IntentCreatedAt: startedAt, StartedAt: startedAt,
+			PatchRequestedAt: startedAt, ConfiguredVerifiedUptimeSeconds: -1,
+		},
+	})
+	if result.err == nil || result.failureStage != lib.MutationFailureConfiguredVerification {
+		t.Fatalf("expired configured stage result = %+v", result)
+	}
+	if device.asicCalls != 0 || device.infoCalls != 0 {
+		t.Fatalf("expired configured stage re-ran preflight: ASIC=%d info=%d", device.asicCalls, device.infoCalls)
+	}
+}
+
+func TestConfiguredReadbackAfterDeadlineIsNotAccepted(t *testing.T) {
+	settings := rootTestSettings(t)
+	startedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	device := &scriptedMutationDevice{source: rootTestInfo(target, 100), target: rootTestInfo(target, 100)}
+	nowCalls := 0
+	coordinator := &mutationCoordinator{
+		devices: device,
+		now: func() time.Time {
+			nowCalls++
+			if nowCalls == 1 {
+				return startedAt
+			}
+			return startedAt.Add(defaultRebootDeadline)
+		},
+	}
+	info, terminal, err := coordinator.waitForConfiguredReadback(
+		context.Background(),
+		mutationRequest{
+			macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
+			point: target, settings: settings,
+		},
+		startedAt,
+	)
+	if err == nil || !terminal || info.MacAddr != rootTestMAC {
+		t.Fatalf("late configured readback = info:%+v terminal:%t err:%v", info, terminal, err)
+	}
+}
+
+func TestVerifiedBootAfterDeadlineIsNotAccepted(t *testing.T) {
+	settings := rootTestSettings(t)
+	restartAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	configuredAt := restartAt.Add(-time.Second)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	device := &scriptedMutationDevice{asic: rootTestASIC()}
+	nowCalls := 0
+	coordinator := &mutationCoordinator{
+		devices: device,
+		discover: func(context.Context, string) (lib.DiscoveredMiner, error) {
+			info := rootTestInfo(target, 1)
+			return lib.DiscoveredMiner{IP: "192.0.2.12", Info: info}, nil
+		},
+		rebootDeadline: defaultRebootDeadline,
+		now: func() time.Time {
+			nowCalls++
+			if nowCalls <= 2 {
+				return restartAt
+			}
+			return restartAt.Add(defaultRebootDeadline)
+		},
+	}
+	miner, _, err := coordinator.waitForVerifiedBoot(
+		context.Background(),
+		mutationRequest{
+			macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
+			point: target, settings: settings, bootProofSameProcess: true,
+		},
+		100, configuredAt, restartAt,
+	)
+	if err == nil || miner.Info.MacAddr != rootTestMAC {
+		t.Fatalf("late reboot proof = miner:%+v err:%v", miner, err)
 	}
 }
 

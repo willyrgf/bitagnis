@@ -91,6 +91,62 @@ func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 	}
 }
 
+func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
+	store, _, state, now := newRootMutationStore(t)
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state.Phase = lib.PhaseCooldown
+	state.SafetyReason = lib.SafetyReasonASICLimit
+	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
+	state.CooldownUntil = now
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: lib.MutationSafetyRollback, Reason: state.SafetyReason,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
+		IntentCreatedAt: now, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	attemptID, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAt := now.Add(time.Second)
+	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestonePatchRequested, patchAt); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := store.ListMutationAttempts(state.MacAddr)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("safety attempt = %+v, %v", attempts, err)
+	}
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{}, nil, nil, "", nil, nil,
+		log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.now = func() time.Time { return now.Add(time.Minute) }
+	result := mutationResult{
+		attemptID: attemptID, macAddr: state.MacAddr, hostname: state.Hostname,
+		kind: lib.MutationSafetyRollback, point: minimum,
+		failureStage:        lib.MutationFailureConfiguredVerification,
+		readbackUnavailable: true,
+	}
+	if err := coordinator.handleTerminalMutationFailureLocked(result, attempts[0]); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadMiner(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PendingKind != lib.MutationSafetyRollback || loaded.PendingPoint() != minimum ||
+		loaded.Phase != lib.PhaseCooldown || loaded.SafetyReason != lib.SafetyReasonASICLimit {
+		t.Fatalf("safety obligation was cleared: %+v", loaded)
+	}
+	closed, err := store.ListMutationAttempts(state.MacAddr)
+	if err != nil || len(closed) != 1 || closed[0].FailureStage != lib.MutationFailureConfiguredVerification {
+		t.Fatalf("closed safety attempt = %+v, %v", closed, err)
+	}
+}
+
 func TestPostRediscoveryASICReadUsesTheRediscoveredIP(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}

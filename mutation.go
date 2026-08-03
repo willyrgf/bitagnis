@@ -968,12 +968,11 @@ func (coordinator *mutationCoordinator) execute(
 	}
 
 	var asic lib.ASICSettings
-	// Once restart_requested is durable, the pre-restart readback stage is
-	// complete. The device may be unavailable while the already-issued restart
-	// takes effect, so resume directly at reboot proof and let that stage own
-	// its absolute deadline.
-	preRestartStages := request.attempt.RestartRequestedAt.IsZero()
-	if preRestartStages && (request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery) {
+	// Once PATCH is durable, preflight is complete. The device may be
+	// unavailable while configured readback or the already-issued restart is
+	// reconciled, so each durable stage must own its absolute deadline.
+	prePatchStage := request.attempt.PatchRequestedAt.IsZero()
+	if prePatchStage && (request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery) {
 		var err error
 		asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 		if err != nil {
@@ -989,7 +988,7 @@ func (coordinator *mutationCoordinator) execute(
 			return terminal(lib.MutationFailurePreflight, fmt.Errorf("pending operating point is not advertised by the supported ASIC"))
 		}
 	}
-	if preRestartStages {
+	if prePatchStage {
 		preflight, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
 		if err != nil {
 			if coordinator.entryPreflightExpired(request) {
@@ -1055,7 +1054,7 @@ func (coordinator *mutationCoordinator) execute(
 		request.info = preflight
 	}
 
-	if preRestartStages && request.attempt.PatchRequestedAt.IsZero() {
+	if prePatchStage {
 		patchAt := coordinator.now()
 		if err := coordinator.states.AdvanceMutationAttempt(request.attemptID, lib.MutationMilestonePatchRequested, patchAt); err != nil {
 			return open(lib.MutationFailurePreflight, fmt.Errorf("persist PATCH milestone: %w", err))
@@ -1190,8 +1189,17 @@ func (coordinator *mutationCoordinator) waitForConfiguredReadback(
 		if err := ctx.Err(); err != nil {
 			return lib.Info{}, false, err
 		}
+		if !coordinator.now().Before(deadline) {
+			if lastErr != nil {
+				return lib.Info{}, true, fmt.Errorf("configured readback deadline expired: %w", lastErr)
+			}
+			return lib.Info{}, true, fmt.Errorf("configured readback deadline expired")
+		}
 		info, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
 		if err == nil {
+			if !coordinator.now().Before(deadline) {
+				return info, true, fmt.Errorf("configured readback deadline expired after response")
+			}
 			if identityErr := validateMutationIdentity(info, request.macAddr); identityErr != nil {
 				return info, true, identityErr
 			}
@@ -1321,6 +1329,12 @@ func (coordinator *mutationCoordinator) waitForVerifiedBoot(
 		if err := ctx.Err(); err != nil {
 			return lib.DiscoveredMiner{}, lib.ASICSettings{}, err
 		}
+		if !coordinator.now().Before(deadline) {
+			if lastErr != nil {
+				return lastMiner, lastASIC, fmt.Errorf("reboot verification deadline expired: %w", lastErr)
+			}
+			return lastMiner, lastASIC, fmt.Errorf("reboot verification deadline expired")
+		}
 		miner, err := coordinator.discover(ctx, request.macAddr)
 		if err == nil {
 			lastMiner = miner
@@ -1356,8 +1370,14 @@ func (coordinator *mutationCoordinator) waitForVerifiedBoot(
 					time.Duration(configuredUptime)*time.Second-rebootUptimeTolerance
 			}
 			if booted {
+				if !coordinator.now().Before(deadline) {
+					return miner, lastASIC, fmt.Errorf("reboot verification deadline expired after boot proof")
+				}
 				if verifyErr := verifyConfiguredReadback(request, miner.Info); verifyErr != nil {
 					return miner, lastASIC, verifyErr
+				}
+				if !coordinator.now().Before(deadline) {
+					return miner, lastASIC, fmt.Errorf("reboot verification deadline expired after readback")
 				}
 				return miner, lastASIC, nil
 			}
@@ -1439,7 +1459,8 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 	result mutationResult,
 	attempt lib.MutationAttempt,
 ) error {
-	if result.readbackUnavailable {
+	if result.readbackUnavailable &&
+		result.kind != lib.MutationSafetyRollback && result.kind != lib.MutationOverheatRecovery {
 		state, err := coordinator.states.LoadMiner(result.macAddr)
 		if err != nil {
 			return err
