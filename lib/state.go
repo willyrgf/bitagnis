@@ -1049,6 +1049,9 @@ func (store *OptimizerStore) FailMutationAndFinalizeTrial(
 	if attempt.MacAddr != durable.MacAddr || attempt.Kind != MutationOperatingPoint {
 		return fmt.Errorf("fail mutation and finalize trial: attempt does not belong to operating-point trial")
 	}
+	if record.EntryAttemptID != id || record.Point() != attempt.TargetPoint() {
+		return fmt.Errorf("fail mutation and finalize trial: record does not belong to attempt")
+	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage != stage {
 			return fmt.Errorf("fail mutation and finalize trial: attempt already failed at %q", attempt.FailureStage)
@@ -4440,6 +4443,13 @@ func validatePointRecord(record OperatingPointRecord) error {
 			record.P95Power != 0 || record.ErrorPercent != nil ||
 			record.AcceptedDelta != 0 || record.RejectedDelta != 0):
 		return fmt.Errorf("unobservable point has terminal evidence")
+	case record.Status == PointValidated &&
+		(!finite(record.MedianHash) || record.MedianHash <= 0 ||
+			!finite(record.MeanTemp) || record.MeanTemp <= 0 ||
+			!finite(record.P95Temp) || record.P95Temp <= 0 ||
+			!finite(record.P95VRTemp) || record.P95VRTemp <= 0 ||
+			!finite(record.P95Power) || record.P95Power <= 0):
+		return fmt.Errorf("validated point lacks complete positive evidence")
 	case record.Status != PointEntered && record.EnteredAt.IsZero():
 		return fmt.Errorf("terminal point has no entry timestamp")
 	case record.Status != PointEntered && record.EntryAttemptID == 0 && record.ReferenceHash != 0:

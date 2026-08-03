@@ -188,6 +188,21 @@ func TestFinalSelectionRejectsOffGridAdvertisedPoint(t *testing.T) {
 	}
 }
 
+func TestSafetyAuthoritiesRequirePositiveEvidence(t *testing.T) {
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	point := lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}
+	failed := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	zeroHash := rootRecord(rootTestMAC, point, 0, 55, 18, 70)
+	if rollbackRecordEligible(zeroHash, failed, asic, settings) {
+		t.Fatal("rollback selected a point without positive hash evidence")
+	}
+	zeroPower := rootRecord(rootTestMAC, point, 100, 55, 0, 70)
+	if _, ok := selectFinalPoint([]lib.OperatingPointRecord{zeroPower}, asic, settings); ok {
+		t.Fatal("final selection accepted zero power evidence")
+	}
+}
+
 func TestEntryMarginRejectsInvalidFrozenEvidence(t *testing.T) {
 	controller := &controller{}
 	entry := rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}, 100, 55, 18, 70)

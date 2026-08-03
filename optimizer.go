@@ -1580,9 +1580,13 @@ func rollbackRecordEligible(record lib.OperatingPointRecord, failedPoint lib.Ope
 	return record.Status == lib.PointValidated && record.EntryAttemptID >= 0 && record.Point() != failedPoint &&
 		lib.IsCanonicalOperatingPoint(record.Point()) && operatingPointAdvertised(asic, record.Point()) &&
 		strictlyDeescalates(record.Point(), failedPoint) &&
-		record.P95Temp > 0 && record.P95Temp < settings.TargetTemp && record.P95Power > 0 &&
+		finite(record.MedianHash) && record.MedianHash > 0 && finite(record.MeanTemp) && record.MeanTemp > 0 &&
+		finite(record.P95Temp) && record.P95Temp > 0 && record.P95Temp < settings.TargetTemp &&
+		finite(record.P95Power) && record.P95Power > 0 &&
 		record.P95Power <= settings.MaxPower-powerHeadroom && record.P95VRTemp > 0 &&
-		record.P95VRTemp <= settings.VRTempHigh*vrExplorationFactor
+		finite(record.P95VRTemp) && record.P95VRTemp <= settings.VRTempHigh*vrExplorationFactor &&
+		(record.ErrorPercent == nil ||
+			(finite(*record.ErrorPercent) && *record.ErrorPercent >= 0 && *record.ErrorPercent <= 100))
 }
 
 func minimumAdvertisedPoint(asic lib.ASICSettings) (lib.OperatingPoint, error) {
@@ -1848,9 +1852,10 @@ func feasibleFinalPoints(records []lib.OperatingPointRecord, asic lib.ASICSettin
 		if record.Status == lib.PointValidated && lib.IsCanonicalOperatingPoint(record.Point()) &&
 			operatingPointAdvertised(asic, record.Point()) &&
 			finite(record.MedianHash) && record.MedianHash > 0 &&
-			finite(record.P95Temp) && record.P95Temp >= 0 && record.P95Temp <= settings.TempLimit &&
-			finite(record.P95Power) && record.P95Power >= 0 && record.P95Power < settings.MaxPower &&
-			finite(record.P95VRTemp) && record.P95VRTemp >= 0 && record.P95VRTemp < settings.VRTempHigh &&
+			finite(record.MeanTemp) && record.MeanTemp > 0 &&
+			finite(record.P95Temp) && record.P95Temp > 0 && record.P95Temp <= settings.TempLimit &&
+			finite(record.P95Power) && record.P95Power > 0 && record.P95Power < settings.MaxPower &&
+			finite(record.P95VRTemp) && record.P95VRTemp > 0 && record.P95VRTemp < settings.VRTempHigh &&
 			qualityHealthy(windowSummary{MedianHash: record.MedianHash, ErrorPercent: record.ErrorPercent}, settings) {
 			feasible = append(feasible, record)
 		}

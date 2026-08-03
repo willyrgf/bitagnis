@@ -194,6 +194,16 @@ func TestUnobservablePointCannotPersistEvidence(t *testing.T) {
 	if err := validatePointRecord(record); err == nil {
 		t.Fatal("unobservable point with evidence was accepted")
 	}
+	validated := record
+	validated.Status = PointValidated
+	validated.MedianHash = 0
+	validated.MeanTemp = 55
+	validated.P95Temp = 55
+	validated.P95VRTemp = 70
+	validated.P95Power = 18
+	if err := validatePointRecord(validated); err == nil {
+		t.Fatal("validated point without positive hash evidence was accepted")
+	}
 }
 
 func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
@@ -637,6 +647,14 @@ func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 	}
 	record.Status = PointUnobservable
 	record.MeasuredAt = now.Add(3 * time.Minute)
+	mismatched := record
+	mismatched.EntryAttemptID = attemptID + 1
+	if err := store.FailMutationAndFinalizeTrial(
+		&state, mismatched, TrialReturn, attemptID, MutationFailurePreflight,
+		now.Add(3*time.Minute), now.Add(4*time.Minute), now.Add(24*time.Minute),
+	); err == nil {
+		t.Fatal("trial record for another attempt was accepted")
+	}
 	if err := store.FailMutationAndFinalizeTrial(
 		&state, record, TrialReturn, attemptID, MutationFailurePreflight,
 		now.Add(3*time.Minute), now.Add(4*time.Minute), now.Add(24*time.Minute),
