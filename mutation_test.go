@@ -219,6 +219,25 @@ func TestRetuneDeadlineStartsOnDiscoveryAndExpiresWhileAbsent(t *testing.T) {
 	}
 }
 
+func TestRetuneDiscoveryStartsDeadlineBeforeMetrics(t *testing.T) {
+	first := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	coordinator := &mutationCoordinator{
+		retuneHost: "root-test",
+		routes: map[string]lib.DiscoveredMiner{
+			"aa:bb:cc:dd:ee:01": {Info: lib.Info{Hostname: "root-test"}},
+		},
+		logger: log.New(io.Discard, "", 0),
+	}
+	coordinator.RecordRetuneDiscovery(first)
+	if !coordinator.retuneFirstSeen.Equal(first) {
+		t.Fatalf("retune first discovery = %v", coordinator.retuneFirstSeen)
+	}
+	coordinator.trackRetuneDeadlineLocked(nil, first.Add(3*time.Minute))
+	if coordinator.retuneHost != "" || !coordinator.retuneRefused {
+		t.Fatalf("retune deadline did not expire before metrics: host=%q refused=%t", coordinator.retuneHost, coordinator.retuneRefused)
+	}
+}
+
 func TestRetuneAcceptsSettledSafetyHoldAfterTwoHealthyPolls(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	state.Phase = lib.PhaseHold

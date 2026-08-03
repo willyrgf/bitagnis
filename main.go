@@ -216,6 +216,9 @@ func run(ctx context.Context, arguments []string) error {
 		}
 		minerController.mutations.RequireHostnames(expected)
 	}
+	if options.retune != "" {
+		minerController.mutations.RecordRetuneDiscovery(time.Now().UTC())
+	}
 	metricsPoll := time.NewTicker(defaultSettings.MetricsTime)
 	defer metricsPoll.Stop()
 	networkPoll := time.NewTicker(20 * time.Minute)

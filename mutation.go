@@ -191,6 +191,26 @@ func (coordinator *mutationCoordinator) RequireHostnames(
 	}
 }
 
+// RecordRetuneDiscovery starts the one-shot qualification clock from the
+// successful named discovery that selected this coordinator. Metrics polling
+// may be delayed or blocked; it must not extend the operator's deadline.
+func (coordinator *mutationCoordinator) RecordRetuneDiscovery(at time.Time) {
+	if coordinator == nil || at.IsZero() {
+		return
+	}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.retuneHost == "" || !coordinator.retuneFirstSeen.IsZero() {
+		return
+	}
+	for _, miner := range coordinator.routes {
+		if miner.Info.Hostname == coordinator.retuneHost {
+			coordinator.retuneFirstSeen = at
+			return
+		}
+	}
+}
+
 func (coordinator *mutationCoordinator) Routes() []lib.DiscoveredMiner {
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
