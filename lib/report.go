@@ -166,7 +166,7 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 	)
 	result.Frontier24Valid = result.Frontier24Audited &&
 		result.DuplicateEnteredTargets == 0 && result.TimeCreatedEligibility == 0
-	seenHours := make(map[int64]bool, len(input.Hourly))
+	hourlyByStart := make(map[int64]HourlyAggregate, len(input.Hourly))
 	expectedMAC := ""
 	for _, aggregate := range input.Hourly {
 		if aggregate.MacAddr == "" {
@@ -183,10 +183,10 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 		if aggregate.HourStartedAt.Location() != time.UTC || !aggregate.HourStartedAt.Equal(aggregate.HourStartedAt.Truncate(time.Hour)) {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row is not UTC")
 		}
-		if seenHours[aggregate.HourStartedAt.Unix()] {
+		hourStartedAt := aggregate.HourStartedAt.Unix()
+		if _, seen := hourlyByStart[hourStartedAt]; seen {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: duplicate hourly bucket")
 		}
-		seenHours[aggregate.HourStartedAt.Unix()] = true
 		if err := validateHourlyAggregate(aggregate); err != nil {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: %w", err)
 		}
@@ -202,7 +202,23 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 		if !segmentEnd.After(segmentStart) {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row is outside the requested scope")
 		}
-		if !segmentStart.Equal(aggregate.HourStartedAt) || !segmentEnd.Equal(hourEnd) {
+		hourlyByStart[hourStartedAt] = aggregate
+	}
+	for cursor := window.Start.Truncate(time.Hour); cursor.Before(window.End); cursor = cursor.Add(time.Hour) {
+		hourEnd := cursor.Add(time.Hour)
+		segmentStart := cursor
+		if segmentStart.Before(window.Start) {
+			segmentStart = window.Start
+		}
+		segmentEnd := hourEnd
+		if segmentEnd.After(window.End) {
+			segmentEnd = window.End
+		}
+		if !segmentEnd.After(segmentStart) {
+			continue
+		}
+		aggregate, found := hourlyByStart[cursor.Unix()]
+		if !found || !segmentStart.Equal(cursor) || !segmentEnd.Equal(hourEnd) {
 			result.UnknownGapSeconds += segmentEnd.Sub(segmentStart).Seconds()
 			continue
 		}

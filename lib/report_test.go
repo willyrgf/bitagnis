@@ -215,6 +215,24 @@ func TestSummarizeReportMinerTreatsPartialBoundaryHoursAsUnknown(t *testing.T) {
 	}
 }
 
+func TestSummarizeReportMinerTreatsMissingHourlyBucketsAsUnknown(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	metrics, err := SummarizeReportMiner(ReportMinerInput{
+		MacAddr:               testMAC,
+		PreArmSettledHashRate: 100,
+		Hourly: []HourlyAggregate{
+			{MacAddr: testMAC, HourStartedAt: start, ObservedSeconds: 3600, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(2 * time.Hour), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+		},
+	}, ReportWindow{Start: start, End: start.Add(3 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.ObservedSeconds != 7200 || metrics.UnknownGapSeconds != 3600 || metrics.ActualHashSeconds != 720000 {
+		t.Fatalf("sparse hourly accounting = %+v", metrics)
+	}
+}
+
 func TestEvaluateArmSeparatesCoverageValidityFromAcceptance(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]HourlyAggregate, 0, 168)
