@@ -252,6 +252,45 @@ func TestRetuneHealthyPollsMustBeConsecutive(t *testing.T) {
 	}
 }
 
+func TestRetuneSafetyBlockBreaksConsecutivePair(t *testing.T) {
+	store, _, state, now := newRootMutationStore(t)
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldSafety
+	state.SafetyReason = lib.SafetyReasonASICLimit
+	state.SettledAt = now.Add(-time.Second)
+	state.RampUntil = now.Add(-time.Minute)
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	info := rootTestInfo(state.CurrentPoint(), 100)
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: info}}, nil,
+		state.Hostname, nil, nil, log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.retuneHost = state.Hostname
+	observations := map[string]*minerObservation{
+		state.MacAddr: {info: info, asic: rootTestASIC(), settings: rootTestSettings(t), state: state},
+	}
+	accepted, err := coordinator.advanceRetuneLocked(observations, now)
+	if err != nil || accepted || coordinator.retuneHealthyCount != 1 {
+		t.Fatalf("first retune poll = accepted:%t count:%d err:%v", accepted, coordinator.retuneHealthyCount, err)
+	}
+	state.Phase = lib.PhaseCooldown
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
+	state.EvidenceDeadlineAt = now.Add(time.Hour)
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Advance(context.Background(), nil, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.retuneHealthyCount != 0 {
+		t.Fatalf("retune healthy count after safety block = %d", coordinator.retuneHealthyCount)
+	}
+}
+
 func TestRetuneAcceptsSettledSafetyHoldAfterTwoHealthyPolls(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	state.Phase = lib.PhaseHold
