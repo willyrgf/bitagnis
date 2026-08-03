@@ -1238,7 +1238,7 @@ func (store *OptimizerStore) AdoptExternalPoint(
 	rampUntil time.Time,
 	evidenceDeadlineAt time.Time,
 ) error {
-	if state == nil || !validCanonicalPoint(point) || attemptID <= 0 ||
+	if state == nil || !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 ||
 		at.IsZero() || rampUntil.IsZero() || evidenceDeadlineAt.IsZero() || evidenceDeadlineAt.Before(rampUntil) {
 		return fmt.Errorf("adopt external point: invalid state, point, attempt, or timing")
 	}
@@ -4076,10 +4076,6 @@ func validateStoredPhaseShape(
 	if state.Phase == PhaseHold && state.HoldReason == HoldOptimized &&
 		state.SettledAt.IsZero() && state.PendingKind == "" && state.EvidenceDeadlineAt.IsZero() && !completedUnresumed {
 		return fmt.Errorf("active hold validation has no evidence deadline")
-	}
-	if state.Phase == PhaseHold && state.HoldReason == HoldManual &&
-		state.SettledAt.IsZero() && state.PendingKind == "" && state.EvidenceDeadlineAt.IsZero() && !completedUnresumed {
-		return fmt.Errorf("active manual hold validation has no evidence deadline")
 	}
 	if (state.Phase == PhaseBaseline || state.Phase == PhaseUndervolt ||
 		state.Phase == PhaseFrequencyTest || state.Phase == PhaseVoltageTest) &&

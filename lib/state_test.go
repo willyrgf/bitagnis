@@ -184,6 +184,44 @@ func TestAutomationPersistenceRejectsOffGridAuthority(t *testing.T) {
 	}
 }
 
+func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.BestHashRate = 100
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	attemptID, err := store.AdmitTrial(
+		&state, candidate, state.CurrentPoint(), PhaseUndervolt, 100,
+		now.Add(time.Minute), now.Add(21*time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offGrid := OperatingPoint{Frequency: 500, CoreVoltage: 1000}
+	if err := store.AdoptExternalPoint(
+		&state, offGrid, attemptID, now.Add(2*time.Minute),
+		now.Add(3*time.Minute), now.Add(23*time.Minute),
+	); err != nil {
+		t.Fatalf("adopt off-grid external point: %v", err)
+	}
+	if state.CurrentPoint() != offGrid || state.Phase != PhaseHold || state.HoldReason != HoldManual {
+		t.Fatalf("off-grid manual state = %+v", state)
+	}
+	points, err := store.ListPoints(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := findTestPoint(points, offGrid); found {
+		t.Fatalf("off-grid manual point entered frontier history: %+v", points)
+	}
+	candidateRecord, found := findTestPoint(points, candidate)
+	if !found || candidateRecord.Status != PointUnobservable {
+		t.Fatalf("external candidate record = %+v", candidateRecord)
+	}
+}
+
 func TestReopenRejectsOffGridOperatingPointRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := OpenOptimizerStore(path)
