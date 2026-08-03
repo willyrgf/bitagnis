@@ -844,9 +844,9 @@ control-uplift acceptance result.
 Temperature therefore has three roles only: hard feasibility, exploration headroom, and a tie-break
 inside the measurement-equivalent band. The controller never tries to heat the ASIC up to 65°C.
 
-### Exact Schema-Version-4 Contract
+### Exact Schema-Version-5 Contract
 
-Schema version 4 replaces version 3. Opening any other nonzero version fails with an explicit
+Schema version 5 replaces versions 3 and 4. Opening any other nonzero version fails with an explicit
 incompatible-schema error; there is no migration, dual reader, or silent reinterpretation.
 
 `optimizer_miners` keeps the current canonical fields and adds:
@@ -856,6 +856,14 @@ incompatible-schema error; there is no migration, dual reader, or silent reinter
 - `pass_reference_hash REAL NOT NULL`, zero for an initial or non-validated-current pass until its
   two-window baseline validates; an optimized retune freezes the pre-reset selected row's positive
   conservative median in the reset transaction. Once positive it is frozen for the pass;
+- `pass_reference_frequency INTEGER NOT NULL`, zero when no arm snapshot exists and otherwise the
+  exact pre-reset selected frequency;
+- `pass_reference_core_voltage INTEGER NOT NULL`, zero when no arm snapshot exists and otherwise the
+  exact pre-reset selected core voltage; and
+- `pass_reference_settled_at INTEGER NOT NULL`, zero when no arm snapshot exists and otherwise the
+  durable settlement timestamp for that complete pre-reset boundary. The three point/snapshot fields
+  are either all zero or a canonical, non-sentinel pair with a positive hash and a timestamp no later
+  than the new `pass_started_at`;
 - `safety_reason TEXT NOT NULL`, empty outside `COOLDOWN`, `OVERHEAT`, and a safety-derived `HOLD`,
   and otherwise one of the finite safety reasons below even while no mutation is actuatable;
 - `hold_reason TEXT NOT NULL`, empty outside `HOLD` and exactly `optimized`, `safety`, `manual`, or
@@ -1332,7 +1340,7 @@ trial_actual_hash_seconds <= actual_hash_seconds
 Report starts are arbitrary UTC timestamps because an accepted retune records the actual
 `pass_started_at`. When a report boundary falls inside an hourly bucket, the overlapping boundary
 portion is conservatively unknown: the evaluator never invents sub-hour state history from an
-aggregate row. Report mode opens the schema-v4 database read-only and rejects missing or
+aggregate row. Report mode opens the schema-v5 database read-only and rejects missing or
 incompatible durable evidence.
 
 The first/second positive timestamps bound restart loss, while hourly actual work is the treatment
@@ -1372,10 +1380,10 @@ the AB arm while B remains in `HOLD`, then after 168 hours and renewed boundary 
 transaction's persisted `pass_started_at`; the treatment denominator is its atomically frozen
 `pass_reference_hash`, and the evaluator records the control's unchanged selected-row median at that
 same timestamp. The arm ends exactly 168 hours later and uses that same contemporaneous wall interval
-for its control. Any control point change invalidates the arm. `pass_reference_hash` preserves the
-prior selected rate across a reset, but schema v4 does not retain the prior `settled_at` timestamp;
-the report therefore leaves the control boundary gate unavailable after that reset rather than
-fabricating settlement from current rows. An inter-arm gap also discards the diagnostic snapshot.
+for its control. Any control point change invalidates the arm. Schema v5 preserves the prior selected
+point, rate, and settlement timestamp in one atomic pass-reference snapshot, so a control retuned at
+the exact arm boundary remains auditable without using its new pass rows. An inter-arm gap or a later
+retune that overwrites the snapshot discards the historical boundary evidence.
 The 24- and 48-hour checks are relative to this arm start.
 Success requires:
 
@@ -1442,11 +1450,10 @@ Resolution: replay captured credential-free summaries in deterministic tests, th
 chosen point with the 168-hour settled-control result. Changing the band or window count after that
 evidence is a new explicit policy revision, not a time-based retry.
 
-No architecture, ownership, recovery-action, retune-contract, or pass-cap uncertainty remains for
-implementation. The exact schema-v4 contract intentionally does not retain a historical control
-settlement timestamp across a point-history reset; reports expose that boundary as unavailable
-rather than claiming an accepted historical crossover. Supporting accepted AB/BA output after that
-reset is a deliberate future schema-contract change, not an inferred fallback.
+No architecture, ownership, recovery-action, retune-contract, pass-cap, or schema-boundary
+uncertainty remains for implementation. The schema-v5 snapshot is the canonical durable source for a
+historical control boundary; the report-layer cutover that consumes it is the next logical phase and
+must not infer an unavailable boundary from current state.
 
 ## Complete Cutover
 
@@ -1456,7 +1463,7 @@ The implementation must replace the current design completely:
 - retain the three current trial-purpose phases but replace candidate chaining with isolated
   admission, reserved return, and two-window promotion;
 - make `HOLD` terminal and make safety cooldown recovery lead to `HOLD`;
-- add the exact schema-v4 fields, enums, unique indexes, and atomic store operations above;
+- add the exact schema-v5 fields, enums, unique indexes, and atomic store operations above;
 - add configured post-PATCH readback and exhaustive same-attempt reconciliation;
 - stop `StartMutationAttempt` from auto-closing older work and stop completion failures from being
   marked terminal;
@@ -1491,8 +1498,11 @@ a miner.
 1. `replace timed retries with finite frontier settlement`: complete the inseparable schema,
    persistence, optimizer, mutation reconciliation, CLI, hourly accounting population, tests,
    README, and RFC cutover; delete the old retry path and reject schema v3.
-2. `report long-term optimizer economics`: add terminal rendering and multi-day queries over the
-   already-populated schema-v4 aggregates, plus their query, formatting, and simulation tests.
+2. `persist crossover boundary evidence in schema v5`: add the complete pass-reference snapshot,
+   exact schema rejection, reset capture, and reopen validation.
+3. `report long-term optimizer economics`: add terminal rendering and multi-day queries over the
+   already-populated schema-v5 aggregates, consume historical boundary snapshots, and add their
+   query, formatting, and simulation tests.
 
 ## Conclusion
 

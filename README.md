@@ -103,15 +103,24 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 4, with typed pending mutations, finite frontier
+The current schema is version 5, with typed pending mutations, finite frontier
 state, hourly accounting, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema version 3,
+`overheat_pending` field, migration, or compatibility reader. Schema versions 3
+and 4,
 an old partial database, or an unknown application object is rejected without
 modification; move it aside or remove it to create the current baseline.
 Evaluated history, cooldown, pending mutation ages, emergency episode ages,
 mutation attempts, and the bounded 384-hour hourly accounting history persist
 across ordinary restarts after that baseline is created.
+
+An optimized operator retune atomically preserves the prior selected point's
+complete frequency/voltage pair, conservative median hash, and settled
+timestamp in the pass-reference snapshot. Initial and manual passes may have
+no arm snapshot. The report reader cutover that consumes this snapshot for
+historical AB/BA control evidence is the next logical phase; until it lands,
+report mode conservatively marks that boundary unavailable rather than
+inferring it from current state.
 
 Mutation history records the mutation kind, finite reason, complete source and
 target pair, intent/start time, configured-readback and restart milestones,
@@ -322,10 +331,6 @@ post-settlement selected-point coverage, an audited first-24-hour frontier with
 no duplicate target entry or time-created eligibility, and a settled unchanged
 control. The 2% uplift is shown as a practical target. Report mode performs no
 discovery, PATCH, restart, mining reconciliation, or mutation.
-
-Schema v4 preserves the prior control rate across a retune but not its historical
-settlement timestamp; an AB/BA report therefore marks that control boundary
-unavailable after reset instead of inferring settlement from current state.
 
 Bitagnis cannot substitute for adequate cooling or a correctly sized power
 supply. AxeOS thermal protection remains the final safety layer.

@@ -539,9 +539,9 @@ func loadReportMinerInput(
 		boundaryRate := 0.0
 		boundaryReference := 0.0
 		if state.PassStartedAt.Equal(window.End) {
-			// The later reset preserves the prior selected median, but schema v4
-			// has no arm-boundary settlement timestamp. Keep the rate as a
-			// diagnostic and leave the economic boundary gate explicitly false.
+			// The schema-v5 snapshot is persisted, but this report-reader phase
+			// still defers consuming its point and settlement fields. Keep the
+			// boundary unavailable rather than inferring it from current state.
 			boundaryRate = state.PassReferenceHash
 			boundaryReference = state.PassReferenceHash
 		}

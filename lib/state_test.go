@@ -99,7 +99,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return state, now
 }
 
-func TestSchemaV4BootstrapAndReopen(t *testing.T) {
+func TestSchemaV5BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -113,7 +113,7 @@ func TestSchemaV4BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 4 {
+	if err != nil || version != 5 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -128,6 +128,160 @@ func TestSchemaV4BootstrapAndReopen(t *testing.T) {
 	loaded, err := reopened.LoadMiner(testMAC)
 	if err != nil || loaded.CurrentPoint() != state.CurrentPoint() {
 		t.Fatalf("reopened state = %+v, %v", loaded, err)
+	}
+}
+
+func TestResetOptimizationPassPersistsCompleteBoundarySnapshot(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	selected := state.CurrentPoint()
+	baseline := OperatingPointRecord{
+		MacAddr: testMAC, Frequency: selected.Frequency, CoreVoltage: selected.CoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: now.Add(10 * time.Minute), EnteredAt: now,
+	}
+	if err := store.FinalizeBaseline(&state, baseline, false, baseline.MeasuredAt); err != nil {
+		t.Fatalf("finalize baseline: %v", err)
+	}
+	settledAt := now.Add(20 * time.Minute)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldOptimized
+	state.SettledAt = settledAt
+	state.RampUntil = now
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatalf("save settled hold: %v", err)
+	}
+
+	passStart := now.Add(time.Hour)
+	if err := store.ResetOptimizationPass(
+		testMAC, selected, passStart, passStart.Add(time.Minute), passStart.Add(21*time.Minute),
+	); err != nil {
+		t.Fatalf("reset optimization pass: %v", err)
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PassReferenceHash != 100 ||
+		loaded.PassReferenceFrequency != selected.Frequency ||
+		loaded.PassReferenceCoreVoltage != selected.CoreVoltage ||
+		!loaded.PassReferenceSettledAt.Equal(settledAt) {
+		t.Fatalf("boundary snapshot = %+v", loaded)
+	}
+
+	path := storePath(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	reopenedState, err := reopened.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopenedState.PassReferenceFrequency != selected.Frequency ||
+		reopenedState.PassReferenceCoreVoltage != selected.CoreVoltage ||
+		!reopenedState.PassReferenceSettledAt.Equal(settledAt) {
+		t.Fatalf("reopened boundary snapshot = %+v", reopenedState)
+	}
+
+	mutated := reopenedState
+	mutated.PassReferenceFrequency = 400
+	mutated.PassReferenceCoreVoltage = 1000
+	mutated.PassReferenceSettledAt = passStart.Add(-time.Minute)
+	if err := reopened.SaveMiner(&mutated); err != nil {
+		t.Fatalf("ordinary save: %v", err)
+	}
+	preserved, err := reopened.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.PassReferenceFrequency != selected.Frequency ||
+		preserved.PassReferenceCoreVoltage != selected.CoreVoltage ||
+		!preserved.PassReferenceSettledAt.Equal(settledAt) {
+		t.Fatalf("ordinary save replaced boundary snapshot = %+v", preserved)
+	}
+}
+
+func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldManual
+	state.SettledAt = now.Add(time.Hour)
+	state.RampUntil = now
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	passStart := now.Add(2 * time.Hour)
+	if err := store.ResetOptimizationPass(
+		testMAC, state.CurrentPoint(), passStart, passStart.Add(time.Minute), passStart.Add(21*time.Minute),
+	); err != nil {
+		t.Fatalf("manual retune: %v", err)
+	}
+	baseline := OperatingPointRecord{
+		MacAddr: testMAC, Frequency: state.CurrentFrequency, CoreVoltage: state.CurrentCoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: passStart.Add(10 * time.Minute), EnteredAt: passStart,
+	}
+	if err := store.FinalizeBaseline(&state, baseline, false, baseline.MeasuredAt); err != nil {
+		t.Fatalf("manual baseline: %v", err)
+	}
+	if state.PassTrigger != PassOperator || state.PassReferenceHash != 0 ||
+		state.PassReferenceFrequency != 0 || state.PassReferenceCoreVoltage != 0 ||
+		!state.PassReferenceSettledAt.IsZero() {
+		t.Fatalf("manual retune created an arm snapshot: %+v", state)
+	}
+}
+
+func TestReopenRejectsInvalidPassReferenceSnapshot(t *testing.T) {
+	cases := []struct {
+		name   string
+		update string
+		args   []any
+	}{
+		{
+			name:   "operator hash without snapshot",
+			update: `UPDATE optimizer_miners SET pass_trigger = 'operator', pass_reference_hash = 100, pass_reference_frequency = 0, pass_reference_core_voltage = 0, pass_reference_settled_at = 0 WHERE mac_addr = ?`,
+			args:   []any{testMAC},
+		},
+		{
+			name:   "off-grid point",
+			update: `UPDATE optimizer_miners SET pass_trigger = 'operator', pass_reference_hash = 100, pass_reference_frequency = 500, pass_reference_core_voltage = 1000, pass_reference_settled_at = pass_started_at - 1 WHERE mac_addr = ?`,
+			args:   []any{testMAC},
+		},
+		{
+			name:   "settlement after pass start",
+			update: `UPDATE optimizer_miners SET pass_trigger = 'operator', pass_reference_hash = 100, pass_reference_frequency = 525, pass_reference_core_voltage = 1150, pass_reference_settled_at = pass_started_at + 1 WHERE mac_addr = ?`,
+			args:   []any{testMAC},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "optimizer.db")
+			store, err := OpenOptimizerStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bootstrapTestMiner(t, store)
+			if _, err := store.conn.ExecContext(context.Background(), testCase.update, testCase.args...); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenOptimizerStore(path); err == nil {
+				t.Fatal("invalid boundary snapshot was accepted")
+			}
+		})
 	}
 }
 
@@ -174,6 +328,23 @@ func TestRejectSchemaV3WithoutMigration(t *testing.T) {
 	}
 	if _, err := OpenOptimizerStore(path); err == nil {
 		t.Fatal("schema v3 was accepted")
+	}
+}
+
+func TestRejectSchemaV4WithoutMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("schema v4 was accepted")
 	}
 }
 

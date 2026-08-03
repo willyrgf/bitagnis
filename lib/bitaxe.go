@@ -72,8 +72,8 @@ type ASICSettings struct {
 // grid that Bitagnis is allowed to automate. A different advertised grid is
 // observable but never becomes an automated request authority.
 func ValidateCanonicalASICGrid(settings ASICSettings) error {
-	expectedFrequencies := []int{400, 490, 525, 550, 600, 625}
-	expectedVoltages := []int{1000, 1060, 1100, 1150, 1200, 1250}
+	expectedFrequencies := canonicalFrequencies()
+	expectedVoltages := canonicalVoltages()
 	if settings.ASICModel != "BM1370" ||
 		settings.DefaultFrequency != 525 || settings.DefaultVoltage != 1150 ||
 		!equalIntSlices(settings.FrequencyOptions, expectedFrequencies) ||
@@ -81,6 +81,21 @@ func ValidateCanonicalASICGrid(settings ASICSettings) error {
 		return fmt.Errorf("advertised ASIC grid is not the supported AxeOS v2.8.1 BM1370 grid")
 	}
 	return nil
+}
+
+// IsCanonicalOperatingPoint reports whether a point belongs to the exact
+// BM1370 automation grid accepted by Bitagnis.
+func IsCanonicalOperatingPoint(point OperatingPoint) bool {
+	return containsOption(canonicalFrequencies(), point.Frequency) &&
+		containsOption(canonicalVoltages(), point.CoreVoltage)
+}
+
+func canonicalFrequencies() []int {
+	return []int{400, 490, 525, 550, 600, 625}
+}
+
+func canonicalVoltages() []int {
+	return []int{1000, 1060, 1100, 1150, 1200, 1250}
 }
 
 func equalIntSlices(left, right []int) bool {

@@ -16,7 +16,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 4
+const optimizerSchemaVersion = 5
 
 // LongTermRetentionHours bounds the credential-free hourly accounting history.
 const LongTermRetentionHours = 384
@@ -127,14 +127,17 @@ type MinerState struct {
 	OverheatCount         int
 	CooldownUntil         time.Time
 
-	PassStartedAt      time.Time
-	PassTrigger        PassTrigger
-	PassReferenceHash  float64
-	SafetyReason       SafetyReason
-	HoldReason         HoldReason
-	SettledAt          time.Time
-	EvidenceDeadlineAt time.Time
-	AccountedThroughAt time.Time
+	PassStartedAt            time.Time
+	PassTrigger              PassTrigger
+	PassReferenceHash        float64
+	PassReferenceFrequency   int
+	PassReferenceCoreVoltage int
+	PassReferenceSettledAt   time.Time
+	SafetyReason             SafetyReason
+	HoldReason               HoldReason
+	SettledAt                time.Time
+	EvidenceDeadlineAt       time.Time
+	AccountedThroughAt       time.Time
 }
 
 func (state MinerState) CurrentPoint() OperatingPoint {
@@ -313,7 +316,7 @@ func OpenOptimizerStore(path string) (*OptimizerStore, error) {
 	return openOptimizerStore(path, false)
 }
 
-// OpenOptimizerStoreReadOnly opens an existing schema-v4 database without
+// OpenOptimizerStoreReadOnly opens an existing schema-v5 database without
 // creating, migrating, locking, or otherwise mutating it. Report mode uses
 // this path so a missing or incompatible database fails rather than changing
 // durable state.
@@ -593,6 +596,8 @@ func (store *OptimizerStore) resetOptimizationPass(
 		return fmt.Errorf("start optimization pass: current point changed")
 	}
 	passReferenceHash := 0.0
+	passReferencePoint := OperatingPoint{}
+	passReferenceSettledAt := time.Time{}
 	var unfinished int
 	if err := tx.QueryRowContext(context.Background(),
 		`SELECT COUNT(*) FROM mutation_attempts
@@ -618,6 +623,8 @@ func (store *OptimizerStore) resetOptimizationPass(
 			return fmt.Errorf("start optimization pass: optimized hold has no validated current selection")
 		}
 		passReferenceHash = medianHash
+		passReferencePoint = point
+		passReferenceSettledAt = state.SettledAt
 	}
 	if _, err := tx.ExecContext(context.Background(),
 		"DELETE FROM operating_points WHERE mac_addr = ?", macAddr); err != nil {
@@ -635,6 +642,9 @@ func (store *OptimizerStore) resetOptimizationPass(
 	state.PassStartedAt = startedAt
 	state.PassTrigger = trigger
 	state.PassReferenceHash = passReferenceHash
+	state.PassReferenceFrequency = passReferencePoint.Frequency
+	state.PassReferenceCoreVoltage = passReferencePoint.CoreVoltage
+	state.PassReferenceSettledAt = passReferenceSettledAt
 	state.SafetyReason = ""
 	state.HoldReason = ""
 	state.SettledAt = time.Time{}
@@ -1121,7 +1131,7 @@ func (store *OptimizerStore) FinalizeBaseline(
 		durable.SettledAt = time.Time{}
 		durable.EvidenceDeadlineAt = time.Time{}
 	} else {
-		if durable.PassReferenceHash == 0 && record.MedianHash > 0 {
+		if durable.PassTrigger == PassInitial && durable.PassReferenceHash == 0 && record.MedianHash > 0 {
 			durable.PassReferenceHash = record.MedianHash
 		}
 		if record.MedianHash >= durable.BestHashRate {
@@ -3102,9 +3112,16 @@ func saveMinerWithValidation(
 			pending_core_voltage, pending_since, mining_pending,
 			observed_frequency, observed_core_voltage, observed_count,
 			consecutive_bad_windows, overheat_count, cooldown_until,
-			pass_started_at, pass_trigger, pass_reference_hash, safety_reason,
+			pass_started_at, pass_trigger, pass_reference_hash,
+			pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
+			safety_reason,
 			hold_reason, settled_at, evidence_deadline_at, accounted_through_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?
+		)
 		ON CONFLICT(mac_addr) DO UPDATE SET
 			hostname = excluded.hostname,
 			ip = excluded.ip,
@@ -3133,6 +3150,12 @@ func saveMinerWithValidation(
 			pass_trigger = excluded.pass_trigger,
 			pass_reference_hash = CASE WHEN optimizer_miners.pass_reference_hash > 0 AND ?
 				THEN optimizer_miners.pass_reference_hash ELSE excluded.pass_reference_hash END,
+			pass_reference_frequency = CASE WHEN ?
+				THEN optimizer_miners.pass_reference_frequency ELSE excluded.pass_reference_frequency END,
+			pass_reference_core_voltage = CASE WHEN ?
+				THEN optimizer_miners.pass_reference_core_voltage ELSE excluded.pass_reference_core_voltage END,
+			pass_reference_settled_at = CASE WHEN ?
+				THEN optimizer_miners.pass_reference_settled_at ELSE excluded.pass_reference_settled_at END,
 			safety_reason = excluded.safety_reason,
 		hold_reason = excluded.hold_reason,
 		settled_at = excluded.settled_at,
@@ -3164,11 +3187,17 @@ func saveMinerWithValidation(
 		timeValue(state.PassStartedAt),
 		state.PassTrigger,
 		state.PassReferenceHash,
+		state.PassReferenceFrequency,
+		state.PassReferenceCoreVoltage,
+		timeValue(state.PassReferenceSettledAt),
 		state.SafetyReason,
 		state.HoldReason,
 		timeValue(state.SettledAt),
 		timeValue(state.EvidenceDeadlineAt),
 		timeValue(state.AccountedThroughAt),
+		preservePassReference,
+		preservePassReference,
+		preservePassReference,
 		preservePassReference,
 	)
 	if err != nil {
@@ -3185,7 +3214,9 @@ const minerSelect = `SELECT
 	pending_core_voltage, pending_since, mining_pending,
 		observed_frequency, observed_core_voltage, observed_count,
 		consecutive_bad_windows, overheat_count, cooldown_until,
-		pass_started_at, pass_trigger, pass_reference_hash, safety_reason,
+		pass_started_at, pass_trigger, pass_reference_hash,
+		pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
+		safety_reason,
 		hold_reason, settled_at, evidence_deadline_at, accounted_through_at
 	FROM optimizer_miners WHERE mac_addr = ?`
 
@@ -3201,6 +3232,7 @@ func queryMiner(queryer interface {
 	var cooldownUntil int64
 	var passStartedAt int64
 	var passTrigger string
+	var passReferenceSettledAt int64
 	var safetyReason string
 	var holdReason string
 	var settledAt int64
@@ -3234,6 +3266,9 @@ func queryMiner(queryer interface {
 		&passStartedAt,
 		&passTrigger,
 		&state.PassReferenceHash,
+		&state.PassReferenceFrequency,
+		&state.PassReferenceCoreVoltage,
+		&passReferenceSettledAt,
 		&safetyReason,
 		&holdReason,
 		&settledAt,
@@ -3251,6 +3286,7 @@ func queryMiner(queryer interface {
 	state.CooldownUntil = storedTime(cooldownUntil)
 	state.PassStartedAt = storedTime(passStartedAt)
 	state.PassTrigger = PassTrigger(passTrigger)
+	state.PassReferenceSettledAt = storedTime(passReferenceSettledAt)
 	state.SafetyReason = SafetyReason(safetyReason)
 	state.HoldReason = HoldReason(holdReason)
 	state.SettledAt = storedTime(settledAt)
@@ -3317,6 +3353,9 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "pass_started_at", sqlType: "INTEGER", notNull: 1},
 		{name: "pass_trigger", sqlType: "TEXT", notNull: 1},
 		{name: "pass_reference_hash", sqlType: "REAL", notNull: 1},
+		{name: "pass_reference_frequency", sqlType: "INTEGER", notNull: 1},
+		{name: "pass_reference_core_voltage", sqlType: "INTEGER", notNull: 1},
+		{name: "pass_reference_settled_at", sqlType: "INTEGER", notNull: 1},
 		{name: "safety_reason", sqlType: "TEXT", notNull: 1},
 		{name: "hold_reason", sqlType: "TEXT", notNull: 1},
 		{name: "settled_at", sqlType: "INTEGER", notNull: 1},
@@ -3412,6 +3451,9 @@ CREATE TABLE optimizer_miners (
 	pass_started_at INTEGER NOT NULL,
 	pass_trigger TEXT NOT NULL,
 	pass_reference_hash REAL NOT NULL,
+	pass_reference_frequency INTEGER NOT NULL,
+	pass_reference_core_voltage INTEGER NOT NULL,
+	pass_reference_settled_at INTEGER NOT NULL,
 	safety_reason TEXT NOT NULL,
 	hold_reason TEXT NOT NULL,
 	settled_at INTEGER NOT NULL,
@@ -3454,7 +3496,7 @@ CREATE TABLE optimizer_hourly (
 	trial_seconds REAL NOT NULL,
 	PRIMARY KEY (mac_addr, hour_started_at)
 );
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -4278,8 +4320,32 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 	case state.AccountedThroughAt.IsZero():
 		return fmt.Errorf("hourly accounting cursor is empty")
 	default:
+		return validatePassReferenceSnapshot(state)
+	}
+}
+
+func validatePassReferenceSnapshot(state MinerState) error {
+	point := OperatingPoint{
+		Frequency:   state.PassReferenceFrequency,
+		CoreVoltage: state.PassReferenceCoreVoltage,
+	}
+	hasPoint := point.Frequency != 0 || point.CoreVoltage != 0
+	hasSettlement := !state.PassReferenceSettledAt.IsZero()
+	if !hasPoint && !hasSettlement {
+		if state.PassTrigger == PassOperator && state.PassReferenceHash > 0 {
+			return fmt.Errorf("operator pass reference hash has no complete boundary snapshot")
+		}
 		return nil
 	}
+	if !hasPoint || !hasSettlement || !IsCanonicalOperatingPoint(point) ||
+		point.Frequency == 50 || !finite(state.PassReferenceHash) || state.PassReferenceHash <= 0 {
+		return fmt.Errorf("pass reference boundary snapshot is incomplete or invalid")
+	}
+	if state.PassReferenceSettledAt.UnixNano() <= 0 ||
+		state.PassReferenceSettledAt.After(state.PassStartedAt) {
+		return fmt.Errorf("pass reference settlement is outside the pass boundary")
+	}
+	return nil
 }
 
 func validatePointRecord(record OperatingPointRecord) error {
