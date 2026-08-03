@@ -968,7 +968,12 @@ func (coordinator *mutationCoordinator) execute(
 	}
 
 	var asic lib.ASICSettings
-	if request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery {
+	// Once restart_requested is durable, the pre-restart readback stage is
+	// complete. The device may be unavailable while the already-issued restart
+	// takes effect, so resume directly at reboot proof and let that stage own
+	// its absolute deadline.
+	preRestartStages := request.attempt.RestartRequestedAt.IsZero()
+	if preRestartStages && (request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery) {
 		var err error
 		asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 		if err != nil {
@@ -984,71 +989,73 @@ func (coordinator *mutationCoordinator) execute(
 			return terminal(lib.MutationFailurePreflight, fmt.Errorf("pending operating point is not advertised by the supported ASIC"))
 		}
 	}
-	preflight, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
-	if err != nil {
-		if coordinator.entryPreflightExpired(request) {
-			return terminal(lib.MutationFailurePreflight, fmt.Errorf("entry preflight deadline expired: %w", err))
-		}
-		return open(lib.MutationFailurePreflight, fmt.Errorf("pre-PATCH information read failed: %w", err))
-	}
-	if err := validateMutationIdentity(preflight, request.macAddr); err != nil {
-		return terminal(lib.MutationFailurePreflight, err)
-	}
-	current, err := coordinator.states.LoadMiner(request.macAddr)
-	if err != nil {
-		return open(lib.MutationFailurePreflight, err)
-	}
-	if !mutationStillPending(current, request) {
-		return terminal(lib.MutationFailurePreflight, fmt.Errorf("durable mutation intent changed before PATCH"))
-	}
-	if request.kind == lib.MutationMiningConfiguration && !sameMiningReadback(preflight, request.info) {
-		return terminal(lib.MutationFailurePreflight, fmt.Errorf("readable mining settings changed before PATCH"))
-	}
-	if err := coordinator.validateMutationPreflight(preflight, request.settings, current, asic); err != nil {
-		if coordinator.preflightNeedsSafetySupersession(request, current, preflight, asic) {
-			if safetyErr := coordinator.supersedeReadback(request, preflight, asic); safetyErr != nil {
-				return open(lib.MutationFailurePreflight, fmt.Errorf("persist preflight safety supersession: %w", safetyErr))
+	if preRestartStages {
+		preflight, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
+		if err != nil {
+			if coordinator.entryPreflightExpired(request) {
+				return terminal(lib.MutationFailurePreflight, fmt.Errorf("entry preflight deadline expired: %w", err))
 			}
+			return open(lib.MutationFailurePreflight, fmt.Errorf("pre-PATCH information read failed: %w", err))
 		}
-		return terminal(lib.MutationFailurePreflight, err)
-	}
-	if request.kind == lib.MutationOperatingPoint && request.attempt.PatchRequestedAt.IsZero() &&
-		operatingPointFromInfo(preflight) != request.attempt.FromPoint() {
-		if coordinator.safeExternalPreflight(request, current, preflight, asic) {
-			if current.ObservedFrequency == preflight.Frequency && current.ObservedCoreVoltage == preflight.CoreVoltage {
-				current.ObservedCount++
-			} else {
-				current.ObservedFrequency = preflight.Frequency
-				current.ObservedCoreVoltage = preflight.CoreVoltage
-				current.ObservedCount = 1
-			}
-			if current.ObservedCount < manualConfirmationPolls {
-				if err := coordinator.states.SaveMiner(&current); err != nil {
-					return open(lib.MutationFailurePreflight, fmt.Errorf("persist external operating-point observation: %w", err))
+		if err := validateMutationIdentity(preflight, request.macAddr); err != nil {
+			return terminal(lib.MutationFailurePreflight, err)
+		}
+		current, err := coordinator.states.LoadMiner(request.macAddr)
+		if err != nil {
+			return open(lib.MutationFailurePreflight, err)
+		}
+		if !mutationStillPending(current, request) {
+			return terminal(lib.MutationFailurePreflight, fmt.Errorf("durable mutation intent changed before PATCH"))
+		}
+		if request.kind == lib.MutationMiningConfiguration && !sameMiningReadback(preflight, request.info) {
+			return terminal(lib.MutationFailurePreflight, fmt.Errorf("readable mining settings changed before PATCH"))
+		}
+		if err := coordinator.validateMutationPreflight(preflight, request.settings, current, asic); err != nil {
+			if coordinator.preflightNeedsSafetySupersession(request, current, preflight, asic) {
+				if safetyErr := coordinator.supersedeReadback(request, preflight, asic); safetyErr != nil {
+					return open(lib.MutationFailurePreflight, fmt.Errorf("persist preflight safety supersession: %w", safetyErr))
 				}
-				return open(lib.MutationFailurePreflight, fmt.Errorf("awaiting second safe external operating-point observation"))
 			}
-			rampUntil := coordinator.now().Add(request.settings.RampUpTime)
-			deadline := rampUntil.Add(2 * request.settings.EvaluationWindowTime)
-			if err := coordinator.states.AdoptExternalPoint(
-				&current,
-				operatingPointFromInfo(preflight),
-				request.attemptID,
-				coordinator.now(),
-				rampUntil,
-				deadline,
-			); err != nil {
-				return open(lib.MutationFailurePreflight, fmt.Errorf("adopt external operating point: %w", err))
-			}
-			result.stateReconciled = true
-			result.miner = lib.DiscoveredMiner{IP: request.ip, Info: preflight}
-			return terminal(lib.MutationFailurePreflight, fmt.Errorf("external operating point adopted without hardware mutation"))
+			return terminal(lib.MutationFailurePreflight, err)
 		}
-		return terminal(lib.MutationFailurePreflight, fmt.Errorf("operating point changed before PATCH"))
+		if request.kind == lib.MutationOperatingPoint && request.attempt.PatchRequestedAt.IsZero() &&
+			operatingPointFromInfo(preflight) != request.attempt.FromPoint() {
+			if coordinator.safeExternalPreflight(request, current, preflight, asic) {
+				if current.ObservedFrequency == preflight.Frequency && current.ObservedCoreVoltage == preflight.CoreVoltage {
+					current.ObservedCount++
+				} else {
+					current.ObservedFrequency = preflight.Frequency
+					current.ObservedCoreVoltage = preflight.CoreVoltage
+					current.ObservedCount = 1
+				}
+				if current.ObservedCount < manualConfirmationPolls {
+					if err := coordinator.states.SaveMiner(&current); err != nil {
+						return open(lib.MutationFailurePreflight, fmt.Errorf("persist external operating-point observation: %w", err))
+					}
+					return open(lib.MutationFailurePreflight, fmt.Errorf("awaiting second safe external operating-point observation"))
+				}
+				rampUntil := coordinator.now().Add(request.settings.RampUpTime)
+				deadline := rampUntil.Add(2 * request.settings.EvaluationWindowTime)
+				if err := coordinator.states.AdoptExternalPoint(
+					&current,
+					operatingPointFromInfo(preflight),
+					request.attemptID,
+					coordinator.now(),
+					rampUntil,
+					deadline,
+				); err != nil {
+					return open(lib.MutationFailurePreflight, fmt.Errorf("adopt external operating point: %w", err))
+				}
+				result.stateReconciled = true
+				result.miner = lib.DiscoveredMiner{IP: request.ip, Info: preflight}
+				return terminal(lib.MutationFailurePreflight, fmt.Errorf("external operating point adopted without hardware mutation"))
+			}
+			return terminal(lib.MutationFailurePreflight, fmt.Errorf("operating point changed before PATCH"))
+		}
+		request.info = preflight
 	}
-	request.info = preflight
 
-	if request.attempt.PatchRequestedAt.IsZero() {
+	if preRestartStages && request.attempt.PatchRequestedAt.IsZero() {
 		patchAt := coordinator.now()
 		if err := coordinator.states.AdvanceMutationAttempt(request.attemptID, lib.MutationMilestonePatchRequested, patchAt); err != nil {
 			return open(lib.MutationFailurePreflight, fmt.Errorf("persist PATCH milestone: %w", err))
@@ -1070,43 +1077,43 @@ func (coordinator *mutationCoordinator) execute(
 		}
 	}
 
-	configured, terminalReadback, err := coordinator.waitForConfiguredReadbackV4(ctx, request, request.attempt.PatchRequestedAt, false)
-	if err != nil {
-		if terminalReadback {
-			result.readbackUnavailable = configured.MacAddr == "" || configured.MacAddr != request.macAddr
-			if coordinator.readbackNeedsSafetySupersession(request, configured, asic) {
-				if safetyErr := coordinator.supersedeReadback(request, configured, asic); safetyErr != nil {
-					return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist configured safety supersession: %w", safetyErr))
-				}
-			}
-			return terminal(lib.MutationFailureConfiguredVerification, err)
-		}
-		return open(lib.MutationFailureConfiguredVerification, err)
-	}
 	if request.attempt.ConfiguredVerifiedAt.IsZero() {
+		configured, terminalReadback, err := coordinator.waitForConfiguredReadback(ctx, request, request.attempt.PatchRequestedAt)
+		if err != nil {
+			if terminalReadback {
+				result.readbackUnavailable = configured.MacAddr == "" || configured.MacAddr != request.macAddr
+				if coordinator.readbackNeedsSafetySupersession(request, configured, asic) {
+					if safetyErr := coordinator.supersedeReadback(request, configured, asic); safetyErr != nil {
+						return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist configured safety supersession: %w", safetyErr))
+					}
+				}
+				return terminal(lib.MutationFailureConfiguredVerification, err)
+			}
+			return open(lib.MutationFailureConfiguredVerification, err)
+		}
 		verifiedAt := coordinator.now()
 		if err := coordinator.states.RecordConfiguredVerification(request.attemptID, verifiedAt, configured.UpTimeSeconds); err != nil {
 			return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist configured verification: %w", err))
 		}
 		request.attempt.ConfiguredVerifiedAt = verifiedAt
 		request.attempt.ConfiguredVerifiedUptimeSeconds = configured.UpTimeSeconds
+		request.info = configured
 	}
-	request.info = configured
-	final, terminalReadback, err := coordinator.waitForConfiguredReadbackV4(ctx, request, request.attempt.ConfiguredVerifiedAt, true)
-	if err != nil {
-		if terminalReadback {
-			result.readbackUnavailable = final.MacAddr == "" || final.MacAddr != request.macAddr
-			if coordinator.readbackNeedsSafetySupersession(request, final, asic) {
-				if safetyErr := coordinator.supersedeReadback(request, final, asic); safetyErr != nil {
-					return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist final safety supersession: %w", safetyErr))
-				}
-			}
-			return terminal(lib.MutationFailureConfiguredVerification, err)
-		}
-		return open(lib.MutationFailureConfiguredVerification, err)
-	}
-	request.info = final
 	if request.attempt.RestartRequestedAt.IsZero() {
+		final, terminalReadback, err := coordinator.waitForConfiguredReadback(ctx, request, request.attempt.ConfiguredVerifiedAt)
+		if err != nil {
+			if terminalReadback {
+				result.readbackUnavailable = final.MacAddr == "" || final.MacAddr != request.macAddr
+				if coordinator.readbackNeedsSafetySupersession(request, final, asic) {
+					if safetyErr := coordinator.supersedeReadback(request, final, asic); safetyErr != nil {
+						return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist final safety supersession: %w", safetyErr))
+					}
+				}
+				return terminal(lib.MutationFailureConfiguredVerification, err)
+			}
+			return open(lib.MutationFailureConfiguredVerification, err)
+		}
+		request.info = final
 		restartAt := coordinator.now()
 		if err := coordinator.states.AdvanceMutationAttempt(request.attemptID, lib.MutationMilestoneRestartRequested, restartAt); err != nil {
 			return open(lib.MutationFailureRebootVerification, fmt.Errorf("persist restart milestone: %w", err))
@@ -1116,7 +1123,7 @@ func (coordinator *mutationCoordinator) execute(
 			return open(lib.MutationFailureRebootVerification, err)
 		}
 	}
-	miner, rediscoveredASIC, err := coordinator.waitForVerifiedBootV4(ctx, request, request.attempt.ConfiguredVerifiedUptimeSeconds, request.attempt.ConfiguredVerifiedAt, request.attempt.RestartRequestedAt)
+	miner, rediscoveredASIC, err := coordinator.waitForVerifiedBoot(ctx, request, request.attempt.ConfiguredVerifiedUptimeSeconds, request.attempt.ConfiguredVerifiedAt, request.attempt.RestartRequestedAt)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return open(lib.MutationFailureRebootVerification, err)
@@ -1172,11 +1179,10 @@ func (coordinator *mutationCoordinator) safeExternalPreflight(
 	return assessInstantaneousSafety(info, request.settings, operatingPointFromInfo(info), minimum).action == safetyNormal
 }
 
-func (coordinator *mutationCoordinator) waitForConfiguredReadbackV4(
+func (coordinator *mutationCoordinator) waitForConfiguredReadback(
 	ctx context.Context,
 	request mutationRequest,
 	startedAt time.Time,
-	finalCheck bool,
 ) (lib.Info, bool, error) {
 	deadline := startedAt.Add(defaultRebootDeadline)
 	var lastErr error
@@ -1189,7 +1195,7 @@ func (coordinator *mutationCoordinator) waitForConfiguredReadbackV4(
 			if identityErr := validateMutationIdentity(info, request.macAddr); identityErr != nil {
 				return info, true, identityErr
 			}
-			if verifyErr := verifyConfiguredReadbackV4(request, info, finalCheck); verifyErr != nil {
+			if verifyErr := verifyConfiguredReadback(request, info); verifyErr != nil {
 				return info, true, verifyErr
 			}
 			return info, true, nil
@@ -1222,7 +1228,7 @@ func (coordinator *mutationCoordinator) waitMutationRetry(ctx context.Context) e
 	}
 }
 
-func verifyConfiguredReadbackV4(request mutationRequest, info lib.Info, finalCheck bool) error {
+func verifyConfiguredReadback(request mutationRequest, info lib.Info) error {
 	if !completeSafetyTelemetry(info) || hasPowerFault(info) {
 		return fmt.Errorf("configured readback has incomplete or faulted safety telemetry")
 	}
@@ -1256,7 +1262,6 @@ func verifyConfiguredReadbackV4(request mutationRequest, info lib.Info, finalChe
 	default:
 		return fmt.Errorf("unsupported mutation kind %q", request.kind)
 	}
-	_ = finalCheck
 	return nil
 }
 
@@ -1301,7 +1306,7 @@ func (coordinator *mutationCoordinator) readbackNeedsSafetySupersession(
 	}
 }
 
-func (coordinator *mutationCoordinator) waitForVerifiedBootV4(
+func (coordinator *mutationCoordinator) waitForVerifiedBoot(
 	ctx context.Context,
 	request mutationRequest,
 	configuredUptime int,
@@ -1351,7 +1356,7 @@ func (coordinator *mutationCoordinator) waitForVerifiedBootV4(
 					time.Duration(configuredUptime)*time.Second-rebootUptimeTolerance
 			}
 			if booted {
-				if verifyErr := verifyConfiguredReadbackV4(request, miner.Info, true); verifyErr != nil {
+				if verifyErr := verifyConfiguredReadback(request, miner.Info); verifyErr != nil {
 					return miner, lastASIC, verifyErr
 				}
 				return miner, lastASIC, nil

@@ -416,6 +416,19 @@ type scriptedMutationDevice struct {
 	restartErr   error
 }
 
+type stagedReadbackMutationDevice struct {
+	*scriptedMutationDevice
+	infoCalls int
+}
+
+func (device *stagedReadbackMutationDevice) GetSystemInfo(context.Context, string) (lib.Info, error) {
+	device.infoCalls++
+	if device.infoCalls == 2 {
+		return lib.Info{}, errors.New("device temporarily unavailable")
+	}
+	return device.target, nil
+}
+
 func (device *scriptedMutationDevice) GetSystemInfo(context.Context, string) (lib.Info, error) {
 	if device.patched {
 		return device.target, nil
@@ -502,6 +515,65 @@ func TestMutationUsesConfiguredReadbackBeforeOneRestart(t *testing.T) {
 	}
 }
 
+func TestReopenedConfiguredStageUsesItsOwnDeadline(t *testing.T) {
+	store, settings, state, now := newRootMutationStore(t)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: lib.MutationOperatingPoint,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: target.Frequency, TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt: now, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	attemptID, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchAt := now.Add(10 * time.Second)
+	configuredAt := now.Add(20 * time.Second)
+	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestonePatchRequested, patchAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordConfiguredVerification(attemptID, configuredAt, 120); err != nil {
+		t.Fatal(err)
+	}
+	device := &stagedReadbackMutationDevice{scriptedMutationDevice: &scriptedMutationDevice{
+		asic: rootTestASIC(), source: rootTestInfo(state.CurrentPoint(), 120),
+		target: rootTestInfo(target, 120), patched: true,
+	}}
+	coordinator := newMutationCoordinator(
+		device, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: device.source}}, nil, "",
+		func(context.Context, string) (lib.DiscoveredMiner, error) {
+			postBoot := device.target
+			postBoot.UpTimeSeconds = 1
+			return lib.DiscoveredMiner{IP: state.IP, Info: postBoot}, nil
+		}, nil, log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.rediscoveryDelay = time.Millisecond
+	coordinator.now = func() time.Time { return now.Add(131 * time.Second) }
+	loaded, err := store.LoadMiner(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := &minerObservation{
+		miner: lib.DiscoveredMiner{IP: state.IP, Info: device.source},
+		info:  device.source, asic: device.asic, settings: settings, state: loaded,
+	}
+	if err := coordinator.startLocked(context.Background(), observation, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	result := <-coordinator.results
+	if result.err != nil {
+		t.Fatalf("reopened configured stage: %v", result.err)
+	}
+	if device.patchCount != 0 || device.restartCount != 1 {
+		t.Fatalf("reopened hardware requests patch/restart = %d/%d", device.patchCount, device.restartCount)
+	}
+}
+
 func TestMutationReadbackDistinguishesUnavailableFromUnsafeMismatch(t *testing.T) {
 	settings := rootTestSettings(t)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
@@ -513,12 +585,12 @@ func TestMutationReadbackDistinguishesUnavailableFromUnsafeMismatch(t *testing.T
 		t.Fatal("empty readback was treated as readable safety evidence")
 	}
 	wrong := rootTestInfo(lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}, 100)
-	if err := verifyConfiguredReadbackV4(request, wrong, false); err == nil {
+	if err := verifyConfiguredReadback(request, wrong); err == nil {
 		t.Fatal("wrong configured pair was accepted")
 	}
 	unsafe := rootTestInfo(target, 100)
 	unsafe.Temp = settings.TempLimit + 1
-	if err := verifyConfiguredReadbackV4(request, unsafe, false); err == nil {
+	if err := verifyConfiguredReadback(request, unsafe); err == nil {
 		t.Fatal("unsafe configured pair was accepted")
 	}
 }
