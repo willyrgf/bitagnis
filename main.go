@@ -125,7 +125,12 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := lib.OpenOptimizerStore("optimizer.db")
+	var store *lib.OptimizerStore
+	if options.reportMode != "" {
+		store, err = lib.OpenOptimizerStoreReadOnly("optimizer.db")
+	} else {
+		store, err = lib.OpenOptimizerStore("optimizer.db")
+	}
 	if err != nil {
 		return err
 	}
@@ -378,8 +383,8 @@ func parseReportArguments(arguments []string) (string, []string, []time.Time, in
 	starts := make([]time.Time, startCount)
 	for index := range starts {
 		value, err := time.Parse(time.RFC3339, arguments[1+hostCount+index])
-		if err != nil || value.UTC().Truncate(time.Hour) != value.UTC() {
-			return "", nil, nil, 0, fmt.Errorf("--report start must be a UTC RFC3339 hour")
+		if err != nil || value.Location() != time.UTC {
+			return "", nil, nil, 0, fmt.Errorf("--report start must be a UTC RFC3339 timestamp")
 		}
 		starts[index] = value.UTC()
 	}
@@ -479,6 +484,9 @@ func loadReportArmInput(
 	if err != nil {
 		return lib.ReportArmInput{}, err
 	}
+	if treatment.MacAddr == "" || control.MacAddr == "" || treatment.MacAddr == control.MacAddr {
+		return lib.ReportArmInput{}, fmt.Errorf("long-term report: treatment and control must be distinct MACs")
+	}
 	return lib.ReportArmInput{Start: window.Start, Treatment: treatment, Control: control}, nil
 }
 
@@ -496,10 +504,6 @@ func loadReportMinerInput(
 	if err != nil {
 		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: selected point: %w", hostname, err)
 	}
-	selected, found := findRecord(records, state.CurrentPoint())
-	if !found || selected.Status != lib.PointValidated || !finite(selected.MedianHash) || selected.MedianHash <= 0 {
-		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: no positive validated selected point", hostname)
-	}
 	hourly, err := store.ListHourly(state.MacAddr, window.Start, window.End)
 	if err != nil {
 		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: hourly data: %w", hostname, err)
@@ -507,6 +511,56 @@ func loadReportMinerInput(
 	attempts, err := store.ListMutationAttempts(state.MacAddr)
 	if err != nil {
 		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: mutation history: %w", hostname, err)
+	}
+	baselineRequests := 0
+	baselineObserved := false
+	if treatment {
+		baselineWindow := lib.ReportWindow{Start: window.Start.Add(-lib.ReportArmDuration), End: window.Start}
+		baselineHourly, baselineErr := store.ListHourly(state.MacAddr, baselineWindow.Start, baselineWindow.End)
+		if baselineErr != nil {
+			return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: restart baseline hourly data: %w", hostname, baselineErr)
+		}
+		baselineMetrics, baselineErr := lib.SummarizeReportMiner(lib.ReportMinerInput{
+			MacAddr: state.MacAddr,
+			Hourly:  baselineHourly,
+		}, baselineWindow)
+		if baselineErr != nil {
+			return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: restart baseline: %w", hostname, baselineErr)
+		}
+		baselineObserved = baselineMetrics.Coverage >= lib.ReportMinimumCoverage
+		baselineExposure, baselineErr := lib.SummarizeRestartExposure(attempts, baselineWindow)
+		if baselineErr != nil {
+			return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: restart baseline mutations: %w", hostname, baselineErr)
+		}
+		baselineRequests = baselineExposure.NormalRequests
+	}
+	if !treatment && state.PassTrigger == lib.PassOperator && state.PassReferenceHash > 0 &&
+		!state.PassStartedAt.Before(window.End) {
+		boundaryRate := 0.0
+		boundaryReference := 0.0
+		if state.PassStartedAt.Equal(window.End) {
+			// The later reset preserves the prior selected median, but schema v4
+			// has no arm-boundary settlement timestamp. Keep the rate as a
+			// diagnostic and leave the economic boundary gate explicitly false.
+			boundaryRate = state.PassReferenceHash
+			boundaryReference = state.PassReferenceHash
+		}
+		return lib.ReportMinerInput{
+			MacAddr:               state.MacAddr,
+			Hostname:              hostname,
+			PreArmSettledHashRate: boundaryRate,
+			PassStartedAt:         state.PassStartedAt,
+			PassReferenceHash:     boundaryReference,
+			BoundarySettled:       false,
+			PointStable:           false,
+			PointRecords:          records,
+			Hourly:                hourly,
+			MutationAttempts:      attempts,
+		}, nil
+	}
+	selected, found := findRecord(records, state.CurrentPoint())
+	if !found || selected.Status != lib.PointValidated || !finite(selected.MedianHash) || selected.MedianHash <= 0 {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: no positive validated selected point", hostname)
 	}
 	pointStable := state.Phase == lib.PhaseHold && state.HoldReason == lib.HoldOptimized &&
 		!state.SettledAt.IsZero() && state.PendingKind == "" && !state.MiningPending
@@ -526,10 +580,13 @@ func loadReportMinerInput(
 		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: treatment pass boundary is not durably frozen at the arm start", hostname)
 	}
 	return lib.ReportMinerInput{
+		MacAddr:  state.MacAddr,
 		Hostname: hostname, PreArmSettledHashRate: preArmRate,
 		PassStartedAt: state.PassStartedAt, PassReferenceHash: state.PassReferenceHash,
-		SettledAt:     state.SettledAt,
-		SelectedPoint: selected.Point(), PointStable: pointStable,
+		SettledAt:       state.SettledAt,
+		BoundarySettled: !state.SettledAt.IsZero() && !state.SettledAt.After(window.Start),
+		PointStable:     pointStable, PointRecords: records,
+		NormalRestartBaselineRequests: baselineRequests, NormalRestartBaselineObserved: baselineObserved,
 		Hourly: hourly, MutationAttempts: attempts,
 	}, nil
 }
@@ -553,13 +610,14 @@ func formatArmReport(output io.Writer, report lib.ArmReport) {
 	formatReportMiner(output, "treatment", report.Treatment)
 	formatReportMiner(output, "control", report.Control)
 	fmt.Fprintf(output, "  uplift: %.4f\n", report.Uplift)
-	fmt.Fprintf(output, "  gates: coverage=%t convergence_48h=%t restart_reduction=%t normal_exposure=%t post_settlement=%t control_stable=%t\n",
+	fmt.Fprintf(output, "  gates: coverage=%t convergence_48h=%t baseline_observed=%t restart_reduction=%t normal_exposure=%t post_settlement=%t frontier_24h=%t control_stable=%t\n",
 		report.CoverageValid, report.Treatment.ConvergedBy48Hours,
-		report.Treatment.NormalRestartReductionValid, report.Treatment.NormalExposureValid,
-		report.Treatment.PostSettlementCoverage >= lib.ReportPostSettlementCoverage,
-		report.UpliftValid)
-	fmt.Fprintf(output, "  practical target (>=2%% uplift): %t\n", report.PracticalTarget)
-	fmt.Fprintf(output, "  result: %s\n", reportStatus(report.Valid, report.Treatment.PreArmSettledHashRate > 0 && report.Control.PreArmSettledHashRate > 0))
+		report.Treatment.NormalRestartBaselineObserved, report.Treatment.NormalRestartReductionValid,
+		report.Treatment.NormalExposureValid,
+		report.Treatment.PostSettlementCoverageValid && report.Treatment.PostSettlementCoverage >= lib.ReportPostSettlementCoverage,
+		report.Treatment.Frontier24Valid, report.ControlStable)
+	fmt.Fprintf(output, "  practical target (>=%.0f%% uplift): %t\n", lib.ReportPracticalUplift*100, report.PracticalTarget)
+	fmt.Fprintf(output, "  result: %s (coverage-valid=%t)\n", reportStatus(report.Accepted, report.Treatment.PreArmSettledHashRate > 0 && report.Control.PreArmSettledHashRate > 0), report.Valid)
 }
 
 func formatCrossoverReport(output io.Writer, report lib.CrossoverReport) {
@@ -568,12 +626,13 @@ func formatCrossoverReport(output io.Writer, report lib.CrossoverReport) {
 	fmt.Fprintln(output, "BA arm")
 	formatArmReport(output, report.BA)
 	fmt.Fprintf(output, "Crossover uplift: %.4f\n", report.CrossoverUplift)
-	fmt.Fprintf(output, "Crossover result: %s\n", reportStatus(report.Valid, report.AB.Treatment.PreArmSettledHashRate > 0 && report.BA.Treatment.PreArmSettledHashRate > 0))
+	fmt.Fprintf(output, "Crossover result: %s (economic-valid=%t)\n", reportStatus(report.Accepted, report.AB.Treatment.PreArmSettledHashRate > 0 && report.BA.Treatment.PreArmSettledHashRate > 0), report.Valid)
 }
 
 func formatReportMiner(output io.Writer, role string, report lib.ReportMinerMetrics) {
 	fmt.Fprintf(output, "  %s: coverage %.1f%% (observed %.0fs, unknown %.0fs), actual %.0f H/s·s, trial actual %.0f, incumbent counterfactual %.0f, normalized %.4f, settled %.0fs, trial %.0fs\n", role, report.Coverage*100, report.ObservedSeconds, report.UnknownGapSeconds, report.ActualHashSeconds, report.TrialActualHashSeconds, report.IncumbentCounterfactualHashSeconds, report.NormalizedWork, report.SettledSeconds, report.TrialSeconds)
-	fmt.Fprintf(output, "    post-settlement coverage %.1f%%, prior normal requests %d, reduction %.1f%%\n", report.PostSettlementCoverage*100, report.NormalRestartBaselineRequests, report.NormalRestartReduction*100)
+	fmt.Fprintf(output, "    post-settlement coverage %.1f%% (evidence %t), prior normal requests %d (observed %t), reduction %.1f%%\n", report.PostSettlementCoverage*100, report.PostSettlementCoverageValid, report.NormalRestartBaselineRequests, report.NormalRestartBaselineObserved, report.NormalRestartReduction*100)
+	fmt.Fprintf(output, "    frontier first 24h: audited %t, duplicates %d, time-created eligibility %d, valid %t\n", report.Frontier24Audited, report.DuplicateEnteredTargets, report.TimeCreatedEligibility, report.Frontier24Valid)
 	fmt.Fprintf(output, "    restarts normal %d/%.0fs, safety %d/%.0fs, unresolved %d\n", report.Restart.NormalRequests, report.Restart.NormalExposureSeconds, report.Restart.SafetyRequests, report.Restart.SafetyExposureSeconds, report.Restart.UnresolvedAttempts)
 }
 
@@ -755,11 +814,10 @@ func (minerController *controller) accountHourly(
 			current.referenceHash = entered.ReferenceHash
 		}
 	}
+	current.classification = classifyAccountingState(*state, current.referenceHash, current.settled)
 	validCurrent := current.validHash
 	previous := runtime.accounting
-	compatible := validCurrent && previous != nil && previous.validHash &&
-		previous.at.Equal(state.AccountedThroughAt) && now.After(previous.at) &&
-		now.Sub(previous.at) <= settings.MetricsTime && previous.point == current.point && previous.phase == current.phase
+	compatible := accountingSamplesCompatible(previous, current, state.AccountedThroughAt, settings.MetricsTime)
 	fragments := hourlyFragments(macAddr, state.AccountedThroughAt, now, current, compatible)
 	if err := minerController.states.CompareAndSetHourly(macAddr, state.AccountedThroughAt, now, fragments, now); err != nil {
 		runtime.accounting = nil

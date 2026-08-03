@@ -1329,6 +1329,12 @@ trial_seconds <= observed_seconds
 trial_actual_hash_seconds <= actual_hash_seconds
 ```
 
+Report starts are arbitrary UTC timestamps because an accepted retune records the actual
+`pass_started_at`. When a report boundary falls inside an hourly bucket, the overlapping boundary
+portion is conservatively unknown: the evaluator never invents sub-hour state history from an
+aggregate row. Report mode opens the schema-v4 database read-only and rejects missing or
+incompatible durable evidence.
+
 The first/second positive timestamps bound restart loss, while hourly actual work is the treatment
 source. At each arm boundary, both miners must be `verifiedSettled` with `hold_reason = optimized`;
 freeze each miner's positive
@@ -1350,10 +1356,13 @@ crossover_uplift = (arm_uplift_AB + arm_uplift_BA) / 2
 
 Unknown time contributes zero to this explicitly labeled lower bound and coverage is reported
 separately. Treatment and control use the same wall interval; this prevents missing polls or restart
-gaps from disappearing through observed-time normalization. An arm is valid only when both miners'
-coverage is at least 95%. A one-arm canary succeeds on work only when `arm_uplift >= 0`; a complete
-AB/BA crossover succeeds on work only when both arms are valid and `crossover_uplift >= 0`. The
-predeclared practical target is the corresponding uplift at or above `0.02`.
+gaps from disappearing through observed-time normalization. An arm is coverage-valid only when both
+miners' coverage is at least 95%; the evaluator reports nonnegative uplift separately from operational
+acceptance. A one-arm canary is accepted on work only when the coverage-valid uplift is nonnegative
+and every convergence, restart, frontier, settlement, baseline-evidence, and control-stability gate
+passes. A complete AB/BA crossover requires the same acceptance for both non-overlapping arms and
+nonnegative crossover uplift. The predeclared practical target is the corresponding accepted uplift
+at or above `0.02`.
 
 Evaluate an authorized treatment miner against an already-settled control under unchanged firmware,
 pool configuration, and safety settings. With two comparable miners, use an AB/BA crossover to
@@ -1363,8 +1372,12 @@ the AB arm while B remains in `HOLD`, then after 168 hours and renewed boundary 
 transaction's persisted `pass_started_at`; the treatment denominator is its atomically frozen
 `pass_reference_hash`, and the evaluator records the control's unchanged selected-row median at that
 same timestamp. The arm ends exactly 168 hours later and uses that same contemporaneous wall interval
-for its control. Any control point change invalidates the arm. The 24- and 48-hour checks are relative
-to this arm start. Success requires:
+for its control. Any control point change invalidates the arm. `pass_reference_hash` preserves the
+prior selected rate across a reset, but schema v4 does not retain the prior `settled_at` timestamp;
+the report therefore leaves the control boundary gate unavailable after that reset rather than
+fabricating settlement from current rows. An inter-arm gap also discards the diagnostic snapshot.
+The 24- and 48-hour checks are relative to this arm start.
+Success requires:
 
 - at 24 hours, zero duplicate `entered` targets and zero time-created eligibility;
 - at 48 hours, `verifiedSettled` `HOLD`; unresolved reconciliation is a separately reported
@@ -1429,8 +1442,11 @@ Resolution: replay captured credential-free summaries in deterministic tests, th
 chosen point with the 168-hour settled-control result. Changing the band or window count after that
 evidence is a new explicit policy revision, not a time-based retry.
 
-No architecture, ownership, schema, recovery-action, retune-contract, or pass-cap uncertainty
-remains for implementation.
+No architecture, ownership, recovery-action, retune-contract, or pass-cap uncertainty remains for
+implementation. The exact schema-v4 contract intentionally does not retain a historical control
+settlement timestamp across a point-history reset; reports expose that boundary as unavailable
+rather than claiming an accepted historical crossover. Supporting accepted AB/BA output after that
+reset is a deliberate future schema-contract change, not an inferred fallback.
 
 ## Complete Cutover
 

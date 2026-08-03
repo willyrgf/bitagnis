@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,6 +31,48 @@ func testASIC() ASICSettings {
 		ASICModel: "BM1370", DefaultFrequency: 525, DefaultVoltage: 1150,
 		FrequencyOptions: []int{400, 490, 525, 550, 600, 625},
 		VoltageOptions:   []int{1000, 1060, 1100, 1150, 1200, 1250},
+	}
+}
+
+func TestOpenOptimizerStoreReadOnlyDoesNotCreateOrWrite(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	if _, err := OpenOptimizerStoreReadOnly(missing); err == nil {
+		t.Fatal("read-only open created a missing database")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("read-only open changed missing database state: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	writable, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := OpenOptimizerStoreReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if _, err := readOnly.conn.ExecContext(context.Background(), "CREATE TABLE report_write_probe (value INTEGER)"); err == nil {
+		t.Fatal("read-only optimizer store accepted a write")
+	}
+
+	invalidPath := filepath.Join(t.TempDir(), "optimizer.db")
+	invalid, err := OpenOptimizerStore(invalidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := invalid.conn.ExecContext(context.Background(), "CREATE VIEW report_schema_probe AS SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := invalid.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStoreReadOnly(invalidPath); err == nil {
+		t.Fatal("read-only optimizer store accepted an unexpected schema object")
 	}
 }
 

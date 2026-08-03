@@ -70,7 +70,7 @@ func TestParseArgumentsRetuneContract(t *testing.T) {
 		{"--report"},
 		{"--report", "unknown", "one", "two", "2026-08-01T00:00:00Z"},
 		{"--report", "one", "two"},
-		{"--report", "one-arm", "one", "two", "2026-08-01T00:30:00Z"},
+		{"--report", "one-arm", "one", "two", "2026-08-01T00:30:00-03:00"},
 		{"--report", "one-arm", "one", "two", "2026-08-01T00:00:00Z", "extra"},
 		{"--report", "one-arm", "one", "two", "2026-08-01T00:00:00Z", "--retune", "two"},
 		{"--report", "one-arm", "one", "two", "2026-08-01T00:00:00Z", "--reapply-mining", "two"},
@@ -203,6 +203,8 @@ func TestLongTermReportFormattingIsDeterministicAndCredentialFree(t *testing.T) 
 			Coverage: .99, ObservedSeconds: 600, UnknownGapSeconds: 6,
 			ActualHashSeconds: 123456, NormalizedWork: 1.03, SettledSeconds: 540,
 			TrialSeconds: 60, PreArmSettledHashRate: 100,
+			PostSettlementCoverageValid: true, NormalRestartBaselineObserved: true,
+			Frontier24Audited: true, Frontier24Valid: true,
 			Restart: lib.RestartExposure{NormalRequests: 2, NormalExposureSeconds: 31, SafetyRequests: 1, SafetyExposureSeconds: 12, UnresolvedAttempts: 0},
 		},
 		Control: lib.ReportMinerMetrics{
@@ -211,7 +213,7 @@ func TestLongTermReportFormattingIsDeterministicAndCredentialFree(t *testing.T) 
 			PreArmSettledHashRate: 100,
 			Restart:               lib.RestartExposure{NormalRequests: 1, NormalExposureSeconds: 14},
 		},
-		Uplift: .03, Valid: true,
+		Uplift: .03, Valid: true, Accepted: true,
 	}
 	var first, second bytes.Buffer
 	formatArmReport(&first, report)
@@ -270,6 +272,42 @@ func TestHourlyFragmentsSplitUTCAndClassifyTrials(t *testing.T) {
 	unknown := hourlyFragments(rootTestMAC, start, end, sample, false)
 	if unknown[0].UnknownGapSeconds != 1800 || unknown[0].ActualHashSeconds != 0 {
 		t.Fatalf("unknown classification = %+v", unknown[0])
+	}
+}
+
+func TestHourlyAccountingClassificationRejectsSamePhaseStateTransition(t *testing.T) {
+	from := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	state := lib.MinerState{
+		Phase:              lib.PhaseHold,
+		HoldReason:         lib.HoldOptimized,
+		CurrentFrequency:   525,
+		CurrentCoreVoltage: 1150,
+		PassReferenceHash:  100,
+		SettledAt:          from.Add(-time.Hour),
+		AccountedThroughAt: from,
+	}
+	first := accountingSample{
+		at:             from,
+		validHash:      true,
+		classification: classifyAccountingState(state, 0, true),
+	}
+	if !accountingSamplesCompatible(&first, accountingSample{
+		at:             from.Add(time.Minute),
+		validHash:      true,
+		classification: classifyAccountingState(state, 0, true),
+	}, from, time.Hour) {
+		t.Fatal("unchanged accounting classification was rejected")
+	}
+	changed := state
+	changed.PendingKind = lib.MutationSafetyRollback
+	changed.PendingFrequency = 400
+	changed.PendingCoreVoltage = 1000
+	if accountingSamplesCompatible(&first, accountingSample{
+		at:             from.Add(time.Minute),
+		validHash:      true,
+		classification: classifyAccountingState(changed, 0, false),
+	}, from, time.Hour) {
+		t.Fatal("same-phase pending transition was credited as actual")
 	}
 }
 

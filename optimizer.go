@@ -47,14 +47,66 @@ type minerRuntime struct {
 }
 
 type accountingSample struct {
-	at            time.Time
-	point         lib.OperatingPoint
-	phase         lib.OptimizerPhase
-	referenceHash float64
-	hashRate      float64
-	validHash     bool
-	settled       bool
-	state         lib.MinerState
+	at             time.Time
+	point          lib.OperatingPoint
+	phase          lib.OptimizerPhase
+	referenceHash  float64
+	hashRate       float64
+	validHash      bool
+	settled        bool
+	classification accountingClassification
+	state          lib.MinerState
+}
+
+// accountingClassification is the durable/runtime state that determines how
+// a healthy interval is credited. A same-phase transition is still unknown
+// until a poll establishes the new classification.
+type accountingClassification struct {
+	phase             lib.OptimizerPhase
+	point             lib.OperatingPoint
+	fallback          lib.OperatingPoint
+	pendingKind       lib.MutationKind
+	pendingPoint      lib.OperatingPoint
+	miningPending     bool
+	holdReason        lib.HoldReason
+	safetyReason      lib.SafetyReason
+	evidencePending   bool
+	settled           bool
+	referenceHash     float64
+	passReferenceHash float64
+}
+
+func classifyAccountingState(
+	state lib.MinerState,
+	referenceHash float64,
+	settled bool,
+) accountingClassification {
+	return accountingClassification{
+		phase:             state.Phase,
+		point:             state.CurrentPoint(),
+		fallback:          state.FallbackPoint(),
+		pendingKind:       state.PendingKind,
+		pendingPoint:      state.PendingPoint(),
+		miningPending:     state.MiningPending,
+		holdReason:        state.HoldReason,
+		safetyReason:      state.SafetyReason,
+		evidencePending:   !state.EvidenceDeadlineAt.IsZero(),
+		settled:           settled,
+		referenceHash:     referenceHash,
+		passReferenceHash: state.PassReferenceHash,
+	}
+}
+
+func accountingSamplesCompatible(
+	previous *accountingSample,
+	current accountingSample,
+	cursor time.Time,
+	maxGap time.Duration,
+) bool {
+	return current.validHash && previous != nil && previous.validHash &&
+		previous.at.Equal(cursor) && current.at.After(previous.at) &&
+		current.at.Sub(previous.at) <= maxGap &&
+		previous.classification == current.classification
 }
 
 type windowSummary struct {

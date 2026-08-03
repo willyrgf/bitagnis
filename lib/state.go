@@ -310,6 +310,18 @@ type OptimizerStore struct {
 }
 
 func OpenOptimizerStore(path string) (*OptimizerStore, error) {
+	return openOptimizerStore(path, false)
+}
+
+// OpenOptimizerStoreReadOnly opens an existing schema-v4 database without
+// creating, migrating, locking, or otherwise mutating it. Report mode uses
+// this path so a missing or incompatible database fails rather than changing
+// durable state.
+func OpenOptimizerStoreReadOnly(path string) (*OptimizerStore, error) {
+	return openOptimizerStore(path, true)
+}
+
+func openOptimizerStore(path string, readOnly bool) (*OptimizerStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("open optimizer database: path cannot be empty")
 	}
@@ -318,7 +330,7 @@ func OpenOptimizerStore(path string) (*OptimizerStore, error) {
 		return nil, fmt.Errorf("open optimizer database: resolve path: %w", err)
 	}
 
-	database, err := sql.Open("sqlite3", optimizerSQLiteDSN(absolutePath))
+	database, err := sql.Open("sqlite3", optimizerSQLiteDSN(absolutePath, readOnly))
 	if err != nil {
 		return nil, fmt.Errorf("open optimizer database: %w", err)
 	}
@@ -351,22 +363,44 @@ func OpenOptimizerStore(path string) (*OptimizerStore, error) {
 	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = 1000"); err != nil {
 		return nil, fmt.Errorf("configure optimizer database timeout: %w", err)
 	}
-	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
-		return nil, fmt.Errorf("configure exclusive optimizer database ownership: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
-		if sqliteBusy(err) {
-			return nil, fmt.Errorf("open optimizer database: database is already in use")
+	if readOnly {
+		if _, err := conn.ExecContext(ctx, "PRAGMA query_only = ON"); err != nil {
+			return nil, fmt.Errorf("configure read-only optimizer database: %w", err)
 		}
-		return nil, fmt.Errorf("acquire exclusive optimizer database ownership: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		return nil, fmt.Errorf("acquire exclusive optimizer database ownership: %w", err)
+	} else {
+		if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
+			return nil, fmt.Errorf("configure exclusive optimizer database ownership: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+			if sqliteBusy(err) {
+				return nil, fmt.Errorf("open optimizer database: database is already in use")
+			}
+			return nil, fmt.Errorf("acquire exclusive optimizer database ownership: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			return nil, fmt.Errorf("acquire exclusive optimizer database ownership: %w", err)
+		}
 	}
 
-	if err := ensureOptimizerSchema(ctx, conn); err != nil {
-		return nil, err
+	if !readOnly {
+		if err := ensureOptimizerSchema(ctx, conn); err != nil {
+			return nil, err
+		}
+	} else {
+		version, err := schemaVersion(ctx, conn)
+		if err != nil {
+			return nil, fmt.Errorf("inspect optimizer schema version: %w", err)
+		}
+		if version != optimizerSchemaVersion {
+			return nil, incompatibleSchema(version)
+		}
+		if err := validateOptimizerSchema(ctx, conn); err != nil {
+			return nil, fmt.Errorf("validate optimizer schema: %w", err)
+		}
+		if err := validateOptimizerIndexes(ctx, conn); err != nil {
+			return nil, fmt.Errorf("validate optimizer indexes: %w", err)
+		}
 	}
 	if err := validateStoredOptimizerData(ctx, conn); err != nil {
 		return nil, fmt.Errorf("validate optimizer database contents: %w", err)
@@ -377,11 +411,15 @@ func OpenOptimizerStore(path string) (*OptimizerStore, error) {
 	return &OptimizerStore{db: database, conn: conn}, nil
 }
 
-func optimizerSQLiteDSN(path string) string {
+func optimizerSQLiteDSN(path string, readOnly bool) string {
+	query := "_busy_timeout=1000"
+	if readOnly {
+		query += "&mode=ro"
+	}
 	return (&url.URL{
 		Scheme:   "file",
 		Path:     path,
-		RawQuery: "_busy_timeout=1000",
+		RawQuery: query,
 	}).String()
 }
 

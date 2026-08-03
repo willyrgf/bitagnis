@@ -23,9 +23,13 @@ const (
 	// ReportPostSettlementCoverage is the minimum selected-point coverage after
 	// the treatment reaches verified settlement.
 	ReportPostSettlementCoverage = 0.95
+	// ReportPracticalUplift is the predeclared practical work-improvement target.
+	ReportPracticalUplift = 0.02
 )
 
-// ReportWindow is a UTC-hour-aligned half-open reporting interval.
+// ReportWindow is a UTC half-open reporting interval. Partial boundary hours
+// are conservatively classified as unknown because hourly rows do not retain
+// sub-hour state history.
 type ReportWindow struct {
 	Start time.Time
 	End   time.Time
@@ -45,15 +49,19 @@ type RestartExposure struct {
 // ReportMinerInput is the durable, credential-free input to report
 // calculations. PreArmSettledHashRate is frozen at the arm boundary.
 type ReportMinerInput struct {
-	Hostname              string
-	PreArmSettledHashRate float64
-	PassStartedAt         time.Time
-	PassReferenceHash     float64
-	SettledAt             time.Time
-	SelectedPoint         OperatingPoint
-	PointStable           bool
-	Hourly                []HourlyAggregate
-	MutationAttempts      []MutationAttempt
+	MacAddr                       string
+	Hostname                      string
+	PreArmSettledHashRate         float64
+	PassStartedAt                 time.Time
+	PassReferenceHash             float64
+	SettledAt                     time.Time
+	BoundarySettled               bool
+	PointStable                   bool
+	PointRecords                  []OperatingPointRecord
+	NormalRestartBaselineRequests int
+	NormalRestartBaselineObserved bool
+	Hourly                        []HourlyAggregate
+	MutationAttempts              []MutationAttempt
 }
 
 // ReportMinerMetrics contains the full-wall-duration economic summary for one
@@ -72,11 +80,17 @@ type ReportMinerMetrics struct {
 	PreArmSettledHashRate              float64
 	NormalizedWork                     float64
 	PostSettlementCoverage             float64
+	PostSettlementCoverageValid        bool
 	NormalRestartBaselineRequests      int
+	NormalRestartBaselineObserved      bool
 	NormalRestartReduction             float64
 	NormalRestartReductionValid        bool
 	NormalExposureValid                bool
 	ConvergedBy48Hours                 bool
+	DuplicateEnteredTargets            int
+	TimeCreatedEligibility             int
+	Frontier24Audited                  bool
+	Frontier24Valid                    bool
 	Restart                            RestartExposure
 }
 
@@ -97,8 +111,10 @@ type ArmReport struct {
 	Control         ReportMinerMetrics
 	Uplift          float64
 	CoverageValid   bool
+	ControlStable   bool
 	UpliftValid     bool
 	Valid           bool
+	Accepted        bool
 	PracticalTarget bool
 }
 
@@ -114,37 +130,13 @@ type CrossoverReport struct {
 	BA              ArmReport
 	CrossoverUplift float64
 	Valid           bool
+	Accepted        bool
 	PracticalTarget bool
 }
 
-// QueryLongTerm reads retained hourly aggregates and mutation history and
-// calculates one report-only miner summary.
-func (store *OptimizerStore) QueryLongTerm(
-	macAddr string,
-	window ReportWindow,
-	preArmSettledHashRate float64,
-) (ReportMinerMetrics, error) {
-	if store == nil {
-		return ReportMinerMetrics{}, fmt.Errorf("query long-term report: store is nil")
-	}
-	hourly, err := store.ListHourly(macAddr, window.Start, window.End)
-	if err != nil {
-		return ReportMinerMetrics{}, fmt.Errorf("query long-term report: hourly aggregates: %w", err)
-	}
-	attempts, err := store.ListMutationAttempts(macAddr)
-	if err != nil {
-		return ReportMinerMetrics{}, fmt.Errorf("query long-term report: mutation attempts: %w", err)
-	}
-	return SummarizeReportMiner(ReportMinerInput{
-		PreArmSettledHashRate: preArmSettledHashRate,
-		Hourly:                hourly,
-		MutationAttempts:      attempts,
-	}, window)
-}
-
-// SummarizeReportMiner computes metrics over full UTC hour buckets and the
-// complete wall interval. Unknown time lowers coverage and contributes zero
-// work; it is never discarded by observed-time normalization.
+// SummarizeReportMiner computes metrics over the complete wall interval.
+// Unknown time lowers coverage and contributes zero work; it is never
+// discarded by observed-time normalization.
 func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMinerMetrics, error) {
 	if err := validateReportWindow(window); err != nil {
 		return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: %w", err)
@@ -152,18 +144,37 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 	if !finiteReportValue(input.PreArmSettledHashRate) || input.PreArmSettledHashRate < 0 {
 		return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: pre-arm rate is invalid")
 	}
-	result := ReportMinerMetrics{
-		Hostname:              input.Hostname,
-		PreArmSettledHashRate: input.PreArmSettledHashRate,
-		SettledAt:             input.SettledAt,
+	if input.NormalRestartBaselineRequests < 0 {
+		return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: normal restart baseline is invalid")
 	}
+	result := ReportMinerMetrics{
+		Hostname:                      input.Hostname,
+		PreArmSettledHashRate:         input.PreArmSettledHashRate,
+		SettledAt:                     input.SettledAt,
+		NormalRestartBaselineRequests: input.NormalRestartBaselineRequests,
+		NormalRestartBaselineObserved: input.NormalRestartBaselineObserved,
+		Frontier24Audited:             len(input.PointRecords) > 0,
+	}
+	result.DuplicateEnteredTargets, result.TimeCreatedEligibility = auditFrontier24(
+		input.PointRecords, window, input.PassStartedAt,
+	)
+	result.Frontier24Valid = result.Frontier24Audited &&
+		result.DuplicateEnteredTargets == 0 && result.TimeCreatedEligibility == 0
 	seenHours := make(map[int64]bool, len(input.Hourly))
+	expectedMAC := ""
 	for _, aggregate := range input.Hourly {
-		if aggregate.HourStartedAt.Before(window.Start.UTC()) || !aggregate.HourStartedAt.Before(window.End.UTC()) ||
-			aggregate.MacAddr == "" {
+		if aggregate.MacAddr == "" {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row is outside the requested scope")
 		}
-		if !aggregate.HourStartedAt.Equal(aggregate.HourStartedAt.UTC()) {
+		if input.MacAddr != "" && aggregate.MacAddr != input.MacAddr {
+			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row belongs to another miner")
+		}
+		if expectedMAC == "" {
+			expectedMAC = aggregate.MacAddr
+		} else if aggregate.MacAddr != expectedMAC {
+			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly rows contain multiple miners")
+		}
+		if aggregate.HourStartedAt.Location() != time.UTC || !aggregate.HourStartedAt.Equal(aggregate.HourStartedAt.Truncate(time.Hour)) {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row is not UTC")
 		}
 		if seenHours[aggregate.HourStartedAt.Unix()] {
@@ -172,6 +183,22 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 		seenHours[aggregate.HourStartedAt.Unix()] = true
 		if err := validateHourlyAggregate(aggregate); err != nil {
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: %w", err)
+		}
+		hourEnd := aggregate.HourStartedAt.Add(time.Hour)
+		segmentStart := aggregate.HourStartedAt
+		if segmentStart.Before(window.Start) {
+			segmentStart = window.Start
+		}
+		segmentEnd := hourEnd
+		if segmentEnd.After(window.End) {
+			segmentEnd = window.End
+		}
+		if !segmentEnd.After(segmentStart) {
+			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly row is outside the requested scope")
+		}
+		if !segmentStart.Equal(aggregate.HourStartedAt) || !segmentEnd.Equal(hourEnd) {
+			result.UnknownGapSeconds += segmentEnd.Sub(segmentStart).Seconds()
+			continue
 		}
 		result.ObservedSeconds += aggregate.ObservedSeconds
 		result.UnknownGapSeconds += aggregate.UnknownGapSeconds
@@ -187,6 +214,15 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 		result.TrialSeconds > result.ObservedSeconds+1e-9 ||
 		result.TrialActualHashSeconds > result.ActualHashSeconds+1e-9 {
 		return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly totals violate bounds")
+	}
+	for _, value := range []float64{
+		result.ObservedSeconds, result.UnknownGapSeconds, result.ActualHashSeconds,
+		result.TrialActualHashSeconds, result.IncumbentCounterfactualHashSeconds,
+		result.SettledSeconds, result.TrialSeconds,
+	} {
+		if !finiteReportValue(value) {
+			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly totals are non-finite")
+		}
 	}
 	result.Coverage = result.ObservedSeconds / duration
 	if result.PreArmSettledHashRate > 0 {
@@ -273,12 +309,21 @@ func validateReportAttempt(attempt MutationAttempt) error {
 	return nil
 }
 
-// EvaluateArm compares treatment and control over exactly 168 hours. An arm
-// is valid at zero uplift when both cover at least 95% and the control point
-// was unchanged. The practical two-percent target is reported separately.
+// EvaluateArm compares treatment and control over exactly 168 hours. Validity
+// is the economic coverage rule; Accepted includes convergence, restart,
+// frontier, settlement, and control-stability gates.
 func EvaluateArm(input ReportArmInput) (ArmReport, error) {
-	if input.Start.IsZero() || input.Start.UTC().Truncate(time.Hour) != input.Start.UTC() {
-		return ArmReport{}, fmt.Errorf("evaluate arm: start must be a UTC hour")
+	if input.Start.IsZero() || input.Start.Location() != time.UTC {
+		return ArmReport{}, fmt.Errorf("evaluate arm: start must be a UTC timestamp")
+	}
+	if input.Treatment.Hostname == "" || input.Control.Hostname == "" ||
+		input.Treatment.Hostname == input.Control.Hostname {
+		return ArmReport{}, fmt.Errorf("evaluate arm: treatment and control must be distinct miners")
+	}
+	treatmentMAC := reportInputMAC(input.Treatment)
+	controlMAC := reportInputMAC(input.Control)
+	if treatmentMAC != "" && treatmentMAC == controlMAC {
+		return ArmReport{}, fmt.Errorf("evaluate arm: treatment and control MACs must be distinct")
 	}
 	window := ReportWindow{Start: input.Start.UTC(), End: input.Start.UTC().Add(ReportArmDuration)}
 	treatment, err := SummarizeReportMiner(input.Treatment, window)
@@ -294,17 +339,14 @@ func EvaluateArm(input ReportArmInput) (ArmReport, error) {
 		Treatment: treatment, Control: control,
 		CoverageValid: treatment.Coverage >= ReportMinimumCoverage && control.Coverage >= ReportMinimumCoverage,
 	}
-	baselineWindow := ReportWindow{Start: window.Start.Add(-ReportArmDuration), End: window.Start}
-	baseline, err := SummarizeRestartExposure(input.Treatment.MutationAttempts, baselineWindow)
-	if err != nil {
-		return ArmReport{}, err
-	}
-	treatment.NormalRestartBaselineRequests = baseline.NormalRequests
-	if baseline.NormalRequests == 0 {
+	result.Valid = result.CoverageValid
+	if !input.Treatment.NormalRestartBaselineObserved {
+		treatment.NormalRestartReductionValid = false
+	} else if treatment.NormalRestartBaselineRequests == 0 {
 		treatment.NormalRestartReduction = 1
 		treatment.NormalRestartReductionValid = treatment.Restart.NormalRequests == 0
 	} else {
-		treatment.NormalRestartReduction = 1 - float64(treatment.Restart.NormalRequests)/float64(baseline.NormalRequests)
+		treatment.NormalRestartReduction = 1 - float64(treatment.Restart.NormalRequests)/float64(treatment.NormalRestartBaselineRequests)
 		treatment.NormalRestartReductionValid = treatment.NormalRestartReduction >= ReportNormalRestartReduction
 	}
 	treatment.NormalExposureValid = treatment.Restart.NormalExposureSeconds <=
@@ -317,24 +359,32 @@ func EvaluateArm(input ReportArmInput) (ArmReport, error) {
 		}
 		postSettlementSeconds := window.End.Sub(postSettlementStart).Seconds()
 		if postSettlementSeconds > 0 {
-			treatment.PostSettlementCoverage = treatment.SettledSeconds / postSettlementSeconds
+			if treatment.SettledSeconds <= postSettlementSeconds+1e-9 {
+				treatment.PostSettlementCoverage = treatment.SettledSeconds / postSettlementSeconds
+				treatment.PostSettlementCoverageValid = true
+			}
 		}
 	}
-	if treatment.PreArmSettledHashRate <= 0 || control.PreArmSettledHashRate <= 0 {
-		return result, nil
+	result.Treatment = treatment
+	if treatment.PreArmSettledHashRate > 0 && control.PreArmSettledHashRate > 0 {
+		result.Uplift = treatment.NormalizedWork - control.NormalizedWork
 	}
-	if !input.Treatment.PassStartedAt.Equal(window.Start) ||
-		input.Treatment.PassReferenceHash <= 0 ||
-		input.Treatment.PassReferenceHash != treatment.PreArmSettledHashRate {
-		return result, nil
-	}
-	result.Uplift = treatment.NormalizedWork - control.NormalizedWork
-	controlBoundarySettled := !input.Control.SettledAt.IsZero() && !input.Control.SettledAt.After(window.Start)
-	result.UpliftValid = result.Uplift >= 0 && input.Control.PointStable && controlBoundarySettled
-	result.Valid = result.CoverageValid && result.UpliftValid &&
-		treatment.ConvergedBy48Hours && treatment.NormalRestartReductionValid &&
-		treatment.NormalExposureValid && treatment.PostSettlementCoverage >= ReportPostSettlementCoverage
-	result.PracticalTarget = result.Valid && result.Uplift >= .02
+	treatmentBoundaryFrozen := treatment.PreArmSettledHashRate > 0 && control.PreArmSettledHashRate > 0 &&
+		input.Treatment.PassStartedAt.Equal(window.Start) && input.Treatment.PassReferenceHash > 0 &&
+		input.Treatment.PassReferenceHash == treatment.PreArmSettledHashRate
+	// BoundarySettled is authoritative. A current SettledAt cannot substitute
+	// for an arm-boundary snapshot after a pass reset.
+	controlBoundarySettled := input.Control.BoundarySettled
+	result.ControlStable = input.Control.PointStable && controlBoundarySettled
+	result.UpliftValid = treatmentBoundaryFrozen && result.Uplift >= 0 &&
+		result.ControlStable
+	result.Accepted = result.Valid && result.UpliftValid &&
+		treatment.ConvergedBy48Hours && treatment.NormalRestartBaselineObserved &&
+		treatment.NormalRestartReductionValid && treatment.NormalExposureValid &&
+		treatment.PostSettlementCoverageValid && treatment.PostSettlementCoverage >= ReportPostSettlementCoverage &&
+		treatment.Frontier24Audited && treatment.Frontier24Valid
+	result.Treatment = treatment
+	result.PracticalTarget = result.Accepted && result.Uplift >= ReportPracticalUplift
 	return result, nil
 }
 
@@ -353,17 +403,80 @@ func EvaluateCrossover(input CrossoverInput) (CrossoverReport, error) {
 		input.AB.Control.Hostname != input.BA.Treatment.Hostname {
 		return CrossoverReport{}, fmt.Errorf("evaluate crossover: treatment/control roles are not symmetric")
 	}
-	if ab.Window.Start.Before(ba.Window.End) && ba.Window.Start.Before(ab.Window.End) {
+	if abTreatmentMAC, baControlMAC := reportInputMAC(input.AB.Treatment), reportInputMAC(input.BA.Control); abTreatmentMAC != "" && baControlMAC != "" && abTreatmentMAC != baControlMAC {
+		return CrossoverReport{}, fmt.Errorf("evaluate crossover: treatment MAC roles are not symmetric")
+	}
+	if abControlMAC, baTreatmentMAC := reportInputMAC(input.AB.Control), reportInputMAC(input.BA.Treatment); abControlMAC != "" && baTreatmentMAC != "" && abControlMAC != baTreatmentMAC {
+		return CrossoverReport{}, fmt.Errorf("evaluate crossover: control MAC roles are not symmetric")
+	}
+	if ba.Window.Start.Before(ab.Window.Start) {
+		return CrossoverReport{}, fmt.Errorf("evaluate crossover: BA arm precedes AB arm")
+	}
+	if ba.Window.Start.Before(ab.Window.End) {
 		return CrossoverReport{}, fmt.Errorf("evaluate crossover: arm windows overlap")
 	}
 	result := CrossoverReport{AB: ab, BA: ba}
-	if !ab.Valid || !ba.Valid {
+	if !ab.Valid || !ba.Valid || !ab.UpliftValid || !ba.UpliftValid {
 		return result, nil
 	}
 	result.CrossoverUplift = (ab.Uplift + ba.Uplift) / 2
 	result.Valid = result.CrossoverUplift >= 0
-	result.PracticalTarget = result.Valid && result.CrossoverUplift >= .02
+	result.Accepted = result.Valid && ab.Accepted && ba.Accepted
+	result.PracticalTarget = result.Accepted && result.CrossoverUplift >= ReportPracticalUplift
 	return result, nil
+}
+
+func reportInputMAC(input ReportMinerInput) string {
+	if input.MacAddr != "" {
+		return input.MacAddr
+	}
+	for _, aggregate := range input.Hourly {
+		if aggregate.MacAddr != "" {
+			return aggregate.MacAddr
+		}
+	}
+	return ""
+}
+
+// auditFrontier24 checks the durable point-entry ledger for the first 24
+// hours of a treatment pass. A candidate may have one entry and must be tied
+// to its mutation attempt; the sole unbound entry is the pass baseline.
+func auditFrontier24(
+	records []OperatingPointRecord,
+	window ReportWindow,
+	passStartedAt time.Time,
+) (duplicateTargets, timeCreatedEligibility int) {
+	if len(records) == 0 {
+		return 0, 0
+	}
+	auditEnd := window.Start.Add(24 * time.Hour)
+	entered := make(map[OperatingPoint]int)
+	unboundAtPassStart := 0
+	for _, record := range records {
+		if record.EnteredAt.Before(window.Start) || !record.EnteredAt.Before(auditEnd) {
+			continue
+		}
+		entered[record.Point()]++
+		if record.EntryAttemptID != 0 {
+			continue
+		}
+		if passStartedAt.IsZero() || !record.EnteredAt.Equal(passStartedAt) {
+			timeCreatedEligibility++
+		} else {
+			unboundAtPassStart++
+		}
+	}
+	for _, count := range entered {
+		if count > 1 {
+			duplicateTargets += count - 1
+		}
+	}
+	if unboundAtPassStart == 0 {
+		timeCreatedEligibility++
+	} else if unboundAtPassStart > 1 {
+		timeCreatedEligibility += unboundAtPassStart - 1
+	}
+	return duplicateTargets, timeCreatedEligibility
 }
 
 type reportMutationClass uint8
@@ -412,9 +525,8 @@ func mergedReportSeconds(intervals []reportInterval) float64 {
 
 func validateReportWindow(window ReportWindow) error {
 	if window.Start.IsZero() || window.End.IsZero() || !window.End.After(window.Start) ||
-		window.Start.UTC().Truncate(time.Hour) != window.Start.UTC() ||
-		window.End.UTC().Truncate(time.Hour) != window.End.UTC() {
-		return fmt.Errorf("range must be positive UTC hours")
+		window.Start.Location() != time.UTC || window.End.Location() != time.UTC {
+		return fmt.Errorf("range must be positive UTC timestamps")
 	}
 	if window.End.Sub(window.Start) > LongTermRetentionHours*time.Hour {
 		return fmt.Errorf("range exceeds retained history")

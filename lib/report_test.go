@@ -83,20 +83,37 @@ func TestEvaluateArmAndCrossover(t *testing.T) {
 	makeHourly := func(mac string, hash float64, start time.Time) []HourlyAggregate {
 		rows := make([]HourlyAggregate, 0, 168)
 		for index := 0; index < 168; index++ {
-			rows = append(rows, HourlyAggregate{MacAddr: mac, HourStartedAt: start.Add(time.Duration(index) * time.Hour), ObservedSeconds: 3600, ActualHashSeconds: hash * 3600, SettledSeconds: 3600})
+			settled := 0.0
+			if index >= 24 {
+				settled = 3600
+			}
+			rows = append(rows, HourlyAggregate{MacAddr: mac, HourStartedAt: start.Add(time.Duration(index) * time.Hour), ObservedSeconds: 3600, ActualHashSeconds: hash * 3600, SettledSeconds: settled})
 		}
 		return rows
 	}
+	makeRecords := func(mac string, start time.Time) []OperatingPointRecord {
+		return []OperatingPointRecord{{MacAddr: mac, Frequency: 525, CoreVoltage: 1150, Status: PointValidated, EnteredAt: start}}
+	}
 	armInput := func(start time.Time, treatment, control string, treatmentHash, controlHash float64) ReportArmInput {
+		treatmentMAC := testMAC
+		controlMAC := "aa:bb:cc:dd:ee:03"
+		if treatment == "b" {
+			treatmentMAC, controlMAC = controlMAC, treatmentMAC
+		}
 		return ReportArmInput{
 			Start:     start,
-			Treatment: ReportMinerInput{Hostname: treatment, PreArmSettledHashRate: 100, PassStartedAt: start, PassReferenceHash: 100, SettledAt: start.Add(24 * time.Hour), PointStable: true, Hourly: makeHourly(testMAC, treatmentHash, start)},
-			Control:   ReportMinerInput{Hostname: control, PreArmSettledHashRate: 100, SettledAt: start.Add(-time.Hour), PointStable: true, Hourly: makeHourly("aa:bb:cc:dd:ee:03", controlHash, start)},
+			Treatment: ReportMinerInput{MacAddr: treatmentMAC, Hostname: treatment, PreArmSettledHashRate: 100, PassStartedAt: start, PassReferenceHash: 100, SettledAt: start.Add(24 * time.Hour), PointStable: true, PointRecords: makeRecords(treatmentMAC, start), NormalRestartBaselineObserved: true, Hourly: makeHourly(treatmentMAC, treatmentHash, start)},
+			Control:   ReportMinerInput{MacAddr: controlMAC, Hostname: control, PreArmSettledHashRate: 100, SettledAt: start.Add(-time.Hour), BoundarySettled: true, PointStable: true, Hourly: makeHourly(controlMAC, controlHash, start)},
 		}
 	}
 	ab, err = EvaluateArm(armInput(from, "a", "b", 103, 100))
 	if err != nil || !ab.Valid || math.Abs(ab.Uplift-.03) > 1e-12 {
 		t.Fatalf("AB arm = %+v, %v", ab, err)
+	}
+	if !ab.Treatment.ConvergedBy48Hours || !ab.Treatment.NormalRestartReductionValid ||
+		!ab.Treatment.NormalExposureValid || !ab.Treatment.Frontier24Valid ||
+		ab.Treatment.Coverage != 1 {
+		t.Fatalf("treatment metrics were not retained in arm result: %+v", ab.Treatment)
 	}
 	baStart := from.Add(ReportArmDuration)
 	ba, err := EvaluateArm(armInput(baStart, "b", "a", 103, 100))
@@ -115,12 +132,119 @@ func TestEvaluateArmAndCrossover(t *testing.T) {
 func TestEvaluateArmRejectsLowCoverage(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := []HourlyAggregate{{MacAddr: testMAC, HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000}}
+	controlRows := []HourlyAggregate{{MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000}}
 	result, err := EvaluateArm(ReportArmInput{
 		Start:     from,
-		Treatment: ReportMinerInput{Hostname: "a", PreArmSettledHashRate: 100, PassStartedAt: from, PassReferenceHash: 100, SettledAt: from.Add(24 * time.Hour), PointStable: true, Hourly: rows},
-		Control:   ReportMinerInput{Hostname: "b", PreArmSettledHashRate: 100, SettledAt: from.Add(-time.Hour), PointStable: true, Hourly: rows},
+		Treatment: ReportMinerInput{MacAddr: testMAC, Hostname: "a", PreArmSettledHashRate: 100, PassStartedAt: from, PassReferenceHash: 100, SettledAt: from.Add(24 * time.Hour), PointStable: true, NormalRestartBaselineObserved: true, Hourly: rows},
+		Control:   ReportMinerInput{MacAddr: "aa:bb:cc:dd:ee:03", Hostname: "b", PreArmSettledHashRate: 100, SettledAt: from.Add(-time.Hour), BoundarySettled: true, PointStable: true, Hourly: controlRows},
 	})
 	if err != nil || result.Valid {
 		t.Fatalf("low coverage arm = %+v, %v", result, err)
+	}
+}
+
+func TestAuditFrontier24RejectsDuplicateAndTimeCreatedEntries(t *testing.T) {
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := ReportWindow{Start: from, End: from.Add(ReportArmDuration)}
+	records := []OperatingPointRecord{
+		{Frequency: 400, CoreVoltage: 1000, Status: PointEntered, EnteredAt: from},
+		{Frequency: 490, CoreVoltage: 1000, Status: PointEntered, EnteredAt: from.Add(time.Hour)},
+		{Frequency: 550, CoreVoltage: 1100, Status: PointEntered, EnteredAt: from.Add(2 * time.Hour), EntryAttemptID: 1},
+		{Frequency: 550, CoreVoltage: 1100, Status: PointEntered, EnteredAt: from.Add(3 * time.Hour), EntryAttemptID: 2},
+	}
+	duplicates, timeCreated := auditFrontier24(records, window, from)
+	if duplicates != 1 || timeCreated != 1 {
+		t.Fatalf("frontier audit = duplicates %d, time-created %d", duplicates, timeCreated)
+	}
+}
+
+func TestSummarizeReportMinerTreatsPartialBoundaryHoursAsUnknown(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
+	window := ReportWindow{Start: start, End: start.Add(2 * time.Hour)}
+	metrics, err := SummarizeReportMiner(ReportMinerInput{
+		MacAddr:               testMAC,
+		PreArmSettledHashRate: 100,
+		Hourly: []HourlyAggregate{
+			{MacAddr: testMAC, HourStartedAt: start.Add(-30 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(30 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(90 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+		},
+	}, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.ObservedSeconds != 3600 || metrics.UnknownGapSeconds != 3600 || metrics.ActualHashSeconds != 360000 || metrics.Coverage != .5 {
+		t.Fatalf("partial boundary accounting = %+v", metrics)
+	}
+}
+
+func TestEvaluateArmSeparatesCoverageValidityFromAcceptance(t *testing.T) {
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := make([]HourlyAggregate, 0, 168)
+	for index := 0; index < 168; index++ {
+		rows = append(rows, HourlyAggregate{
+			MacAddr: testMAC, HourStartedAt: from.Add(time.Duration(index) * time.Hour),
+			ObservedSeconds: 3600, ActualHashSeconds: 360000, SettledSeconds: 3600,
+		})
+	}
+	controlRows := make([]HourlyAggregate, 0, 168)
+	for index := 0; index < 168; index++ {
+		controlRows = append(controlRows, HourlyAggregate{
+			MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from.Add(time.Duration(index) * time.Hour),
+			ObservedSeconds: 3600, ActualHashSeconds: 360000,
+		})
+	}
+	input := ReportArmInput{
+		Start: from,
+		Treatment: ReportMinerInput{
+			MacAddr: testMAC, Hostname: "treatment", PreArmSettledHashRate: 100,
+			PassStartedAt: from, PassReferenceHash: 100, SettledAt: from.Add(time.Hour),
+			PointStable: true, PointRecords: []OperatingPointRecord{{MacAddr: testMAC, Frequency: 525, CoreVoltage: 1150, Status: PointValidated, EnteredAt: from}}, Hourly: rows,
+		},
+		Control: ReportMinerInput{
+			MacAddr: "aa:bb:cc:dd:ee:03", Hostname: "control", PreArmSettledHashRate: 100,
+			SettledAt: from.Add(-time.Hour), BoundarySettled: true, PointStable: true,
+			Hourly: controlRows,
+		},
+	}
+	report, err := EvaluateArm(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Valid || !report.UpliftValid || report.Accepted || report.Uplift != 0 {
+		t.Fatalf("coverage/economic validity was conflated: %+v", report)
+	}
+	input.Control.BoundarySettled = false
+	input.Control.PointStable = false
+	unproven, err := EvaluateArm(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unproven.Valid || unproven.UpliftValid || unproven.Accepted {
+		t.Fatalf("unproven control boundary was accepted: %+v", unproven)
+	}
+}
+
+func TestEvaluateArmRejectsSameMinerAndCrossoverReversal(t *testing.T) {
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := EvaluateArm(ReportArmInput{
+		Start:     from,
+		Treatment: ReportMinerInput{MacAddr: testMAC, Hostname: "a"},
+		Control:   ReportMinerInput{MacAddr: testMAC, Hostname: "b"},
+	}); err == nil {
+		t.Fatal("same-miner arm was accepted")
+	}
+	arm := func(start time.Time, treatment, control string) ReportArmInput {
+		return ReportArmInput{
+			Start:     start,
+			Treatment: ReportMinerInput{Hostname: treatment},
+			Control:   ReportMinerInput{Hostname: control},
+		}
+	}
+	if _, err := EvaluateCrossover(CrossoverInput{
+		AB: arm(from.Add(ReportArmDuration), "a", "b"),
+		BA: arm(from, "b", "a"),
+	}); err == nil {
+		t.Fatal("reversed crossover arms were accepted")
 	}
 }

@@ -312,13 +312,20 @@ An AB/BA report evaluates two non-overlapping 168-hour arms with roles reversed:
 ```
 
 Reports normalize actual hash over the full wall duration, count unknown time
-as zero work, separate normal and safety restart exposure, and require at least
-95% coverage. A valid arm also requires treatment convergence by 48 hours, at
-least a 90% reduction from the preceding normal-restart count, normal restart
-exposure no greater than 1% of arm time, at least 95% post-settlement selected
-point coverage, and a settled unchanged control. A nonnegative valid-arm uplift
-is required for success; the 2% uplift is shown as a practical target. Report
-mode performs no discovery, PATCH, restart, mining reconciliation, or mutation.
+as zero work, conservatively classify partial boundary hours as unknown, and
+separate normal and safety restart exposure. An arm is coverage-valid when both
+miners have at least 95% coverage; its nonnegative uplift is reported even when
+operational acceptance gates fail. Acceptance additionally requires an observed
+normal-restart baseline with at least a 90% reduction, convergence by 48 hours,
+normal restart exposure no greater than 1% of arm time, at least 95%
+post-settlement selected-point coverage, an audited first-24-hour frontier with
+no duplicate target entry or time-created eligibility, and a settled unchanged
+control. The 2% uplift is shown as a practical target. Report mode performs no
+discovery, PATCH, restart, mining reconciliation, or mutation.
+
+Schema v4 preserves the prior control rate across a retune but not its historical
+settlement timestamp; an AB/BA report therefore marks that control boundary
+unavailable after reset instead of inferring settlement from current state.
 
 Bitagnis cannot substitute for adequate cooling or a correctly sized power
 supply. AxeOS thermal protection remains the final safety layer.
