@@ -32,6 +32,41 @@ func TestSummarizeReportMinerUsesFullWallDurationAndMergesExposure(t *testing.T)
 	}
 }
 
+func TestReportBoundaryRequiresCompleteCanonicalHistoricalEvidence(t *testing.T) {
+	start := time.Date(2026, 1, 8, 0, 0, 0, 0, time.UTC)
+	valid := ReportMinerInput{
+		PreArmSettledHashRate: 100,
+		BoundaryPoint:         OperatingPoint{Frequency: 525, CoreVoltage: 1150},
+		BoundarySettledAt:     start.Add(-time.Minute),
+	}
+	cases := []struct {
+		name  string
+		input ReportMinerInput
+		want  bool
+	}{
+		{name: "valid", input: valid, want: true},
+		{name: "off grid", input: func() ReportMinerInput { value := valid; value.BoundaryPoint.Frequency = 500; return value }(), want: false},
+		{name: "sentinel", input: func() ReportMinerInput { value := valid; value.BoundaryPoint.Frequency = 50; return value }(), want: false},
+		{name: "settlement after arm start", input: func() ReportMinerInput {
+			value := valid
+			value.BoundarySettledAt = start.Add(time.Second)
+			return value
+		}(), want: false},
+		{name: "non-UTC settlement", input: func() ReportMinerInput {
+			value := valid
+			value.BoundarySettledAt = time.Date(2026, 1, 7, 19, 0, 0, 0, time.FixedZone("offset", -5*60*60))
+			return value
+		}(), want: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := validReportBoundary(testCase.input, start); got != testCase.want {
+				t.Fatalf("validReportBoundary() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestSummarizeRestartExposureMergesOverlappingIntervals(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	window := ReportWindow{Start: from, End: from.Add(time.Hour)}
@@ -102,8 +137,10 @@ func TestEvaluateArmAndCrossover(t *testing.T) {
 		}
 		return ReportArmInput{
 			Start:     start,
-			Treatment: ReportMinerInput{MacAddr: treatmentMAC, Hostname: treatment, PreArmSettledHashRate: 100, PassStartedAt: start, PassReferenceHash: 100, SettledAt: start.Add(24 * time.Hour), PointStable: true, PointRecords: makeRecords(treatmentMAC, start), NormalRestartBaselineObserved: true, Hourly: makeHourly(treatmentMAC, treatmentHash, start)},
-			Control:   ReportMinerInput{MacAddr: controlMAC, Hostname: control, PreArmSettledHashRate: 100, SettledAt: start.Add(-time.Hour), BoundarySettled: true, PointStable: true, Hourly: makeHourly(controlMAC, controlHash, start)},
+			Treatment: ReportMinerInput{MacAddr: treatmentMAC, Hostname: treatment, PreArmSettledHashRate: 100, PassStartedAt: start, PassReferenceHash: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: start.Add(-time.Hour), SettledAt: start.Add(24 * time.Hour), PointStable: true, PointRecords: makeRecords(treatmentMAC, start), NormalRestartBaselineObserved: true, Hourly: makeHourly(treatmentMAC, treatmentHash, start)},
+			// The control has no current point records in this fixture. Its
+			// complete boundary snapshot is the historical evidence for the arm.
+			Control: ReportMinerInput{MacAddr: controlMAC, Hostname: control, PreArmSettledHashRate: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: start.Add(-time.Hour), SettledAt: start.Add(-time.Hour), PointStable: true, Hourly: makeHourly(controlMAC, controlHash, start)},
 		}
 	}
 	ab, err = EvaluateArm(armInput(from, "a", "b", 103, 100))
@@ -135,8 +172,8 @@ func TestEvaluateArmRejectsLowCoverage(t *testing.T) {
 	controlRows := []HourlyAggregate{{MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000}}
 	result, err := EvaluateArm(ReportArmInput{
 		Start:     from,
-		Treatment: ReportMinerInput{MacAddr: testMAC, Hostname: "a", PreArmSettledHashRate: 100, PassStartedAt: from, PassReferenceHash: 100, SettledAt: from.Add(24 * time.Hour), PointStable: true, NormalRestartBaselineObserved: true, Hourly: rows},
-		Control:   ReportMinerInput{MacAddr: "aa:bb:cc:dd:ee:03", Hostname: "b", PreArmSettledHashRate: 100, SettledAt: from.Add(-time.Hour), BoundarySettled: true, PointStable: true, Hourly: controlRows},
+		Treatment: ReportMinerInput{MacAddr: testMAC, Hostname: "a", PreArmSettledHashRate: 100, PassStartedAt: from, PassReferenceHash: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: from.Add(-time.Hour), SettledAt: from.Add(24 * time.Hour), PointStable: true, NormalRestartBaselineObserved: true, Hourly: rows},
+		Control:   ReportMinerInput{MacAddr: "aa:bb:cc:dd:ee:03", Hostname: "b", PreArmSettledHashRate: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: from.Add(-time.Hour), SettledAt: from.Add(-time.Hour), PointStable: true, Hourly: controlRows},
 	})
 	if err != nil || result.Valid {
 		t.Fatalf("low coverage arm = %+v, %v", result, err)
@@ -198,12 +235,12 @@ func TestEvaluateArmSeparatesCoverageValidityFromAcceptance(t *testing.T) {
 		Start: from,
 		Treatment: ReportMinerInput{
 			MacAddr: testMAC, Hostname: "treatment", PreArmSettledHashRate: 100,
-			PassStartedAt: from, PassReferenceHash: 100, SettledAt: from.Add(time.Hour),
+			PassStartedAt: from, PassReferenceHash: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: from.Add(-time.Hour), SettledAt: from.Add(time.Hour),
 			PointStable: true, PointRecords: []OperatingPointRecord{{MacAddr: testMAC, Frequency: 525, CoreVoltage: 1150, Status: PointValidated, EnteredAt: from}}, Hourly: rows,
 		},
 		Control: ReportMinerInput{
 			MacAddr: "aa:bb:cc:dd:ee:03", Hostname: "control", PreArmSettledHashRate: 100,
-			SettledAt: from.Add(-time.Hour), BoundarySettled: true, PointStable: true,
+			BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: from.Add(-time.Hour), SettledAt: from.Add(-time.Hour), PointStable: true,
 			Hourly: controlRows,
 		},
 	}
@@ -214,7 +251,7 @@ func TestEvaluateArmSeparatesCoverageValidityFromAcceptance(t *testing.T) {
 	if !report.Valid || !report.UpliftValid || report.Accepted || report.Uplift != 0 {
 		t.Fatalf("coverage/economic validity was conflated: %+v", report)
 	}
-	input.Control.BoundarySettled = false
+	input.Control.BoundarySettledAt = time.Time{}
 	input.Control.PointStable = false
 	unproven, err := EvaluateArm(input)
 	if err != nil {

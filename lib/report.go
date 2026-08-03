@@ -47,7 +47,8 @@ type RestartExposure struct {
 }
 
 // ReportMinerInput is the durable, credential-free input to report
-// calculations. PreArmSettledHashRate is frozen at the arm boundary.
+// calculations. PreArmSettledHashRate and the complete boundary tuple are
+// frozen at the arm boundary.
 type ReportMinerInput struct {
 	MacAddr                       string
 	Hostname                      string
@@ -55,7 +56,8 @@ type ReportMinerInput struct {
 	PassStartedAt                 time.Time
 	PassReferenceHash             float64
 	SettledAt                     time.Time
-	BoundarySettled               bool
+	BoundaryPoint                 OperatingPoint
+	BoundarySettledAt             time.Time
 	PointStable                   bool
 	PointRecords                  []OperatingPointRecord
 	NormalRestartBaselineRequests int
@@ -68,6 +70,8 @@ type ReportMinerInput struct {
 // miner in one report arm.
 type ReportMinerMetrics struct {
 	Hostname                           string
+	BoundaryPoint                      OperatingPoint
+	BoundarySettledAt                  time.Time
 	SettledAt                          time.Time
 	Coverage                           float64
 	ObservedSeconds                    float64
@@ -149,6 +153,8 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 	}
 	result := ReportMinerMetrics{
 		Hostname:                      input.Hostname,
+		BoundaryPoint:                 input.BoundaryPoint,
+		BoundarySettledAt:             input.BoundarySettledAt,
 		PreArmSettledHashRate:         input.PreArmSettledHashRate,
 		SettledAt:                     input.SettledAt,
 		NormalRestartBaselineRequests: input.NormalRestartBaselineRequests,
@@ -369,12 +375,10 @@ func EvaluateArm(input ReportArmInput) (ArmReport, error) {
 	if treatment.PreArmSettledHashRate > 0 && control.PreArmSettledHashRate > 0 {
 		result.Uplift = treatment.NormalizedWork - control.NormalizedWork
 	}
-	treatmentBoundaryFrozen := treatment.PreArmSettledHashRate > 0 && control.PreArmSettledHashRate > 0 &&
+	treatmentBoundaryFrozen := validReportBoundary(input.Treatment, window.Start) &&
 		input.Treatment.PassStartedAt.Equal(window.Start) && input.Treatment.PassReferenceHash > 0 &&
 		input.Treatment.PassReferenceHash == treatment.PreArmSettledHashRate
-	// BoundarySettled is authoritative. A current SettledAt cannot substitute
-	// for an arm-boundary snapshot after a pass reset.
-	controlBoundarySettled := input.Control.BoundarySettled
+	controlBoundarySettled := validReportBoundary(input.Control, window.Start)
 	result.ControlStable = input.Control.PointStable && controlBoundarySettled
 	result.UpliftValid = treatmentBoundaryFrozen && result.Uplift >= 0 &&
 		result.ControlStable
@@ -386,6 +390,16 @@ func EvaluateArm(input ReportArmInput) (ArmReport, error) {
 	result.Treatment = treatment
 	result.PracticalTarget = result.Accepted && result.Uplift >= ReportPracticalUplift
 	return result, nil
+}
+
+func validReportBoundary(input ReportMinerInput, armStart time.Time) bool {
+	return input.PreArmSettledHashRate > 0 && finiteReportValue(input.PreArmSettledHashRate) &&
+		IsCanonicalOperatingPoint(input.BoundaryPoint) &&
+		input.BoundaryPoint.Frequency != 50 &&
+		!input.BoundarySettledAt.IsZero() &&
+		input.BoundarySettledAt.Location() == time.UTC &&
+		input.BoundarySettledAt.UnixNano() > 0 &&
+		!input.BoundarySettledAt.After(armStart)
 }
 
 // EvaluateCrossover evaluates sequential, non-overlapping AB and BA arms and

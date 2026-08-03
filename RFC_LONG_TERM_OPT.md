@@ -1350,6 +1350,12 @@ conservative `median_hash` from its currently selected validated row as that min
 `pre_arm_settled_hash_rate`. For each exact 168-hour arm, normalize over the full wall duration, not
 only observed seconds:
 
+The credential-free report input carries the complete boundary point and its durable settlement
+timestamp alongside each frozen rate. A boundary is valid only when the point is an exact canonical
+frequency/voltage pair, the hash rate is finite and positive, and settlement is a nonzero UTC time
+no later than the arm start. A missing or invalid tuple is an explicit invalid-evidence result, not
+a request to consult current state.
+
 ```text
 coverage(m, arm) = observed_seconds(m, arm) / 168h_seconds
 
@@ -1382,8 +1388,9 @@ transaction's persisted `pass_started_at`; the treatment denominator is its atom
 same timestamp. The arm ends exactly 168 hours later and uses that same contemporaneous wall interval
 for its control. Any control point change invalidates the arm. Schema v5 preserves the prior selected
 point, rate, and settlement timestamp in one atomic pass-reference snapshot, so a control retuned at
-the exact arm boundary remains auditable without using its new pass rows. An inter-arm gap or a later
-retune that overwrites the snapshot discards the historical boundary evidence.
+the exact arm boundary remains auditable without using its new pass rows; the report reader consumes
+that snapshot rather than inferring the boundary from the new pass. An inter-arm gap or a later retune
+that overwrites the snapshot discards the historical boundary evidence.
 The 24- and 48-hour checks are relative to this arm start.
 Success requires:
 
@@ -1452,8 +1459,8 @@ evidence is a new explicit policy revision, not a time-based retry.
 
 No architecture, ownership, recovery-action, retune-contract, pass-cap, or schema-boundary
 uncertainty remains for implementation. The schema-v5 snapshot is the canonical durable source for a
-historical control boundary; the report-layer cutover that consumes it is the next logical phase and
-must not infer an unavailable boundary from current state.
+historical control boundary, and the report reader consumes it without inferring an unavailable
+boundary from current state.
 
 ## Complete Cutover
 
@@ -1502,7 +1509,7 @@ a miner.
    exact schema rejection, reset capture, and reopen validation.
 3. `report long-term optimizer economics`: add terminal rendering and multi-day queries over the
    already-populated schema-v5 aggregates, consume historical boundary snapshots, and add their
-   query, formatting, and simulation tests.
+   query, formatting, and historical-AB/BA regression tests.
 
 ## Conclusion
 

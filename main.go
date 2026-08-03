@@ -534,61 +534,77 @@ func loadReportMinerInput(
 		}
 		baselineRequests = baselineExposure.NormalRequests
 	}
-	if !treatment && state.PassTrigger == lib.PassOperator && state.PassReferenceHash > 0 &&
-		!state.PassStartedAt.Before(window.End) {
-		boundaryRate := 0.0
-		boundaryReference := 0.0
-		if state.PassStartedAt.Equal(window.End) {
-			// The schema-v5 snapshot is persisted, but this report-reader phase
-			// still defers consuming its point and settlement fields. Keep the
-			// boundary unavailable rather than inferring it from current state.
-			boundaryRate = state.PassReferenceHash
-			boundaryReference = state.PassReferenceHash
-		}
-		return lib.ReportMinerInput{
-			MacAddr:               state.MacAddr,
-			Hostname:              hostname,
-			PreArmSettledHashRate: boundaryRate,
-			PassStartedAt:         state.PassStartedAt,
-			PassReferenceHash:     boundaryReference,
-			BoundarySettled:       false,
-			PointStable:           false,
-			PointRecords:          records,
-			Hourly:                hourly,
-			MutationAttempts:      attempts,
-		}, nil
+	input := lib.ReportMinerInput{
+		MacAddr:                       state.MacAddr,
+		Hostname:                      hostname,
+		PassStartedAt:                 state.PassStartedAt,
+		PassReferenceHash:             state.PassReferenceHash,
+		PointRecords:                  records,
+		NormalRestartBaselineRequests: baselineRequests,
+		NormalRestartBaselineObserved: baselineObserved,
+		Hourly:                        hourly,
+		MutationAttempts:              attempts,
 	}
+	mutationStable := reportPointStable(attempts, window)
+	if treatment {
+		if state.PassTrigger != lib.PassOperator || !state.PassStartedAt.Equal(window.Start) || state.PassReferenceHash <= 0 {
+			return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: treatment pass boundary is not durably frozen at the arm start", hostname)
+		}
+		input.PreArmSettledHashRate = state.PassReferenceHash
+		input.BoundaryPoint = lib.OperatingPoint{
+			Frequency:   state.PassReferenceFrequency,
+			CoreVoltage: state.PassReferenceCoreVoltage,
+		}
+		input.BoundarySettledAt = state.PassReferenceSettledAt
+		selected, found := findRecord(records, state.CurrentPoint())
+		if found && selected.Status == lib.PointValidated && finite(selected.MedianHash) && selected.MedianHash > 0 {
+			input.SettledAt = state.SettledAt
+		}
+		return input, nil
+	}
+
+	if state.PassStartedAt.Equal(window.End) && state.PassTrigger == lib.PassOperator {
+		// The second retune starts at the half-open AB arm end. Its atomic
+		// pass-reference snapshot is the only durable source for B's historical
+		// AB boundary; the new BA point history is deliberately not consulted.
+		input.PreArmSettledHashRate = state.PassReferenceHash
+		input.BoundaryPoint = lib.OperatingPoint{
+			Frequency:   state.PassReferenceFrequency,
+			CoreVoltage: state.PassReferenceCoreVoltage,
+		}
+		input.BoundarySettledAt = state.PassReferenceSettledAt
+		input.PointStable = mutationStable
+		return input, nil
+	}
+	if state.PassStartedAt.After(window.Start) {
+		// A reset inside the arm or after an inter-arm gap means the current
+		// state cannot prove the historical control boundary.
+		return input, nil
+	}
+
 	selected, found := findRecord(records, state.CurrentPoint())
 	if !found || selected.Status != lib.PointValidated || !finite(selected.MedianHash) || selected.MedianHash <= 0 {
-		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: no positive validated selected point", hostname)
+		return input, nil
 	}
-	pointStable := state.Phase == lib.PhaseHold && state.HoldReason == lib.HoldOptimized &&
-		!state.SettledAt.IsZero() && state.PendingKind == "" && !state.MiningPending
+	input.PreArmSettledHashRate = selected.MedianHash
+	input.BoundaryPoint = selected.Point()
+	input.BoundarySettledAt = state.SettledAt
+	input.SettledAt = state.SettledAt
+	input.PointStable = state.Phase == lib.PhaseHold && state.HoldReason == lib.HoldOptimized &&
+		!state.SettledAt.IsZero() && state.PendingKind == "" && !state.MiningPending && mutationStable
+	return input, nil
+}
+
+func reportPointStable(attempts []lib.MutationAttempt, window lib.ReportWindow) bool {
 	for _, attempt := range attempts {
 		if attempt.Kind != lib.MutationOperatingPoint && attempt.Kind != lib.MutationSafetyRollback && attempt.Kind != lib.MutationOverheatRecovery {
 			continue
 		}
 		if mutationOverlapsReportWindow(attempt, window) {
-			pointStable = false
+			return false
 		}
 	}
-	preArmRate := selected.MedianHash
-	if state.PassStartedAt.Equal(window.Start) && state.PassReferenceHash > 0 {
-		preArmRate = state.PassReferenceHash
-	}
-	if treatment && (state.PassTrigger != lib.PassOperator || !state.PassStartedAt.Equal(window.Start) || state.PassReferenceHash <= 0) {
-		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: treatment pass boundary is not durably frozen at the arm start", hostname)
-	}
-	return lib.ReportMinerInput{
-		MacAddr:  state.MacAddr,
-		Hostname: hostname, PreArmSettledHashRate: preArmRate,
-		PassStartedAt: state.PassStartedAt, PassReferenceHash: state.PassReferenceHash,
-		SettledAt:       state.SettledAt,
-		BoundarySettled: !state.SettledAt.IsZero() && !state.SettledAt.After(window.Start),
-		PointStable:     pointStable, PointRecords: records,
-		NormalRestartBaselineRequests: baselineRequests, NormalRestartBaselineObserved: baselineObserved,
-		Hourly: hourly, MutationAttempts: attempts,
-	}, nil
+	return true
 }
 
 func mutationOverlapsReportWindow(attempt lib.MutationAttempt, window lib.ReportWindow) bool {
@@ -631,6 +647,11 @@ func formatCrossoverReport(output io.Writer, report lib.CrossoverReport) {
 
 func formatReportMiner(output io.Writer, role string, report lib.ReportMinerMetrics) {
 	fmt.Fprintf(output, "  %s: coverage %.1f%% (observed %.0fs, unknown %.0fs), actual %.0f H/s·s, trial actual %.0f, incumbent counterfactual %.0f, normalized %.4f, settled %.0fs, trial %.0fs\n", role, report.Coverage*100, report.ObservedSeconds, report.UnknownGapSeconds, report.ActualHashSeconds, report.TrialActualHashSeconds, report.IncumbentCounterfactualHashSeconds, report.NormalizedWork, report.SettledSeconds, report.TrialSeconds)
+	if report.BoundaryPoint != (lib.OperatingPoint{}) && !report.BoundarySettledAt.IsZero() {
+		fmt.Fprintf(output, "    boundary %d/%d, settled %s\n", report.BoundaryPoint.Frequency, report.BoundaryPoint.CoreVoltage, report.BoundarySettledAt.UTC().Format(time.RFC3339))
+	} else {
+		fmt.Fprintln(output, "    boundary unavailable")
+	}
 	fmt.Fprintf(output, "    post-settlement coverage %.1f%% (evidence %t), prior normal requests %d (observed %t), reduction %.1f%%\n", report.PostSettlementCoverage*100, report.PostSettlementCoverageValid, report.NormalRestartBaselineRequests, report.NormalRestartBaselineObserved, report.NormalRestartReduction*100)
 	fmt.Fprintf(output, "    frontier first 24h: audited %t, duplicates %d, time-created eligibility %d, valid %t\n", report.Frontier24Audited, report.DuplicateEnteredTargets, report.TimeCreatedEligibility, report.Frontier24Valid)
 	fmt.Fprintf(output, "    restarts normal %d/%.0fs, safety %d/%.0fs, unresolved %d\n", report.Restart.NormalRequests, report.Restart.NormalExposureSeconds, report.Restart.SafetyRequests, report.Restart.SafetyExposureSeconds, report.Restart.UnresolvedAttempts)

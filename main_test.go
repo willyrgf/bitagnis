@@ -226,6 +226,61 @@ func TestLongTermReportFormattingIsDeterministicAndCredentialFree(t *testing.T) 
 	}
 }
 
+func TestReportLoaderUsesHistoricalControlBoundaryAfterSecondRetune(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	oldPoint := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	info := rootTestInfo(oldPoint, 100)
+	info.MacAddr = "aa:bb:cc:dd:ee:04"
+	info.Hostname = "control-history"
+	createdAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	state, _, err := store.BootstrapMiner(info, "192.0.2.14", createdAt, time.Minute, 5*time.Minute, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := lib.OperatingPointRecord{
+		MacAddr: info.MacAddr, Frequency: oldPoint.Frequency, CoreVoltage: oldPoint.CoreVoltage,
+		Status: lib.PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: createdAt.Add(10 * time.Minute), EnteredAt: createdAt,
+	}
+	if err := store.FinalizeBaseline(&state, baseline, false, baseline.MeasuredAt); err != nil {
+		t.Fatal(err)
+	}
+	boundarySettledAt := createdAt.Add(23 * time.Hour)
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldOptimized
+	state.SettledAt = boundarySettledAt
+	state.RampUntil = createdAt
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+
+	armStart := createdAt.Add(24 * time.Hour)
+	passStart := armStart.Add(lib.ReportArmDuration)
+	if err := store.ResetOptimizationPass(
+		info.MacAddr, oldPoint, passStart, passStart.Add(time.Minute), passStart.Add(21*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	input, err := loadReportMinerInput(store, info.Hostname, lib.ReportWindow{Start: armStart, End: passStart}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input.PreArmSettledHashRate != 100 || input.BoundaryPoint != oldPoint ||
+		!input.BoundarySettledAt.Equal(boundarySettledAt) || !input.PointStable {
+		t.Fatalf("historical control boundary = %+v", input)
+	}
+	if len(input.PointRecords) != 1 || input.PointRecords[0].Status != lib.PointEntered {
+		t.Fatalf("historical control consulted new pass rows: %+v", input.PointRecords)
+	}
+}
+
 func TestMutationOverlapsReportWindowUsesHealthyOrFailureBoundary(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	window := lib.ReportWindow{Start: start, End: start.Add(24 * time.Hour)}

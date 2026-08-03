@@ -117,10 +117,11 @@ across ordinary restarts after that baseline is created.
 An optimized operator retune atomically preserves the prior selected point's
 complete frequency/voltage pair, conservative median hash, and settled
 timestamp in the pass-reference snapshot. Initial and manual passes may have
-no arm snapshot. The report reader cutover that consumes this snapshot for
-historical AB/BA control evidence is the next logical phase; until it lands,
-report mode conservatively marks that boundary unavailable rather than
-inferring it from current state.
+no arm snapshot. Report mode consumes this exact snapshot for historical
+AB/BA control evidence when the second retune starts exactly at the prior arm
+end; a reset inside an arm or after an inter-arm gap leaves that historical
+boundary unavailable. It never infers a missing boundary from current state or
+the new pass's point rows.
 
 Mutation history records the mutation kind, finite reason, complete source and
 target pair, intent/start time, configured-readback and restart milestones,
