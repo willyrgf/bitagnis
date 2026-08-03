@@ -164,12 +164,6 @@ func (client *BitaxeClient) GetSystemInfo(ctx context.Context, target string) (I
 	if err := client.getJSON(ctx, target, "/api/system/info", &info); err != nil {
 		return Info{}, fmt.Errorf("get system info: %w", err)
 	}
-	if info.ErrorPercentage != nil &&
-		(!finite(*info.ErrorPercentage) ||
-			*info.ErrorPercentage < 0 ||
-			*info.ErrorPercentage > 100) {
-		info.ErrorPercentage = nil
-	}
 	if err := validateInfo(info); err != nil {
 		return Info{}, fmt.Errorf("validate system info: %w", err)
 	}
@@ -190,6 +184,16 @@ func (client *BitaxeClient) GetASICSettings(
 	}
 	if !validCoreVoltage(settings.DefaultVoltage) {
 		return ASICSettings{}, fmt.Errorf("get ASIC settings: invalid default voltage %d", settings.DefaultVoltage)
+	}
+	for _, option := range settings.FrequencyOptions {
+		if option <= 0 || option > 10_000 {
+			return ASICSettings{}, fmt.Errorf("get ASIC settings: invalid frequency option %d", option)
+		}
+	}
+	for _, option := range settings.VoltageOptions {
+		if !validCoreVoltage(option) {
+			return ASICSettings{}, fmt.Errorf("get ASIC settings: invalid voltage option %d", option)
+		}
 	}
 	settings.FrequencyOptions = normalizedOptions(
 		settings.FrequencyOptions,
@@ -329,6 +333,8 @@ func validateOperatingPoint(point OperatingPoint) error {
 	switch {
 	case point.Frequency <= 0 || point.Frequency > 10_000:
 		return fmt.Errorf("invalid frequency %d", point.Frequency)
+	case point.Frequency == 50:
+		return fmt.Errorf("firmware emergency frequency sentinel cannot be requested")
 	case !validCoreVoltage(point.CoreVoltage):
 		return fmt.Errorf("invalid core voltage %d", point.CoreVoltage)
 	default:
@@ -548,10 +554,13 @@ func validateInfo(info Info) error {
 	case !finite(info.CoreVoltageActual) || info.CoreVoltageActual < 0 ||
 		info.CoreVoltageActual > 10_000:
 		return fmt.Errorf("actual core voltage %.2f is outside the accepted range", info.CoreVoltageActual)
-	case !finite(info.HashRate):
+	case !finite(info.HashRate) || info.HashRate < 0:
 		return fmt.Errorf("hash rate %.2f is invalid", info.HashRate)
-	case !finite(info.ExpectedHashRate):
+	case !finite(info.ExpectedHashRate) || info.ExpectedHashRate < 0:
 		return fmt.Errorf("expected hash rate %.2f is invalid", info.ExpectedHashRate)
+	case info.ErrorPercentage != nil &&
+		(!finite(*info.ErrorPercentage) || *info.ErrorPercentage < 0 || *info.ErrorPercentage > 100):
+		return fmt.Errorf("error percentage is invalid")
 	case !finite(info.Temp) || info.Temp < -100 || info.Temp > 200:
 		return fmt.Errorf("ASIC temperature %.2f is invalid", info.Temp)
 	case !finite(info.VRTemp) || info.VRTemp < -100 || info.VRTemp > 200:

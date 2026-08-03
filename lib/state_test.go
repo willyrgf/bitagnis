@@ -184,6 +184,18 @@ func TestAutomationPersistenceRejectsOffGridAuthority(t *testing.T) {
 	}
 }
 
+func TestUnobservablePointCannotPersistEvidence(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	record := OperatingPointRecord{
+		MacAddr: testMAC, Frequency: 525, CoreVoltage: 1150,
+		Status: PointUnobservable, MedianHash: 1, EnteredAt: now,
+		MeasuredAt: now.Add(time.Minute),
+	}
+	if err := validatePointRecord(record); err == nil {
+		t.Fatal("unobservable point with evidence was accepted")
+	}
+}
+
 func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)

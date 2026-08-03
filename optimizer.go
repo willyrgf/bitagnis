@@ -512,12 +512,7 @@ func (minerController *controller) evaluateBaseline(
 		point := state.CurrentPoint()
 		return minerController.finalizeBaseline(state, lib.OperatingPointRecord{
 			MacAddr: state.MacAddr, Frequency: point.Frequency, CoreVoltage: point.CoreVoltage,
-			Status: lib.PointUnobservable, MedianHash: summary.MedianHash,
-			ExpectedHash: summary.ExpectedHash, Attainment: summary.Attainment,
-			MeanTemp: summary.MeanTemp, P95Temp: summary.P95Temp,
-			P95VRTemp: summary.P95VRTemp, P95Power: summary.P95Power,
-			ErrorPercent:  cloneFloat(summary.ErrorPercent),
-			AcceptedDelta: summary.AcceptedDelta, RejectedDelta: summary.RejectedDelta,
+			Status:     lib.PointUnobservable,
 			MeasuredAt: now, EnteredAt: statePassEntryTime(state, point),
 		}, true, settings, now)
 	}
@@ -865,8 +860,12 @@ func (minerController *controller) entryMarginPositive(
 	settings lib.Settings,
 	now time.Time,
 ) bool {
-	if entry.EntryAttemptID <= 0 || entry.ReferenceHash <= 0 {
+	if entry.EntryAttemptID <= 0 {
 		return true
+	}
+	if !finite(entry.ReferenceHash) || entry.ReferenceHash <= 0 ||
+		!finite(entry.MedianHash) || entry.MedianHash <= 0 {
+		return false
 	}
 	attempts, err := minerController.states.ListMutationAttempts(state.MacAddr)
 	if err != nil {
@@ -1266,7 +1265,9 @@ func (minerController *controller) addSample(
 	now time.Time,
 ) (windowSummary, bool) {
 	if !finitePositive(info.Temp) || !finitePositive(info.VRTemp) || !finitePositive(info.Power) ||
-		!finite(info.HashRate) || info.HashRate < 0 || !finite(info.ExpectedHashRate) || info.ExpectedHashRate < 0 {
+		!finite(info.HashRate) || info.HashRate < 0 || !finite(info.ExpectedHashRate) || info.ExpectedHashRate < 0 ||
+		(info.ErrorPercentage != nil &&
+			(!finite(*info.ErrorPercentage) || *info.ErrorPercentage < 0 || *info.ErrorPercentage > 100)) {
 		minerController.resetRuntime(macAddr)
 		return windowSummary{}, false
 	}
@@ -1305,7 +1306,12 @@ func (minerController *controller) addSample(
 	}
 	samples := append([]telemetrySample(nil), runtime.samples[:count]...)
 	runtime.samples = runtime.samples[count:]
-	return summarizeWindow(samples), true
+	summary := summarizeWindow(samples)
+	if err := validateWindowSummary(summary); err != nil {
+		minerController.resetRuntime(macAddr)
+		return windowSummary{}, false
+	}
+	return summary, true
 }
 
 func (minerController *controller) runtimeFor(macAddr string) *minerRuntime {
@@ -1410,6 +1416,12 @@ func summarizeWindow(samples []telemetrySample) windowSummary {
 }
 
 func combineWindowSummaries(first, second windowSummary) (windowSummary, error) {
+	if err := validateWindowSummary(first); err != nil {
+		return windowSummary{}, fmt.Errorf("first window: %w", err)
+	}
+	if err := validateWindowSummary(second); err != nil {
+		return windowSummary{}, fmt.Errorf("second window: %w", err)
+	}
 	combined := windowSummary{
 		MedianHash:   min(first.MedianHash, second.MedianHash),
 		ExpectedHash: max(first.ExpectedHash, second.ExpectedHash),
@@ -1434,10 +1446,27 @@ func combineWindowSummaries(first, second windowSummary) (windowSummary, error) 
 	}
 	combined.AcceptedDelta = first.AcceptedDelta + second.AcceptedDelta
 	combined.RejectedDelta = first.RejectedDelta + second.RejectedDelta
-	if !finite(combined.MedianHash) || !finite(combined.ExpectedHash) || !finite(combined.Attainment) {
-		return windowSummary{}, fmt.Errorf("window aggregate is non-finite")
+	if err := validateWindowSummary(combined); err != nil {
+		return windowSummary{}, err
 	}
 	return combined, nil
+}
+
+func validateWindowSummary(summary windowSummary) error {
+	if !finite(summary.MedianHash) || summary.MedianHash < 0 ||
+		!finite(summary.ExpectedHash) || summary.ExpectedHash < 0 ||
+		!finite(summary.Attainment) || summary.Attainment < 0 ||
+		!finite(summary.MeanTemp) || summary.MeanTemp < 0 ||
+		!finite(summary.P95Temp) || summary.P95Temp < 0 ||
+		!finite(summary.P95VRTemp) || summary.P95VRTemp < 0 ||
+		!finite(summary.P95Power) || summary.P95Power < 0 {
+		return fmt.Errorf("window aggregate is invalid")
+	}
+	if summary.ErrorPercent != nil &&
+		(!finite(*summary.ErrorPercent) || *summary.ErrorPercent < 0 || *summary.ErrorPercent > 100) {
+		return fmt.Errorf("window error percentage is invalid")
+	}
+	return nil
 }
 
 func percentile(values []float64, fraction float64) float64 {
@@ -1466,7 +1495,10 @@ func mean(values []float64) float64 {
 }
 
 func qualityHealthy(summary windowSummary, settings lib.Settings) bool {
-	return summary.MedianHash > 0 && (summary.ErrorPercent == nil || *summary.ErrorPercent <= settings.MaxErrorPercentage)
+	return finite(summary.MedianHash) && summary.MedianHash > 0 &&
+		(summary.ErrorPercent == nil ||
+			(finite(*summary.ErrorPercent) && *summary.ErrorPercent >= 0 &&
+				*summary.ErrorPercent <= settings.MaxErrorPercentage))
 }
 
 func hasExplorationHeadroom(summary windowSummary, settings lib.Settings) bool {
@@ -1546,7 +1578,8 @@ func strictlyDeescalates(target, live lib.OperatingPoint) bool {
 
 func rollbackRecordEligible(record lib.OperatingPointRecord, failedPoint lib.OperatingPoint, asic lib.ASICSettings, settings lib.Settings) bool {
 	return record.Status == lib.PointValidated && record.EntryAttemptID >= 0 && record.Point() != failedPoint &&
-		operatingPointAdvertised(asic, record.Point()) && strictlyDeescalates(record.Point(), failedPoint) &&
+		lib.IsCanonicalOperatingPoint(record.Point()) && operatingPointAdvertised(asic, record.Point()) &&
+		strictlyDeescalates(record.Point(), failedPoint) &&
 		record.P95Temp > 0 && record.P95Temp < settings.TargetTemp && record.P95Power > 0 &&
 		record.P95Power <= settings.MaxPower-powerHeadroom && record.P95VRTemp > 0 &&
 		record.P95VRTemp <= settings.VRTempHigh*vrExplorationFactor
@@ -1812,9 +1845,12 @@ func selectBestPoint(records []lib.OperatingPointRecord, asic lib.ASICSettings, 
 func feasibleFinalPoints(records []lib.OperatingPointRecord, asic lib.ASICSettings, settings lib.Settings) []lib.OperatingPointRecord {
 	feasible := make([]lib.OperatingPointRecord, 0, len(records))
 	for _, record := range records {
-		if record.Status == lib.PointValidated && operatingPointAdvertised(asic, record.Point()) &&
-			record.MedianHash > 0 && record.P95Temp <= settings.TempLimit &&
-			record.P95Power < settings.MaxPower && record.P95VRTemp < settings.VRTempHigh &&
+		if record.Status == lib.PointValidated && lib.IsCanonicalOperatingPoint(record.Point()) &&
+			operatingPointAdvertised(asic, record.Point()) &&
+			finite(record.MedianHash) && record.MedianHash > 0 &&
+			finite(record.P95Temp) && record.P95Temp >= 0 && record.P95Temp <= settings.TempLimit &&
+			finite(record.P95Power) && record.P95Power >= 0 && record.P95Power < settings.MaxPower &&
+			finite(record.P95VRTemp) && record.P95VRTemp >= 0 && record.P95VRTemp < settings.VRTempHigh &&
 			qualityHealthy(windowSummary{MedianHash: record.MedianHash, ErrorPercent: record.ErrorPercent}, settings) {
 			feasible = append(feasible, record)
 		}

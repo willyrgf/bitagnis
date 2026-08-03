@@ -172,6 +172,13 @@ func TestMutationValidationHappensBeforeRequest(t *testing.T) {
 	); err == nil {
 		t.Fatal("invalid operating point was accepted")
 	}
+	if err := client.PatchOperatingPoint(
+		context.Background(),
+		OperatingPoint{Frequency: 50, CoreVoltage: 1000},
+		"bitaxe.test",
+	); err == nil {
+		t.Fatal("firmware emergency sentinel was accepted")
+	}
 	if err := client.PatchMiningConfiguration(
 		context.Background(),
 		enabledMiningSettings(),
@@ -271,6 +278,20 @@ func TestGetASICSettingsReturnsNormalizedAdvertisedGrid(t *testing.T) {
 	}
 }
 
+func TestGetASICSettingsRejectsInvalidOptions(t *testing.T) {
+	for _, body := range []string{
+		`{"ASICModel":"BM1370","defaultFrequency":525,"frequencyOptions":[400,0,525],"defaultVoltage":1150,"voltageOptions":[1000,1150]}`,
+		`{"ASICModel":"BM1370","defaultFrequency":525,"frequencyOptions":[400,525],"defaultVoltage":1150,"voltageOptions":[1000,2100]}`,
+	} {
+		client := testBitaxeClient(func(_ *http.Request) (*http.Response, error) {
+			return successfulResponse(body), nil
+		})
+		if _, err := client.GetASICSettings(context.Background(), "bitaxe.test"); err == nil {
+			t.Fatalf("invalid ASIC options were accepted: %s", body)
+		}
+	}
+}
+
 func TestGetSystemInfoExtractsAndValidatesMutationFields(t *testing.T) {
 	client := testBitaxeClient(func(_ *http.Request) (*http.Response, error) {
 		return successfulResponse(validInfoJSON()), nil
@@ -316,6 +337,16 @@ func TestGetSystemInfoValidatesHTTPAndPayload(t *testing.T) {
 			name:      "missing identity",
 			response:  successfulResponse(`{"frequency":525}`),
 			wantError: "hostname is empty",
+		},
+		{
+			name:      "invalid error percentage",
+			response:  successfulResponse(strings.Replace(validInfoJSON(), `"errorPercentage":1.25`, `"errorPercentage":101`, 1)),
+			wantError: "error percentage is invalid",
+		},
+		{
+			name:      "negative hash rate",
+			response:  successfulResponse(strings.Replace(validInfoJSON(), `"hashRate":799.3`, `"hashRate":-1`, 1)),
+			wantError: "hash rate",
 		},
 		{
 			name:      "transport error",

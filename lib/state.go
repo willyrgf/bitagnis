@@ -685,6 +685,22 @@ const (
 	TrialBlock   TrialDecision = "block"
 )
 
+func validateTrialDecision(status string, decision TrialDecision) error {
+	switch decision {
+	case TrialPromote:
+		if status != PointValidated {
+			return fmt.Errorf("promotion requires a validated point")
+		}
+	case TrialReturn, TrialBlock:
+		if status == PointValidated {
+			return fmt.Errorf("%s cannot use a validated point", decision)
+		}
+	default:
+		return fmt.Errorf("invalid trial decision %q", decision)
+	}
+	return nil
+}
+
 // AdmitTrial consumes a previously unseen candidate and persists its pending
 // hardware intent, entry attempt, fallback incumbent, and trial phase in one
 // transaction. The row insertion is the eligibility decision: a duplicate
@@ -841,6 +857,9 @@ func (store *OptimizerStore) FinalizeTrial(
 	if decision != TrialPromote && decision != TrialReturn && decision != TrialBlock {
 		return fmt.Errorf("finalize trial: invalid decision %q", decision)
 	}
+	if err := validateTrialDecision(record.Status, decision); err != nil {
+		return fmt.Errorf("finalize trial: %w", err)
+	}
 	if err := validatePointRecord(record); err != nil {
 		return fmt.Errorf("finalize trial: %w", err)
 	}
@@ -918,7 +937,9 @@ func finalizeTrialTx(
 	}
 	current.MeasuredAt = storedTime(measuredAt)
 	current.EnteredAt = storedTime(enteredAt)
-	if current.Status != PointEntered || current.EntryAttemptID != record.EntryAttemptID {
+	if current.Status != PointEntered || current.EntryAttemptID != record.EntryAttemptID ||
+		!current.EnteredAt.Equal(record.EnteredAt) ||
+		current.ReferenceHash != record.ReferenceHash {
 		return fmt.Errorf("point is not the reserved entered row")
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
@@ -995,6 +1016,9 @@ func (store *OptimizerStore) FailMutationAndFinalizeTrial(
 ) error {
 	if state == nil || id <= 0 || now.IsZero() || stage == "" {
 		return fmt.Errorf("fail mutation and finalize trial: invalid state or timing")
+	}
+	if err := validateTrialDecision(record.Status, decision); err != nil {
+		return fmt.Errorf("fail mutation and finalize trial: %w", err)
 	}
 	if err := validatePointRecord(record); err != nil {
 		return fmt.Errorf("fail mutation and finalize trial: %w", err)
@@ -1106,13 +1130,19 @@ func (store *OptimizerStore) FinalizeBaseline(
 		return fmt.Errorf("finalize baseline: record is not the durable incumbent")
 	}
 	var status string
+	var storedEnteredAt, storedEntryAttemptID int64
+	var storedReferenceHash float64
 	if err := tx.QueryRowContext(context.Background(),
-		`SELECT status FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-		record.MacAddr, record.Frequency, record.CoreVoltage).Scan(&status); err != nil {
+		`SELECT status, entered_at, entry_attempt_id, reference_hash
+		FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
+		record.MacAddr, record.Frequency, record.CoreVoltage).Scan(
+		&status, &storedEnteredAt, &storedEntryAttemptID, &storedReferenceHash); err != nil {
 		return fmt.Errorf("finalize baseline: load point: %w", err)
 	}
-	if status != PointEntered {
-		return fmt.Errorf("finalize baseline: baseline row is already terminal")
+	if status != PointEntered || storedEntryAttemptID != 0 || storedReferenceHash != 0 ||
+		storedEnteredAt != timeValue(durable.PassStartedAt) ||
+		!record.EnteredAt.Equal(durable.PassStartedAt) {
+		return fmt.Errorf("finalize baseline: baseline row does not match the current pass")
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
 		status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
@@ -4404,6 +4434,12 @@ func validatePointRecord(record OperatingPointRecord) error {
 			record.P95Power != 0 || record.ErrorPercent != nil ||
 			record.AcceptedDelta != 0 || record.RejectedDelta != 0):
 		return fmt.Errorf("entered point has terminal evidence")
+	case record.Status == PointUnobservable &&
+		(record.MedianHash != 0 || record.ExpectedHash != 0 || record.Attainment != 0 ||
+			record.MeanTemp != 0 || record.P95Temp != 0 || record.P95VRTemp != 0 ||
+			record.P95Power != 0 || record.ErrorPercent != nil ||
+			record.AcceptedDelta != 0 || record.RejectedDelta != 0):
+		return fmt.Errorf("unobservable point has terminal evidence")
 	case record.Status != PointEntered && record.EnteredAt.IsZero():
 		return fmt.Errorf("terminal point has no entry timestamp")
 	case record.Status != PointEntered && record.EntryAttemptID == 0 && record.ReferenceHash != 0:

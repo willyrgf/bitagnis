@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -155,6 +156,45 @@ func TestConservativeWindowSummaryAndFixedFinalSelection(t *testing.T) {
 	selected, ok := selectFinalPoint(points, asic, settings)
 	if !ok || selected.Frequency != 550 || selected.CoreVoltage != 1100 {
 		t.Fatalf("fixed-anchor selection = %+v, %t", selected, ok)
+	}
+}
+
+func TestWindowAggregateRejectsInvalidEvidence(t *testing.T) {
+	valid := windowSummary{MedianHash: 100, ExpectedHash: 100, MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18}
+	invalid := []windowSummary{
+		{MedianHash: -1},
+		{ExpectedHash: math.NaN()},
+		{P95Power: -1},
+	}
+	for _, candidate := range invalid {
+		if _, err := combineWindowSummaries(valid, candidate); err == nil {
+			t.Fatalf("invalid window aggregate was accepted: %+v", candidate)
+		}
+	}
+	errorPercent := 101.0
+	valid.ErrorPercent = &errorPercent
+	if _, err := combineWindowSummaries(valid, windowSummary{}); err == nil {
+		t.Fatal("invalid window error percentage was accepted")
+	}
+}
+
+func TestFinalSelectionRejectsOffGridAdvertisedPoint(t *testing.T) {
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	asic.FrequencyOptions = []int{400, 490, 500, 525, 550, 600, 625}
+	record := rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 500, CoreVoltage: 1000}, 100, 55, 18, 70)
+	if _, ok := selectFinalPoint([]lib.OperatingPointRecord{record}, asic, settings); ok {
+		t.Fatal("off-grid advertised point became final authority")
+	}
+}
+
+func TestEntryMarginRejectsInvalidFrozenEvidence(t *testing.T) {
+	controller := &controller{}
+	entry := rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}, 100, 55, 18, 70)
+	entry.EntryAttemptID = 1
+	entry.ReferenceHash = 0
+	if controller.entryMarginPositive(&lib.MinerState{}, entry, lib.Settings{}, time.Now().UTC()) {
+		t.Fatal("entry margin accepted a missing frozen reference")
 	}
 }
 

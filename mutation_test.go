@@ -461,6 +461,26 @@ func TestTelemetryGapDropsDeferredEvidence(t *testing.T) {
 	}
 }
 
+func TestInvalidErrorPercentageDropsEvidence(t *testing.T) {
+	settings := rootTestSettings(t)
+	settings.MetricsTime = time.Second
+	settings.EvaluationWindowTime = time.Second
+	state := lib.MinerState{
+		MacAddr: rootTestMAC, CurrentFrequency: 525, CurrentCoreVoltage: 1150,
+		Phase: lib.PhaseBaseline,
+	}
+	controller := &controller{runtimes: make(map[string]*minerRuntime)}
+	info := rootTestInfo(state.CurrentPoint(), 100)
+	errorPercent := 101.0
+	info.ErrorPercentage = &errorPercent
+	if _, ready := controller.addSample(state.MacAddr, info, state, settings, time.Now().UTC()); ready {
+		t.Fatal("invalid error percentage completed a window")
+	}
+	if runtime := controller.runtimeFor(state.MacAddr); len(runtime.samples) != 0 {
+		t.Fatalf("invalid error percentage retained samples: %d", len(runtime.samples))
+	}
+}
+
 func TestCompletionRetryRequiresTheOriginalTimestamp(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
