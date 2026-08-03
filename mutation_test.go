@@ -238,6 +238,20 @@ func TestRetuneDiscoveryStartsDeadlineBeforeMetrics(t *testing.T) {
 	}
 }
 
+func TestRetuneHealthyPollsMustBeConsecutive(t *testing.T) {
+	coordinator := &mutationCoordinator{
+		retuneHost:         "root-test",
+		retuneHealthyCount: 1,
+		logger:             log.New(io.Discard, "", 0),
+	}
+	if _, err := coordinator.advanceRetuneLocked(nil, time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.retuneHealthyCount != 0 {
+		t.Fatalf("retune healthy count after absent poll = %d", coordinator.retuneHealthyCount)
+	}
+}
+
 func TestRetuneAcceptsSettledSafetyHoldAfterTwoHealthyPolls(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	state.Phase = lib.PhaseHold

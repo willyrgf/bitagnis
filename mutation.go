@@ -315,12 +315,15 @@ func (coordinator *mutationCoordinator) Advance(
 		}
 	}
 	if safetyBlocked {
+		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}
 	if pendingWithoutObservation {
+		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}
 	if appliedResult {
+		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}
 	if coordinator.retuneHost != "" {
@@ -398,9 +401,11 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 		}
 	}
 	if observation == nil {
+		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}
 	if coordinator.normalActive != "" || len(coordinator.active) != 0 {
+		coordinator.retuneHealthyCount = 0
 		return false, nil
 	}
 	state := observation.state

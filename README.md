@@ -173,7 +173,8 @@ named miner for a new pass:
 `--retune` never resets safety state or issues hardware writes by itself. It is
 accepted only after the named miner has two consecutive safe startup polls in a
 settled, unblocked `HOLD`; it rejects `all`, mining reapply, pending work, and
-active safety episodes.
+active or unsettled safety episodes. A settled safety-derived `HOLD` may qualify;
+the accepted pass clears its safety reason and starts without an arm snapshot.
 
 ## Configuration
 
