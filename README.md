@@ -103,22 +103,25 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 3, with typed pending mutations and one durable
+The current schema is version 4, with typed pending mutations, finite frontier
+state, hourly accounting, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. An old, partial,
-or unknown database is rejected without modification; move it aside or remove
-it to create the current baseline. Evaluated history, cooldown, pending
-mutation ages, emergency episode ages, and mutation attempts persist across
-ordinary restarts after that baseline is created.
+`overheat_pending` field, migration, or compatibility reader. Schema version 3,
+an old partial database, or an unknown application object is rejected without
+modification; move it aside or remove it to create the current baseline.
+Evaluated history, cooldown, pending mutation ages, emergency episode ages,
+mutation attempts, and the bounded 384-hour hourly accounting history persist
+across ordinary restarts after that baseline is created.
 
-Mutation history records the mutation kind, complete source and target pair,
-intent/start time, pre-request PATCH and restart milestones, reboot proof,
-durable completion, two-poll healthy-mining resumption, and a deterministic
-failure stage. An interrupted process leaves durable evidence, and replay
-creates a new attempt instead of overwriting the old one. This supports
-long-term restart counts and restart-to-healthy-mining duration by miner and
-mutation kind. It does not record external/manual reboots, raw telemetry,
-free-form errors, Stratum settings, or credentials.
+Mutation history records the mutation kind, finite reason, complete source and
+target pair, intent/start time, configured-readback and restart milestones,
+reboot proof, first-positive observation, durable completion, two-poll
+healthy-mining resumption, and a deterministic failure stage. An interrupted
+process leaves the same durable attempt unfinished for reconciliation; it is
+never silently marked failed or replayed as a second hardware authority. This
+supports long-term restart counts and restart-to-healthy-mining duration by
+miner and mutation kind. It does not record external/manual reboots, raw
+telemetry, free-form errors, Stratum settings, or credentials.
 
 For a credential-free restart summary:
 
@@ -146,6 +149,21 @@ If AxeOS settings are changed manually while Bitagnis is running, two consecutiv
 polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
 Off-grid manual settings can be monitored, but Bitagnis will not emit them as
 automated requests.
+
+Normal optimization is a finite pass. Each advertised complete pair is consumed
+at most once per pass, terminal point outcomes are not reopened by elapsed time
+or cooler telemetry, and a settled `HOLD` performs no normal operating-point
+mutation. After an environmental or hardware change, explicitly qualify one
+named miner for a new pass:
+
+```sh
+./bitagnis --retune bitaxe-example
+```
+
+`--retune` never resets safety state or issues hardware writes by itself. It is
+accepted only after the named miner has two consecutive safe startup polls in a
+settled, unblocked `HOLD`; it rejects `all`, mining reapply, pending work, and
+active safety episodes.
 
 ## Configuration
 
@@ -278,6 +296,29 @@ Build and run:
 go build
 ./bitagnis
 ```
+
+Read-only long-term economics reports use retained hourly aggregates and
+credential-free mutation history. A one-arm report compares a treatment miner
+with a settled control over exactly 168 UTC hours:
+
+```sh
+./bitagnis --report one-arm treatment-host control-host 2026-08-01T00:00:00Z
+```
+
+An AB/BA report evaluates two non-overlapping 168-hour arms with roles reversed:
+
+```sh
+./bitagnis --report ab-ba miner-a miner-b 2026-08-01T00:00:00Z 2026-08-08T00:00:00Z
+```
+
+Reports normalize actual hash over the full wall duration, count unknown time
+as zero work, separate normal and safety restart exposure, and require at least
+95% coverage. A valid arm also requires treatment convergence by 48 hours, at
+least a 90% reduction from the preceding normal-restart count, normal restart
+exposure no greater than 1% of arm time, at least 95% post-settlement selected
+point coverage, and a settled unchanged control. A nonnegative valid-arm uplift
+is required for success; the 2% uplift is shown as a practical target. Report
+mode performs no discovery, PATCH, restart, mining reconciliation, or mutation.
 
 Bitagnis cannot substitute for adequate cooling or a correctly sized power
 supply. AxeOS thermal protection remains the final safety layer.

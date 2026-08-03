@@ -58,16 +58,32 @@ type deviceAPI interface {
 }
 
 type optimizerStateStore interface {
-	LoadOrCreate(lib.Info, string, time.Time) (lib.MinerState, bool, error)
+	BootstrapMiner(lib.Info, string, time.Time, time.Duration, time.Duration, bool) (lib.MinerState, bool, error)
 	LoadMiner(string) (lib.MinerState, error)
 	SaveMiner(*lib.MinerState) error
-	SavePoint(*lib.OperatingPointRecord) error
 	ListPoints(string) ([]lib.OperatingPointRecord, error)
+	ResetOptimizationPass(string, lib.OperatingPoint, time.Time, time.Time, time.Time) error
+	AdmitTrial(*lib.MinerState, lib.OperatingPoint, lib.OperatingPoint, lib.OptimizerPhase, float64, time.Time, time.Time) (int64, error)
+	FinalizeTrial(*lib.MinerState, lib.OperatingPointRecord, lib.TrialDecision, time.Time, time.Time, time.Time) error
+	FinalizeBaseline(*lib.MinerState, lib.OperatingPointRecord, bool, time.Time) error
+	AdoptManualPoint(*lib.MinerState, lib.OperatingPoint, time.Time, time.Time, time.Time) error
+	AdoptExternalPoint(*lib.MinerState, lib.OperatingPoint, int64, time.Time, time.Time, time.Time) error
 	StartMutationAttempt(*lib.MutationAttempt) (int64, error)
 	AdvanceMutationAttempt(int64, lib.MutationMilestone, time.Time) error
-	FailMutationAttempt(int64, lib.MutationFailureStage, time.Time) error
+	RecordConfiguredVerification(int64, time.Time, int) error
+	RecordFirstPositive(int64, time.Time) error
+	CompleteMiningResume(*lib.MinerState, int64, time.Time, time.Time, time.Time) error
+	FailMutationAndSave(*lib.MinerState, int64, lib.MutationFailureStage, time.Time) error
+	FailMutationAndFinalizeTrial(*lib.MinerState, lib.OperatingPointRecord, lib.TrialDecision, int64, lib.MutationFailureStage, time.Time, time.Time, time.Time) error
+	QuarantineMutation(*lib.MinerState, int64, lib.MutationFailureStage, time.Time) error
+	SupersedeMutation(*lib.MinerState, *lib.MinerState, int64, time.Time) error
+	PersistSafetyTransition(*lib.MinerState, *lib.MinerState, *lib.OperatingPointRecord, time.Time) error
 	CompleteMutationAttempt(*lib.MinerState, int64, time.Time) error
+	ListMutationAttempts(string) ([]lib.MutationAttempt, error)
 	PendingMutationResume(string) (lib.MutationAttempt, bool, error)
+	UnfinishedMutationAttempt(string) (lib.MutationAttempt, bool, error)
+	CompareAndSetHourly(string, time.Time, time.Time, []lib.HourlyAggregate, time.Time) error
+	ListHourly(string, time.Time, time.Time) ([]lib.HourlyAggregate, error)
 }
 
 type controller struct {
@@ -79,9 +95,6 @@ type controller struct {
 
 	runtimeMu sync.Mutex
 	runtimes  map[string]*minerRuntime
-
-	asicMu    sync.Mutex
-	asicCache map[string]lib.ASICSettings
 
 	mutations *mutationCoordinator
 }
@@ -112,6 +125,18 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	store, err := lib.OpenOptimizerStore("optimizer.db")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			log.Printf("Optimizer database shutdown failed: %s", closeErr)
+		}
+	}()
+	if options.reportMode != "" {
+		return runLongTermReport(store, options, os.Stdout)
+	}
 	settingsFile, err := lib.LoadSettings("settings.yaml")
 	if err != nil {
 		return err
@@ -123,15 +148,6 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := lib.OpenOptimizerStore("optimizer.db")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := store.Close(); closeErr != nil {
-			log.Printf("Optimizer database shutdown failed: %s", closeErr)
-		}
-	}()
 
 	scanClient := lib.NewBitaxeClient(3 * time.Second)
 	client := lib.NewBitaxeClient(5 * time.Second)
@@ -147,13 +163,12 @@ func run(ctx context.Context, arguments []string) error {
 	}
 
 	minerController := &controller{
-		devices:   client,
-		states:    store,
-		settings:  settingsFile,
-		logger:    log.Default(),
-		output:    os.Stdout,
-		runtimes:  make(map[string]*minerRuntime),
-		asicCache: make(map[string]lib.ASICSettings),
+		devices:  client,
+		states:   store,
+		settings: settingsFile,
+		logger:   log.Default(),
+		output:   os.Stdout,
+		runtimes: make(map[string]*minerRuntime),
 	}
 	rediscover := func(
 		discoveryContext context.Context,
@@ -181,6 +196,7 @@ func run(ctx context.Context, arguments []string) error {
 		settingsFile,
 		miners,
 		options.reapply,
+		options.retune,
 		rediscover,
 		func(settings lib.MiningSettings) (string, string, error) {
 			return lib.LoadMiningPasswords(".env", settings)
@@ -248,8 +264,12 @@ func run(ctx context.Context, arguments []string) error {
 }
 
 type commandOptions struct {
-	hostnames map[string]bool
-	reapply   map[string]bool
+	hostnames    map[string]bool
+	reapply      map[string]bool
+	retune       string
+	reportMode   string
+	reportHosts  []string
+	reportStarts []time.Time
 }
 
 func parseArguments(arguments []string) (commandOptions, error) {
@@ -258,13 +278,38 @@ func parseArguments(arguments []string) (commandOptions, error) {
 		reapply:   make(map[string]bool),
 	}
 	reapply := false
-	for _, argument := range arguments {
+	for index := 0; index < len(arguments); index++ {
+		argument := arguments[index]
 		switch {
 		case argument == "--reapply-mining":
 			if reapply {
 				return commandOptions{}, fmt.Errorf("--reapply-mining was specified more than once")
 			}
 			reapply = true
+		case argument == "--retune":
+			if options.retune != "" {
+				return commandOptions{}, fmt.Errorf("--retune was specified more than once")
+			}
+			if index+1 >= len(arguments) || arguments[index+1] == "" || arguments[index+1][0] == '-' {
+				return commandOptions{}, fmt.Errorf("--retune requires exactly one hostname")
+			}
+			if arguments[index+1] == "all" {
+				return commandOptions{}, fmt.Errorf("--retune requires a specific hostname, not all")
+			}
+			options.retune = arguments[index+1]
+			index++
+		case argument == "--report":
+			if options.reportMode != "" {
+				return commandOptions{}, fmt.Errorf("--report was specified more than once")
+			}
+			mode, hosts, starts, consumed, parseErr := parseReportArguments(arguments[index+1:])
+			if parseErr != nil {
+				return commandOptions{}, parseErr
+			}
+			options.reportMode = mode
+			options.reportHosts = hosts
+			options.reportStarts = starts
+			index += consumed
 		case argument == "":
 			return commandOptions{}, fmt.Errorf("hostname arguments cannot be empty")
 		case argument[0] == '-':
@@ -272,6 +317,21 @@ func parseArguments(arguments []string) (commandOptions, error) {
 		default:
 			options.hostnames[argument] = true
 		}
+	}
+	if options.retune != "" && reapply {
+		return commandOptions{}, fmt.Errorf("--retune and --reapply-mining are mutually exclusive")
+	}
+	if options.retune != "" && len(options.hostnames) != 0 {
+		return commandOptions{}, fmt.Errorf("--retune requires exactly one hostname")
+	}
+	if options.reportMode != "" {
+		if reapply || options.retune != "" || len(options.hostnames) != 0 {
+			return commandOptions{}, fmt.Errorf("--report cannot be combined with mutation or hostname arguments")
+		}
+		return options, nil
+	}
+	if options.retune != "" {
+		options.hostnames[options.retune] = true
 	}
 	if reapply {
 		if len(options.hostnames) == 0 {
@@ -285,6 +345,45 @@ func parseArguments(arguments []string) (commandOptions, error) {
 		options.hostnames["all"] = true
 	}
 	return options, nil
+}
+
+func parseReportArguments(arguments []string) (string, []string, []time.Time, int, error) {
+	if len(arguments) == 0 {
+		return "", nil, nil, 0, fmt.Errorf("--report requires one-arm or ab-ba arguments")
+	}
+	mode := arguments[0]
+	var hostCount int
+	switch mode {
+	case "one-arm":
+		hostCount = 2
+	case "ab-ba":
+		hostCount = 2
+	default:
+		return "", nil, nil, 0, fmt.Errorf("--report mode %q is invalid", mode)
+	}
+	startCount := 1
+	if mode == "ab-ba" {
+		startCount = 2
+	}
+	consumed := 1 + hostCount + startCount
+	if len(arguments) < consumed {
+		return "", nil, nil, 0, fmt.Errorf("--report %s requires %d arguments", mode, hostCount+startCount+1)
+	}
+	hosts := append([]string(nil), arguments[1:1+hostCount]...)
+	for _, host := range hosts {
+		if host == "" || host == "all" || strings.HasPrefix(host, "-") {
+			return "", nil, nil, 0, fmt.Errorf("--report requires specific hostnames")
+		}
+	}
+	starts := make([]time.Time, startCount)
+	for index := range starts {
+		value, err := time.Parse(time.RFC3339, arguments[1+hostCount+index])
+		if err != nil || value.UTC().Truncate(time.Hour) != value.UTC() {
+			return "", nil, nil, 0, fmt.Errorf("--report start must be a UTC RFC3339 hour")
+		}
+		starts[index] = value.UTC()
+	}
+	return mode, hosts, starts, consumed, nil
 }
 
 func validateReapplyHostnames(
@@ -329,6 +428,165 @@ func validateNamedDiscovery(
 	return nil
 }
 
+func runLongTermReport(store *lib.OptimizerStore, options commandOptions, output io.Writer) error {
+	if store == nil || options.reportMode == "" {
+		return fmt.Errorf("long-term report: invalid request")
+	}
+	switch options.reportMode {
+	case "one-arm":
+		input, err := loadReportArmInput(store, options.reportHosts[0], options.reportHosts[1], options.reportStarts[0])
+		if err != nil {
+			return err
+		}
+		report, err := lib.EvaluateArm(input)
+		if err != nil {
+			return err
+		}
+		formatArmReport(output, report)
+		return nil
+	case "ab-ba":
+		ab, err := loadReportArmInput(store, options.reportHosts[0], options.reportHosts[1], options.reportStarts[0])
+		if err != nil {
+			return err
+		}
+		ba, err := loadReportArmInput(store, options.reportHosts[1], options.reportHosts[0], options.reportStarts[1])
+		if err != nil {
+			return err
+		}
+		report, err := lib.EvaluateCrossover(lib.CrossoverInput{AB: ab, BA: ba})
+		if err != nil {
+			return err
+		}
+		formatCrossoverReport(output, report)
+		return nil
+	default:
+		return fmt.Errorf("long-term report: unsupported mode %q", options.reportMode)
+	}
+}
+
+func loadReportArmInput(
+	store *lib.OptimizerStore,
+	treatmentHostname string,
+	controlHostname string,
+	start time.Time,
+) (lib.ReportArmInput, error) {
+	window := lib.ReportWindow{Start: start.UTC(), End: start.UTC().Add(lib.ReportArmDuration)}
+	treatment, err := loadReportMinerInput(store, treatmentHostname, window, true)
+	if err != nil {
+		return lib.ReportArmInput{}, err
+	}
+	control, err := loadReportMinerInput(store, controlHostname, window, false)
+	if err != nil {
+		return lib.ReportArmInput{}, err
+	}
+	return lib.ReportArmInput{Start: window.Start, Treatment: treatment, Control: control}, nil
+}
+
+func loadReportMinerInput(
+	store *lib.OptimizerStore,
+	hostname string,
+	window lib.ReportWindow,
+	treatment bool,
+) (lib.ReportMinerInput, error) {
+	state, err := store.LoadMinerByHostname(hostname)
+	if err != nil {
+		return lib.ReportMinerInput{}, err
+	}
+	records, err := store.ListPoints(state.MacAddr)
+	if err != nil {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: selected point: %w", hostname, err)
+	}
+	selected, found := findRecord(records, state.CurrentPoint())
+	if !found || selected.Status != lib.PointValidated || !finite(selected.MedianHash) || selected.MedianHash <= 0 {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: no positive validated selected point", hostname)
+	}
+	hourly, err := store.ListHourly(state.MacAddr, window.Start, window.End)
+	if err != nil {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: hourly data: %w", hostname, err)
+	}
+	attempts, err := store.ListMutationAttempts(state.MacAddr)
+	if err != nil {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: mutation history: %w", hostname, err)
+	}
+	pointStable := state.Phase == lib.PhaseHold && state.HoldReason == lib.HoldOptimized &&
+		!state.SettledAt.IsZero() && state.PendingKind == "" && !state.MiningPending
+	for _, attempt := range attempts {
+		if attempt.Kind != lib.MutationOperatingPoint && attempt.Kind != lib.MutationSafetyRollback && attempt.Kind != lib.MutationOverheatRecovery {
+			continue
+		}
+		if mutationOverlapsReportWindow(attempt, window) {
+			pointStable = false
+		}
+	}
+	preArmRate := selected.MedianHash
+	if state.PassStartedAt.Equal(window.Start) && state.PassReferenceHash > 0 {
+		preArmRate = state.PassReferenceHash
+	}
+	if treatment && (state.PassTrigger != lib.PassOperator || !state.PassStartedAt.Equal(window.Start) || state.PassReferenceHash <= 0) {
+		return lib.ReportMinerInput{}, fmt.Errorf("long-term report %s: treatment pass boundary is not durably frozen at the arm start", hostname)
+	}
+	return lib.ReportMinerInput{
+		Hostname: hostname, PreArmSettledHashRate: preArmRate,
+		PassStartedAt: state.PassStartedAt, PassReferenceHash: state.PassReferenceHash,
+		SettledAt:     state.SettledAt,
+		SelectedPoint: selected.Point(), PointStable: pointStable,
+		Hourly: hourly, MutationAttempts: attempts,
+	}, nil
+}
+
+func mutationOverlapsReportWindow(attempt lib.MutationAttempt, window lib.ReportWindow) bool {
+	if !attempt.StartedAt.Before(window.End) {
+		return false
+	}
+	end := window.End
+	switch {
+	case !attempt.MiningResumedAt.IsZero():
+		end = attempt.MiningResumedAt
+	case !attempt.FailedAt.IsZero():
+		end = attempt.FailedAt
+	}
+	return end.After(window.Start)
+}
+
+func formatArmReport(output io.Writer, report lib.ArmReport) {
+	fmt.Fprintf(output, "Arm report: %s -> %s (%s to %s UTC)\n", report.TreatmentHost, report.ControlHost, report.Window.Start.Format(time.RFC3339), report.Window.End.Format(time.RFC3339))
+	formatReportMiner(output, "treatment", report.Treatment)
+	formatReportMiner(output, "control", report.Control)
+	fmt.Fprintf(output, "  uplift: %.4f\n", report.Uplift)
+	fmt.Fprintf(output, "  gates: coverage=%t convergence_48h=%t restart_reduction=%t normal_exposure=%t post_settlement=%t control_stable=%t\n",
+		report.CoverageValid, report.Treatment.ConvergedBy48Hours,
+		report.Treatment.NormalRestartReductionValid, report.Treatment.NormalExposureValid,
+		report.Treatment.PostSettlementCoverage >= lib.ReportPostSettlementCoverage,
+		report.UpliftValid)
+	fmt.Fprintf(output, "  practical target (>=2%% uplift): %t\n", report.PracticalTarget)
+	fmt.Fprintf(output, "  result: %s\n", reportStatus(report.Valid, report.Treatment.PreArmSettledHashRate > 0 && report.Control.PreArmSettledHashRate > 0))
+}
+
+func formatCrossoverReport(output io.Writer, report lib.CrossoverReport) {
+	fmt.Fprintln(output, "AB arm")
+	formatArmReport(output, report.AB)
+	fmt.Fprintln(output, "BA arm")
+	formatArmReport(output, report.BA)
+	fmt.Fprintf(output, "Crossover uplift: %.4f\n", report.CrossoverUplift)
+	fmt.Fprintf(output, "Crossover result: %s\n", reportStatus(report.Valid, report.AB.Treatment.PreArmSettledHashRate > 0 && report.BA.Treatment.PreArmSettledHashRate > 0))
+}
+
+func formatReportMiner(output io.Writer, role string, report lib.ReportMinerMetrics) {
+	fmt.Fprintf(output, "  %s: coverage %.1f%% (observed %.0fs, unknown %.0fs), actual %.0f H/s·s, trial actual %.0f, incumbent counterfactual %.0f, normalized %.4f, settled %.0fs, trial %.0fs\n", role, report.Coverage*100, report.ObservedSeconds, report.UnknownGapSeconds, report.ActualHashSeconds, report.TrialActualHashSeconds, report.IncumbentCounterfactualHashSeconds, report.NormalizedWork, report.SettledSeconds, report.TrialSeconds)
+	fmt.Fprintf(output, "    post-settlement coverage %.1f%%, prior normal requests %d, reduction %.1f%%\n", report.PostSettlementCoverage*100, report.NormalRestartBaselineRequests, report.NormalRestartReduction*100)
+	fmt.Fprintf(output, "    restarts normal %d/%.0fs, safety %d/%.0fs, unresolved %d\n", report.Restart.NormalRequests, report.Restart.NormalExposureSeconds, report.Restart.SafetyRequests, report.Restart.SafetyExposureSeconds, report.Restart.UnresolvedAttempts)
+}
+
+func reportStatus(valid, evaluated bool) string {
+	if !evaluated {
+		return "NOT EVALUATED"
+	}
+	if valid {
+		return "VALID"
+	}
+	return "INVALID"
+}
+
 func (minerController *controller) pollMiners(
 	ctx context.Context,
 	miners []lib.DiscoveredMiner,
@@ -365,9 +623,19 @@ func (minerController *controller) pollMiners(
 	for index := range results {
 		observation := results[index].observation
 		if observation == nil {
+			if index < len(miners) {
+				if state, err := minerController.states.LoadMiner(miners[index].Info.MacAddr); err == nil {
+					if err := minerController.accountHourly(miners[index].Info.MacAddr, nil, &state, lib.Info{}, now); err != nil && !errors.Is(err, context.Canceled) {
+						minerController.logf("Hourly accounting failed for %s: %s", miners[index].Info.Hostname, err)
+					}
+				}
+			}
 			continue
 		}
 		observations[observation.state.MacAddr] = observation
+		if err := minerController.accountHourly(observation.state.MacAddr, observation, &observation.state, observation.info, now); err != nil && !errors.Is(err, context.Canceled) {
+			minerController.logf("Hourly accounting failed for %s: %s", observation.info.Hostname, err)
+		}
 		wasHandled, err := minerController.enforceMinerSafety(
 			ctx,
 			&observation.state,
@@ -448,6 +716,162 @@ func (minerController *controller) pollMiners(
 	fmt.Fprintf(output, "\nTotal: %s\n\n", formatAggregateHashRate(totalHashRate, hashRateAvailable))
 }
 
+func (minerController *controller) accountHourly(
+	macAddr string,
+	observation *minerObservation,
+	state *lib.MinerState,
+	info lib.Info,
+	now time.Time,
+) error {
+	if state == nil || state.AccountedThroughAt.IsZero() || now.IsZero() {
+		return fmt.Errorf("hourly accounting: missing durable cursor")
+	}
+	settings, err := minerController.settings.ForHost(state.Hostname)
+	if err != nil {
+		return err
+	}
+	runtime := minerController.runtimeFor(macAddr)
+	if !now.After(state.AccountedThroughAt) {
+		runtime.accounting = nil
+		return nil
+	}
+	current := accountingSample{
+		at: now, point: state.CurrentPoint(), phase: state.Phase,
+		hashRate: info.HashRate, validHash: observation != nil && validHashRate(info.HashRate), state: *state,
+	}
+	if observation != nil {
+		current.settled = minerController.verifiedSettledObservation(*state, info, observation.asic, settings, now)
+	}
+	if current.phase == lib.PhaseUndervolt || current.phase == lib.PhaseFrequencyTest || current.phase == lib.PhaseVoltageTest {
+		if current.point != state.FallbackPoint() {
+			records, listErr := minerController.states.ListPoints(macAddr)
+			if listErr != nil {
+				return listErr
+			}
+			entered, found := findRecord(records, current.point)
+			if !found || entered.EntryAttemptID <= 0 || entered.ReferenceHash <= 0 || !finite(entered.ReferenceHash) {
+				return fmt.Errorf("hourly accounting: live trial has no frozen reference hash")
+			}
+			current.referenceHash = entered.ReferenceHash
+		}
+	}
+	validCurrent := current.validHash
+	previous := runtime.accounting
+	compatible := validCurrent && previous != nil && previous.validHash &&
+		previous.at.Equal(state.AccountedThroughAt) && now.After(previous.at) &&
+		now.Sub(previous.at) <= settings.MetricsTime && previous.point == current.point && previous.phase == current.phase
+	fragments := hourlyFragments(macAddr, state.AccountedThroughAt, now, current, compatible)
+	if err := minerController.states.CompareAndSetHourly(macAddr, state.AccountedThroughAt, now, fragments, now); err != nil {
+		runtime.accounting = nil
+		if errors.Is(err, lib.ErrAccountingCursorChanged) {
+			fresh, loadErr := minerController.states.LoadMiner(macAddr)
+			if loadErr == nil {
+				*state = fresh
+			}
+		}
+		return err
+	}
+	state.AccountedThroughAt = now.UTC()
+	if validCurrent {
+		runtime.accounting = &current
+	} else {
+		runtime.accounting = nil
+	}
+	return nil
+}
+
+func hourlyFragments(
+	macAddr string,
+	start time.Time,
+	end time.Time,
+	current accountingSample,
+	actual bool,
+) []lib.HourlyAggregate {
+	if !end.After(start) {
+		return nil
+	}
+	retainedStart := end.UTC().Add(-384 * time.Hour)
+	if start.Before(retainedStart) {
+		start = retainedStart
+	}
+	if !end.After(start) {
+		return nil
+	}
+	fragments := make([]lib.HourlyAggregate, 0, 2)
+	for cursor := start.UTC(); cursor.Before(end.UTC()); {
+		hour := cursor.Truncate(time.Hour)
+		segmentEnd := hour.Add(time.Hour)
+		if segmentEnd.After(end.UTC()) {
+			segmentEnd = end.UTC()
+		}
+		seconds := segmentEnd.Sub(cursor).Seconds()
+		fragment := lib.HourlyAggregate{MacAddr: macAddr, HourStartedAt: hour}
+		if actual {
+			fragment.ObservedSeconds = seconds
+			fragment.ActualHashSeconds = current.hashRate * seconds
+			if current.phase == lib.PhaseUndervolt || current.phase == lib.PhaseFrequencyTest || current.phase == lib.PhaseVoltageTest {
+				if current.state.CurrentPoint() != current.state.FallbackPoint() {
+					fragment.TrialSeconds = seconds
+					fragment.TrialActualHashSeconds = fragment.ActualHashSeconds
+					fragment.IncumbentCounterfactualHashSeconds = current.referenceHash * seconds
+				}
+			}
+			if current.settled {
+				fragment.SettledSeconds = seconds
+			}
+		} else {
+			fragment.UnknownGapSeconds = seconds
+		}
+		fragments = append(fragments, fragment)
+		cursor = segmentEnd
+	}
+	return fragments
+}
+
+func (minerController *controller) verifiedSettledObservation(
+	state lib.MinerState,
+	info lib.Info,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+) bool {
+	if (state.HoldReason != lib.HoldOptimized && state.HoldReason != lib.HoldSafety) ||
+		state.Phase != lib.PhaseHold || state.SettledAt.IsZero() || !state.EvidenceDeadlineAt.IsZero() ||
+		state.PendingKind != "" || state.MiningPending || now.Before(state.RampUntil) ||
+		info.MacAddr != state.MacAddr || operatingPointFromInfo(info) != state.CurrentPoint() ||
+		canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, state.CurrentPoint()) ||
+		!completeSafetyTelemetry(info) || hasPowerFault(info) {
+		return false
+	}
+	minimum, err := minimumAdvertisedPoint(asic)
+	if err != nil || assessInstantaneousSafety(info, settings, state.CurrentPoint(), minimum).action != safetyNormal {
+		return false
+	}
+	attempts, err := minerController.states.ListMutationAttempts(state.MacAddr)
+	if err != nil {
+		return false
+	}
+	for _, attempt := range attempts {
+		if attempt.FailedAt.IsZero() && attempt.MiningResumedAt.IsZero() {
+			return false
+		}
+	}
+	if state.HoldReason == lib.HoldSafety {
+		return state.SafetyReason != ""
+	}
+	if state.SafetyReason != "" {
+		return false
+	}
+	records, err := minerController.states.ListPoints(state.MacAddr)
+	if err != nil {
+		return false
+	}
+	selected, ok := selectFinalPoint(records, asic, settings)
+	best, bestOK := selectBestPoint(records, asic, settings)
+	return ok && bestOK && selected.Point() == state.CurrentPoint() && selected.Status == lib.PointValidated &&
+		best.MedianHash == state.BestHashRate && best.Point() == state.BestPoint()
+}
+
 func (minerController *controller) pollMinerSafely(
 	ctx context.Context,
 	miner lib.DiscoveredMiner,
@@ -495,7 +919,7 @@ func (minerController *controller) pollMiner(
 	if settings.Skip {
 		return minerPollResult{}, nil
 	}
-	asic, err := minerController.cachedASICSettings(ctx, info.MacAddr, miner.IP)
+	asic, err := minerController.devices.GetASICSettings(ctx, miner.IP)
 	if err != nil {
 		return minerPollResult{}, err
 	}
@@ -507,15 +931,20 @@ func (minerController *controller) pollMiner(
 			asic.ASICModel,
 		)
 	}
-	state, created, err := minerController.states.LoadOrCreate(info, miner.IP, now)
+	pairAdvertised := operatingPointAdvertised(asic, operatingPointFromInfo(info)) &&
+		canonicalASICGrid(asic) == nil
+	state, created, err := minerController.states.BootstrapMiner(
+		info,
+		miner.IP,
+		now,
+		settings.RampUpTime,
+		settings.EvaluationWindowTime,
+		pairAdvertised,
+	)
 	if err != nil {
 		return minerPollResult{}, err
 	}
 	if created {
-		state.RampUntil = now.Add(settings.RampUpTime)
-		if err := minerController.states.SaveMiner(&state); err != nil {
-			return minerPollResult{}, err
-		}
 		minerController.logf(
 			"Bootstrapping %s from live operating point %d MHz/%d mV",
 			info.Hostname,
@@ -534,28 +963,6 @@ func (minerController *controller) pollMiner(
 			created:  created,
 		},
 	}, nil
-}
-
-func (minerController *controller) cachedASICSettings(
-	ctx context.Context,
-	macAddr string,
-	ip string,
-) (lib.ASICSettings, error) {
-	minerController.asicMu.Lock()
-	settings, ok := minerController.asicCache[macAddr]
-	minerController.asicMu.Unlock()
-	if ok {
-		return settings, nil
-	}
-
-	settings, err := minerController.devices.GetASICSettings(ctx, ip)
-	if err != nil {
-		return lib.ASICSettings{}, err
-	}
-	minerController.asicMu.Lock()
-	minerController.asicCache[macAddr] = settings
-	minerController.asicMu.Unlock()
-	return settings, nil
 }
 
 func writeMinerTable(output io.Writer, results []minerPollResult) {

@@ -68,6 +68,33 @@ type ASICSettings struct {
 	VoltageOptions   []int  `json:"voltageOptions"`
 }
 
+// ValidateCanonicalASICGrid accepts only the AxeOS v2.8.1 BM1370 board 601
+// grid that Bitagnis is allowed to automate. A different advertised grid is
+// observable but never becomes an automated request authority.
+func ValidateCanonicalASICGrid(settings ASICSettings) error {
+	expectedFrequencies := []int{400, 490, 525, 550, 600, 625}
+	expectedVoltages := []int{1000, 1060, 1100, 1150, 1200, 1250}
+	if settings.ASICModel != "BM1370" ||
+		settings.DefaultFrequency != 525 || settings.DefaultVoltage != 1150 ||
+		!equalIntSlices(settings.FrequencyOptions, expectedFrequencies) ||
+		!equalIntSlices(settings.VoltageOptions, expectedVoltages) {
+		return fmt.Errorf("advertised ASIC grid is not the supported AxeOS v2.8.1 BM1370 grid")
+	}
+	return nil
+}
+
+func equalIntSlices(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 type OperatingPoint struct {
 	Frequency   int
 	CoreVoltage int

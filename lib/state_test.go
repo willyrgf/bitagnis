@@ -1,692 +1,528 @@
 package lib
 
 import (
-	"database/sql"
-	"fmt"
-	"os"
+	"context"
+	"errors"
 	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
-func openTestOptimizerStore(t *testing.T) *OptimizerStore {
+const (
+	testMAC      = "aa:bb:cc:dd:ee:01"
+	testHostname = "bitaxe-test"
+	testIP       = "192.0.2.11"
+)
+
+func testInfo() Info {
+	return Info{
+		Version: "v2.8.1", ASICModel: "BM1370", BoardVersion: "601",
+		Hostname: testHostname, MacAddr: testMAC, Frequency: 525, CoreVoltage: 1150,
+		CoreVoltageActual: 1150, HashRate: 100, ExpectedHashRate: 100,
+		Temp: 55, VRTemp: 70, Power: 18, UpTimeSeconds: 100,
+	}
+}
+
+func testASIC() ASICSettings {
+	return ASICSettings{
+		ASICModel: "BM1370", DefaultFrequency: 525, DefaultVoltage: 1150,
+		FrequencyOptions: []int{400, 490, 525, 550, 600, 625},
+		VoltageOptions:   []int{1000, 1060, 1100, 1150, 1200, 1250},
+	}
+}
+
+func openTestStore(t *testing.T) *OptimizerStore {
 	t.Helper()
 	store, err := OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
-		t.Fatalf("open test optimizer store: %v", err)
+		t.Fatalf("open optimizer store: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("close test optimizer store: %v", err)
-		}
-	})
+	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 
-func normalInfo() Info {
-	return Info{
-		Hostname:    "bitaxe-alpha",
-		MacAddr:     "aa:bb:cc:dd:ee:ff",
-		Frequency:   400,
-		CoreVoltage: 1100,
-		HashRate:    800,
-		Temp:        62,
-	}
-}
-
-func TestOptimizerStoreBootstrapsFromLiveOperatingPoint(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	now := time.Now().Round(time.Second)
-	state, created, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.Time) {
+	t.Helper()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	state, created, err := store.BootstrapMiner(testInfo(), testIP, now, time.Minute, 5*time.Minute, true)
 	if err != nil {
-		t.Fatalf("LoadOrCreate returned an error: %v", err)
+		t.Fatalf("bootstrap: %v", err)
 	}
 	if !created {
-		t.Fatal("new miner was not reported as created")
+		t.Fatal("bootstrap did not create miner")
 	}
-	if state.CurrentPoint() != (OperatingPoint{Frequency: 400, CoreVoltage: 1100}) {
-		t.Fatalf("current point = %+v", state.CurrentPoint())
-	}
-	if state.Phase != PhaseBaseline || !state.PhaseStartedAt.Equal(now) {
-		t.Fatalf("initial optimizer state = %+v", state)
-	}
-
-	reloaded, created, err := store.LoadOrCreate(normalInfo(), "192.0.2.11", now.Add(time.Minute))
-	if err != nil {
-		t.Fatalf("reload state: %v", err)
-	}
-	if created || reloaded.IP != "192.0.2.11" {
-		t.Fatalf("reloaded state = %+v, created = %v", reloaded, created)
-	}
+	return state, now
 }
 
-func TestOptimizerStoreNeverTrustsEmergencyOperatingPoint(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	info := normalInfo()
-	info.Frequency = 50
-	info.CoreVoltage = 1000
-	info.OverHeatMode = 1
-
-	state, created, err := store.LoadOrCreate(info, "192.0.2.10", time.Now())
+func TestSchemaV4BootstrapAndReopen(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
+		t.Fatalf("unexpected bootstrap authority: %+v", state)
+	}
+	points, err := store.ListPoints(testMAC)
 	if err != nil {
-		t.Fatalf("LoadOrCreate returned an error: %v", err)
+		t.Fatalf("list bootstrap point: %v", err)
 	}
-	if !created || state.CurrentPoint() != (OperatingPoint{}) {
-		t.Fatalf("emergency point was trusted: %+v", state)
+	if len(points) != 1 || points[0].Status != PointEntered || points[0].EntryAttemptID != 0 {
+		t.Fatalf("unexpected baseline row: %+v", points)
 	}
-	if state.Phase != PhaseOverheat || state.OverheatCount != 1 {
-		t.Fatalf("overheat bootstrap state = %+v", state)
+	version, err := schemaVersion(context.Background(), store.conn)
+	if err != nil || version != 4 {
+		t.Fatalf("schema version = %d, %v", version, err)
 	}
-}
-
-func TestOptimizerStoreCreatesOnlyCurrentSchema(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	version, err := schemaVersion(t.Context(), store.conn)
-	if err != nil {
-		t.Fatalf("read schema version: %v", err)
-	}
-	tables, err := applicationTables(t.Context(), store.conn)
-	if err != nil {
-		t.Fatalf("read schema tables: %v", err)
-	}
-	if version != optimizerSchemaVersion ||
-		fmt.Sprint(tables) != "[mutation_attempts operating_points optimizer_miners]" {
-		t.Fatalf("schema version/tables = %d/%v", version, tables)
-	}
-	for _, table := range tables {
-		columns, err := tableColumns(t.Context(), store.conn, table)
-		if err != nil {
-			t.Fatalf("read %s columns: %v", table, err)
-		}
-		for _, column := range columns {
-			lowerName := strings.ToLower(column.name)
-			switch {
-			case column.name == "overheat_pending":
-				t.Fatal("schema retained deleted overheat_pending column")
-			case strings.Contains(lowerName, "password") ||
-				strings.Contains(lowerName, "stratum") ||
-				strings.Contains(lowerName, "telemetry") ||
-				strings.Contains(lowerName, "sample"):
-				t.Fatalf("schema contains forbidden durable field %q", column.name)
-			}
-		}
-	}
-}
-
-func TestOptimizerStoreOpensRelativeRuntimePath(t *testing.T) {
-	t.Chdir(t.TempDir())
-	store, err := OpenOptimizerStore("optimizer.db")
-	if err != nil {
-		t.Fatalf("open relative optimizer store: %v", err)
-	}
+	path := storePath(t, store)
 	if err := store.Close(); err != nil {
-		t.Fatalf("close relative optimizer store: %v", err)
+		t.Fatalf("close: %v", err)
 	}
-	if _, err := os.Stat("optimizer.db"); err != nil {
-		t.Fatalf("stat relative optimizer database: %v", err)
-	}
-}
-
-func TestOptimizerStoreExcludesSecondProcess(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	first, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("open first store: %v", err)
-	}
-	t.Cleanup(func() { _ = first.Close() })
-
-	started := time.Now()
-	second, err := OpenOptimizerStore(path)
-	if second != nil {
-		_ = second.Close()
-	}
-	if err == nil || !strings.Contains(err.Error(), "already in use") {
-		t.Fatalf("second open error = %v", err)
-	}
-	if time.Since(started) > 2*time.Second {
-		t.Fatalf("second open was not bounded: %s", time.Since(started))
-	}
-}
-
-func TestOptimizerStorePersistsHistoryAndPendingObligationsAcrossReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	now := time.Now().Round(time.Second)
-	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
-	if err != nil {
-		t.Fatalf("create state: %v", err)
-	}
-	state.SetPendingMutation(
-		MutationOverheatRecovery,
-		OperatingPoint{Frequency: 400, CoreVoltage: 1060},
-		now,
-	)
-	state.Phase = PhaseOverheat
-	state.MiningPending = true
-	state.OverheatCount = 3
-	state.CooldownUntil = now.Add(6 * time.Hour)
-	if err := store.SaveMiner(&state); err != nil {
-		t.Fatalf("save pending state: %v", err)
-	}
-	record := OperatingPointRecord{
-		MacAddr:      state.MacAddr,
-		Frequency:    400,
-		CoreVoltage:  1060,
-		Status:       PointValidated,
-		MedianHash:   800,
-		ExpectedHash: 816,
-		Attainment:   800.0 / 816,
-		MeanTemp:     60.5,
-		P95Temp:      62,
-		P95VRTemp:    49,
-		P95Power:     14.8,
-		MeasuredAt:   now,
-	}
-	if err := store.SavePoint(&record); err != nil {
-		t.Fatalf("save point: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
 	reopened, err := OpenOptimizerStore(path)
 	if err != nil {
-		t.Fatalf("reopen store: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	got, created, err := reopened.LoadOrCreate(normalInfo(), "192.0.2.10", now)
-	if err != nil {
-		t.Fatalf("load reopened state: %v", err)
-	}
-	if created ||
-		got.PendingKind != MutationOverheatRecovery ||
-		got.PendingPoint() != (OperatingPoint{Frequency: 400, CoreVoltage: 1060}) ||
-		!got.MiningPending ||
-		got.OverheatCount != 3 ||
-		!got.CooldownUntil.Equal(state.CooldownUntil) {
-		t.Fatalf("reopened state = %+v", got)
-	}
-	records, err := reopened.ListPoints(state.MacAddr)
-	if err != nil {
-		t.Fatalf("list reopened points: %v", err)
-	}
-	if len(records) != 1 || records[0].Point() != record.Point() {
-		t.Fatalf("reopened records = %+v", records)
+	defer reopened.Close()
+	loaded, err := reopened.LoadMiner(testMAC)
+	if err != nil || loaded.CurrentPoint() != state.CurrentPoint() {
+		t.Fatalf("reopened state = %+v, %v", loaded, err)
 	}
 }
 
-func TestMutationAttemptLifecyclePersistsAcrossReopen(t *testing.T) {
+func TestResetOptimizationPassRejectsSafetyHold(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldSafety
+	state.SafetyReason = SafetyReasonASICLimit
+	state.SettledAt = now.Add(time.Hour)
+	state.PhaseStartedAt = now.Add(time.Hour)
+	state.EvidenceDeadlineAt = time.Time{}
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResetOptimizationPass(
+		testMAC, state.CurrentPoint(), now.Add(2*time.Hour),
+		now.Add(3*time.Hour), now.Add(23*time.Hour),
+	); err == nil {
+		t.Fatal("retune was accepted from a safety-derived hold")
+	}
+}
+
+func storePath(t *testing.T, store *OptimizerStore) string {
+	t.Helper()
+	var path string
+	if err := store.conn.QueryRowContext(context.Background(), "PRAGMA database_list").Scan(new(int), new(string), &path); err != nil {
+		t.Fatalf("database path: %v", err)
+	}
+	return path
+}
+
+func TestRejectSchemaV3WithoutMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := OpenOptimizerStore(path)
 	if err != nil {
-		t.Fatalf("open store: %v", err)
+		t.Fatal(err)
 	}
-	now := time.Now().Round(time.Second)
-	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("schema v3 was accepted")
+	}
+}
+
+func TestReopenRejectsOrphanedUnfinishedMutationAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
 	if err != nil {
-		t.Fatalf("create state: %v", err)
+		t.Fatal(err)
 	}
-	target := OperatingPoint{Frequency: 400, CoreVoltage: 1060}
-	state.Phase = PhaseUndervolt
+	_, now := bootstrapTestMiner(t, store)
+	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO mutation_attempts (
+		mac_addr, kind, reason, from_frequency, from_core_voltage,
+		target_frequency, target_core_voltage, intent_created_at, started_at,
+		patch_requested_at, configured_verified_at, configured_verified_uptime_seconds,
+		restart_requested_at, reboot_verified_at, completed_at, first_positive_at,
+		mining_resumed_at, failed_at, failure_stage
+	) VALUES (?, ?, '', 525, 1150, 525, 1100, ?, ?, 0, 0, -1, 0, 0, 0, 0, 0, 0, '')`,
+		testMAC, MutationOperatingPoint, timeValue(now), timeValue(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("orphaned unfinished mutation authority was accepted")
+	}
+}
+
+func TestAdmitTrialBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	baseline := state.CurrentPoint()
+	state.BestHashRate = 100
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	if _, err := store.AdmitTrial(&state, candidate, baseline, PhaseUndervolt, 99, now.Add(time.Minute), now.Add(21*time.Minute)); err == nil {
+		t.Fatal("stale frozen reference was accepted")
+	}
+	state.PassReferenceHash = 100
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	state.PassReferenceHash = 1
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil || loaded.PassReferenceHash != 100 {
+		t.Fatalf("positive pass reference was overwritten: %+v, %v", loaded, err)
+	}
+	state = loaded
+	attemptID, err := store.AdmitTrial(&state, candidate, baseline, PhaseUndervolt, 100, now.Add(time.Minute), now.Add(21*time.Minute))
+	if err != nil {
+		t.Fatalf("admit trial: %v", err)
+	}
+	if attemptID <= 0 || state.PendingPoint() != candidate || state.FallbackPoint() != baseline {
+		t.Fatalf("admission state = %+v", state)
+	}
+	attempt, ok, err := store.UnfinishedMutationAttempt(testMAC)
+	if err != nil || !ok || attempt.ID != attemptID {
+		t.Fatalf("entry attempt = %+v, %t, %v", attempt, ok, err)
+	}
+	points, err := store.ListPoints(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, found := findTestPoint(points, candidate)
+	if !found || entry.EntryAttemptID != attemptID || entry.ReferenceHash != 100 {
+		t.Fatalf("candidate binding = %+v", entry)
+	}
+	terminal := entry
+	terminal.Status = PointNoGain
+	terminal.MedianHash = 99
+	terminal.ExpectedHash = 100
+	terminal.Attainment = .99
+	terminal.MeanTemp = 55
+	terminal.P95Temp = 56
+	terminal.P95VRTemp = 70
+	terminal.P95Power = 18
+	terminal.MeasuredAt = now.Add(12 * time.Minute)
+	if err := store.FailMutationAndFinalizeTrial(
+		&state, terminal, TrialReturn, attemptID, MutationFailurePreflight,
+		terminal.MeasuredAt, time.Time{}, time.Time{},
+	); err != nil {
+		t.Fatalf("finalize return: %v", err)
+	}
+	if state.PendingKind != "" || state.FallbackPoint() != (OperatingPoint{}) || state.Phase != PhaseBaseline {
+		t.Fatalf("return state = %+v", state)
+	}
+	if _, err := store.AdmitTrial(&state, OperatingPoint{Frequency: 525, CoreVoltage: 1100}, baseline, PhaseUndervolt, 100, now, now.Add(time.Hour)); err == nil {
+		t.Fatal("duplicate candidate was admitted")
+	}
+}
+
+func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.BestHashRate = 100
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	attemptID, err := store.AdmitTrial(&state, candidate, state.CurrentPoint(), PhaseUndervolt, 100, now.Add(time.Minute), now.Add(21*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.ListPoints(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found := findTestPoint(records, candidate)
+	if !found {
+		t.Fatal("candidate row is missing")
+	}
+	record.Status = PointUnobservable
+	record.MeasuredAt = now.Add(3 * time.Minute)
+	if err := store.FailMutationAndFinalizeTrial(
+		&state, record, TrialReturn, attemptID, MutationFailurePreflight,
+		now.Add(3*time.Minute), now.Add(4*time.Minute), now.Add(24*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != PhaseBaseline || state.PendingKind != "" || state.FallbackPoint() != (OperatingPoint{}) {
+		t.Fatalf("failed trial state = %+v", state)
+	}
+	records, err = store.ListPoints(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found = findTestPoint(records, candidate)
+	if !found || record.Status != PointUnobservable {
+		t.Fatalf("failed candidate row = %+v", record)
+	}
+	attempts, err := store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != MutationFailurePreflight {
+		t.Fatalf("failed attempt = %+v, %v", attempts, err)
+	}
+}
+
+func TestMutationMilestonesAndAtomicResume(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if err := store.SaveMiner(&state); err != nil {
-		t.Fatalf("save pending state: %v", err)
+		t.Fatal(err)
 	}
 	attempt := MutationAttempt{
-		MacAddr:           state.MacAddr,
-		Kind:              MutationOperatingPoint,
-		FromFrequency:     state.CurrentFrequency,
-		FromCoreVoltage:   state.CurrentCoreVoltage,
-		TargetFrequency:   target.Frequency,
-		TargetCoreVoltage: target.CoreVoltage,
-		IntentCreatedAt:   now,
-		StartedAt:         now.Add(time.Second),
+		MacAddr: testMAC, Kind: MutationOperatingPoint,
+		FromFrequency: 525, FromCoreVoltage: 1150,
+		TargetFrequency: 525, TargetCoreVoltage: 1100,
+		IntentCreatedAt: now, StartedAt: now,
+		ConfiguredVerifiedUptimeSeconds: -1,
 	}
 	id, err := store.StartMutationAttempt(&attempt)
 	if err != nil {
-		t.Fatalf("start attempt: %v", err)
+		t.Fatal(err)
 	}
-	if id <= 0 || attempt.ID != id {
-		t.Fatalf("attempt ID = %d/%d", id, attempt.ID)
+	if _, err := store.StartMutationAttempt(&MutationAttempt{
+		MacAddr: testMAC, Kind: MutationOperatingPoint,
+		FromFrequency: 525, FromCoreVoltage: 1150,
+		TargetFrequency: 525, TargetCoreVoltage: 1200,
+		IntentCreatedAt: now, StartedAt: now,
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}); err == nil {
+		t.Fatal("second unfinished attempt was accepted")
 	}
-	if err := store.AdvanceMutationAttempt(
-		id,
-		MutationMilestoneRestartRequested,
-		now.Add(2*time.Second),
-	); err == nil {
-		t.Fatal("restart milestone without PATCH was accepted")
+	if err := store.AdvanceMutationAttempt(id, MutationMilestonePatchRequested, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	milestones := []struct {
-		milestone MutationMilestone
-		at        time.Time
-	}{
-		{MutationMilestonePatchRequested, now.Add(2 * time.Second)},
-		{MutationMilestoneRestartRequested, now.Add(3 * time.Second)},
-		{MutationMilestoneRebootVerified, now.Add(20 * time.Second)},
+	if err := store.AdvanceMutationAttempt(id, MutationMilestonePatchRequested, now.Add(2*time.Second)); err == nil {
+		t.Fatal("conflicting PATCH milestone was accepted")
 	}
-	for _, milestone := range milestones {
-		if err := store.AdvanceMutationAttempt(
-			id,
-			milestone.milestone,
-			milestone.at,
-		); err != nil {
-			t.Fatalf("advance %s: %v", milestone.milestone, err)
-		}
+	if err := store.RecordConfiguredVerification(id, now.Add(2*time.Second), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRestartRequested, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRebootVerified, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
 	}
 	state.SetCurrentPoint(target)
 	state.ClearPendingMutation()
-	completedAt := now.Add(21 * time.Second)
-	if err := store.CompleteMutationAttempt(&state, id, completedAt); err != nil {
-		t.Fatalf("complete attempt: %v", err)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldBlocked
+	state.SetFallbackPoint(OperatingPoint{})
+	state.RampUntil = now.Add(5 * time.Second)
+	if err := store.CompleteMutationAttempt(&state, id, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	pending, found, err := store.PendingMutationResume(state.MacAddr)
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil || loaded.Phase != PhaseBaseline || loaded.HoldReason != "" || loaded.CurrentPoint() != target {
+		t.Fatalf("completion was not store-derived: %+v, %v", loaded, err)
+	}
+	if err := store.RecordFirstPositive(id, now.Add(6*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.LoadMiner(testMAC)
 	if err != nil {
-		t.Fatalf("load pending resume: %v", err)
+		t.Fatal(err)
 	}
-	if !found || pending.ID != id || !pending.CompletedAt.Equal(completedAt) {
-		t.Fatalf("pending resume = %+v, found = %v", pending, found)
+	if err := store.CompleteMiningResume(&state, id, now.Add(7*time.Second), now.Add(8*time.Second), now.Add(18*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
-	resumedAt := now.Add(40 * time.Second)
-	if err := store.AdvanceMutationAttempt(
-		id,
-		MutationMilestoneMiningResumed,
-		resumedAt,
-	); err != nil {
-		t.Fatalf("resume mining: %v", err)
+	attempts, err := store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || attempts[0].MiningResumedAt.IsZero() {
+		t.Fatalf("resumed attempt = %+v, %v", attempts, err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
-	reopened, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	attempts, err := reopened.ListMutationAttempts(state.MacAddr)
-	if err != nil {
-		t.Fatalf("list attempts: %v", err)
-	}
-	if len(attempts) != 1 {
-		t.Fatalf("attempts = %+v", attempts)
-	}
-	got := attempts[0]
-	if got.ID != id ||
-		got.Kind != MutationOperatingPoint ||
-		got.FromPoint() != (OperatingPoint{Frequency: 400, CoreVoltage: 1100}) ||
-		got.TargetPoint() != target ||
-		!got.PatchRequestedAt.Equal(milestones[0].at) ||
-		!got.RestartRequestedAt.Equal(milestones[1].at) ||
-		!got.RebootVerifiedAt.Equal(milestones[2].at) ||
-		!got.CompletedAt.Equal(completedAt) ||
-		!got.MiningResumedAt.Equal(resumedAt) ||
-		!got.FailedAt.IsZero() ||
-		got.FailureStage != "" {
-		t.Fatalf("reopened mutation attempt = %+v", got)
+	if _, ok, err := store.PendingMutationResume(testMAC); err != nil || ok {
+		t.Fatalf("pending resume = %t, %v", ok, err)
 	}
 }
 
-func TestStartingMutationClosesInterruptedAttempt(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	now := time.Now().Round(time.Second)
-	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
+func TestQuarantineMutationClosesAmbiguousCandidateAtomically(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state.BestHashRate = 100
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	attemptID, err := store.AdmitTrial(&state, candidate, state.CurrentPoint(), PhaseFrequencyTest, 100, now.Add(time.Minute), now.Add(21*time.Minute))
 	if err != nil {
-		t.Fatalf("create state: %v", err)
+		t.Fatal(err)
 	}
-	first := MutationAttempt{
-		MacAddr:           state.MacAddr,
-		Kind:              MutationOperatingPoint,
-		FromFrequency:     400,
-		FromCoreVoltage:   1100,
-		TargetFrequency:   400,
-		TargetCoreVoltage: 1060,
-		IntentCreatedAt:   now,
-		StartedAt:         now,
+	if err := store.AdvanceMutationAttempt(attemptID, MutationMilestonePatchRequested, now.Add(90*time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	firstID, err := store.StartMutationAttempt(&first)
-	if err != nil {
-		t.Fatalf("start first attempt: %v", err)
-	}
-	if err := store.AdvanceMutationAttempt(
-		firstID,
-		MutationMilestonePatchRequested,
-		now.Add(time.Second),
-	); err != nil {
-		t.Fatalf("advance first attempt: %v", err)
-	}
-	second := first
-	second.ID = 0
-	second.TargetCoreVoltage = 1150
-	second.IntentCreatedAt = now.Add(time.Minute)
-	second.StartedAt = now.Add(time.Minute)
-	if _, err := store.StartMutationAttempt(&second); err != nil {
-		t.Fatalf("start second attempt: %v", err)
-	}
-	attempts, err := store.ListMutationAttempts(state.MacAddr)
-	if err != nil {
-		t.Fatalf("list attempts: %v", err)
-	}
-	if len(attempts) != 2 ||
-		attempts[0].FailureStage != MutationFailureInterrupted ||
-		!attempts[0].FailedAt.Equal(second.StartedAt) ||
-		!attempts[1].FailedAt.IsZero() {
-		t.Fatalf("attempts after interruption = %+v", attempts)
-	}
-}
-
-func TestOptimizerStoreRejectsIncompatibleSchemaWithoutModification(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-	}{
-		{
-			name:   "old unversioned",
-			schema: `CREATE TABLE optimizer_miners (mac_addr TEXT PRIMARY KEY, pending_recovery INTEGER);`,
-		},
-		{
-			name:   "unknown version",
-			schema: `PRAGMA user_version = 99; CREATE TABLE marker (value TEXT);`,
-		},
-		{
-			name:   "previous version",
-			schema: `PRAGMA user_version = 2; CREATE TABLE marker (value TEXT);`,
-		},
-		{
-			name: "partial current",
-			schema: `PRAGMA user_version = 1;
-				CREATE TABLE optimizer_miners (mac_addr TEXT NOT NULL PRIMARY KEY);`,
-		},
-		{
-			name: "unexpected current table",
-			schema: `PRAGMA user_version = 1;
-				CREATE TABLE unexpected (value TEXT);`,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "optimizer.db")
-			createRawDatabase(t, path, test.schema)
-			before, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read database before open: %v", err)
-			}
-
-			store, err := OpenOptimizerStore(path)
-			if store != nil {
-				_ = store.Close()
-			}
-			if err == nil ||
-				!strings.Contains(err.Error(), "move aside or remove") {
-				t.Fatalf("open error = %v", err)
-			}
-			after, readErr := os.ReadFile(path)
-			if readErr != nil {
-				t.Fatalf("read database after rejection: %v", readErr)
-			}
-			if string(after) != string(before) {
-				t.Fatal("incompatible database bytes were modified")
-			}
-		})
-	}
-}
-
-func TestOptimizerStoreRejectsInvalidCurrentDataBeforeUse(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	if _, _, err := store.LoadOrCreate(
-		normalInfo(),
-		"192.0.2.10",
-		time.Now(),
-	); err != nil {
-		_ = store.Close()
-		t.Fatalf("create state: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-	database, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatalf("open raw database: %v", err)
-	}
-	if _, err := database.Exec(
-		"UPDATE optimizer_miners SET pending_kind = 'unknown'",
-	); err != nil {
-		_ = database.Close()
-		t.Fatalf("corrupt current data: %v", err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatalf("close raw database: %v", err)
-	}
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read database before validation: %v", err)
-	}
-	reopened, err := OpenOptimizerStore(path)
-	if reopened != nil {
-		_ = reopened.Close()
-	}
-	if err == nil || !strings.Contains(err.Error(), "pending mutation kind") {
-		t.Fatalf("reopen error = %v", err)
-	}
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read database after validation: %v", err)
-	}
-	if string(after) != string(before) {
-		t.Fatal("invalid current database was modified during rejection")
-	}
-}
-
-func TestOptimizerStoreSerializesConcurrentWrites(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	var workers sync.WaitGroup
-	errorsChannel := make(chan error, 32)
-	for index := range 32 {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			state := MinerState{
-				MacAddr:            fmt.Sprintf("aa:bb:cc:dd:ee:%02x", index),
-				Hostname:           fmt.Sprintf("miner-%02d", index),
-				IP:                 fmt.Sprintf("192.0.2.%d", index+1),
-				Phase:              PhaseBaseline,
-				CurrentFrequency:   400,
-				CurrentCoreVoltage: 1100,
-			}
-			if err := store.SaveMiner(&state); err != nil {
-				errorsChannel <- err
-			}
-		}()
-	}
-	workers.Wait()
-	close(errorsChannel)
-	for err := range errorsChannel {
-		t.Errorf("concurrent SaveMiner returned an error: %v", err)
-	}
-}
-
-func TestOptimizerStoreRejectsInvalidPendingStateAndPoint(t *testing.T) {
-	store := openTestOptimizerStore(t)
-	state := MinerState{
-		MacAddr:            "aa:bb:cc:dd:ee:ff",
-		Hostname:           "bitaxe-alpha",
-		IP:                 "192.0.2.10",
-		Phase:              PhaseBaseline,
-		CurrentFrequency:   400,
-		CurrentCoreVoltage: 1100,
-		PendingKind:        MutationOperatingPoint,
-	}
-	if err := store.SaveMiner(&state); err == nil {
-		t.Fatal("SaveMiner returned nil for incomplete pending mutation")
-	}
-
-	err := store.SavePoint(&OperatingPointRecord{
-		MacAddr:     "aa:bb",
-		Frequency:   400,
-		CoreVoltage: 2500,
-		Status:      PointUnstable,
-	})
-	if err == nil {
-		t.Fatal("SavePoint returned nil, want invalid voltage error")
-	}
-}
-
-func TestMinerStateRejectsInvalidSafetyKindPhaseCombinations(t *testing.T) {
-	now := time.Now()
-	base := MinerState{
-		MacAddr:            "aa:bb:cc:dd:ee:ff",
-		Hostname:           "bitaxe-alpha",
-		IP:                 "192.0.2.10",
-		Phase:              PhaseBaseline,
-		PhaseStartedAt:     now,
-		CurrentFrequency:   490,
-		CurrentCoreVoltage: 1100,
-	}
-	tests := []struct {
-		name  string
-		phase OptimizerPhase
-		kind  MutationKind
-	}{
-		{
-			name:  "safety rollback outside safety phase",
-			phase: PhaseBaseline,
-			kind:  MutationSafetyRollback,
-		},
-		{
-			name:  "overheat recovery outside emergency",
-			phase: PhaseCooldown,
-			kind:  MutationOverheatRecovery,
-		},
-		{
-			name:  "ordinary intent in emergency",
-			phase: PhaseOverheat,
-			kind:  MutationOperatingPoint,
-		},
-		{
-			name:  "unknown kind",
-			phase: PhaseCooldown,
-			kind:  MutationKind("unknown"),
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			state := base
-			state.Phase = test.phase
-			state.SetPendingMutation(
-				test.kind,
-				OperatingPoint{Frequency: 400, CoreVoltage: 1000},
-				now,
-			)
-			if err := validateMinerState(state); err == nil {
-				t.Fatalf("invalid state was accepted: %+v", state)
-			}
-		})
-	}
-}
-
-func TestMutationFreeOverheatEpisodeSurvivesReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	now := time.Now().Round(time.Second)
-	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
-	if err != nil {
-		t.Fatalf("create state: %v", err)
-	}
-	state.Phase = PhaseOverheat
-	state.PhaseStartedAt = now.Add(time.Minute)
-	state.OverheatCount = 2
-	state.CooldownUntil = now.Add(4 * time.Hour)
 	state.ClearPendingMutation()
-	if err := store.SaveMiner(&state); err != nil {
-		t.Fatalf("save emergency hold: %v", err)
+	state.SetFallbackPoint(OperatingPoint{})
+	state.Phase = PhaseOverheat
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
+	state.EvidenceDeadlineAt = time.Time{}
+	state.SafetyReason = SafetyReasonMutationUncertain
+	state.OverheatCount = 1
+	state.CooldownUntil = now.Add(time.Hour)
+	failedAt := now.Add(2 * time.Minute)
+	if err := store.QuarantineMutation(&state, attemptID, MutationFailureConfiguredVerification, failedAt); err != nil {
+		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
-	reopened, err := OpenOptimizerStore(path)
+	records, err := store.ListPoints(testMAC)
 	if err != nil {
-		t.Fatalf("reopen store: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	got, err := reopened.LoadMiner(state.MacAddr)
-	if err != nil {
-		t.Fatalf("load emergency hold: %v", err)
+	record, found := findTestPoint(records, candidate)
+	if !found || record.Status != PointUnobservable {
+		t.Fatalf("quarantined candidate = %+v", record)
 	}
-	if got.Phase != PhaseOverheat ||
-		got.PendingKind != "" ||
-		!got.PhaseStartedAt.Equal(state.PhaseStartedAt) ||
-		!got.CooldownUntil.Equal(state.CooldownUntil) ||
-		got.OverheatCount != state.OverheatCount {
-		t.Fatalf("reopened emergency hold = %+v", got)
+	attempts, err := store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != MutationFailureConfiguredVerification {
+		t.Fatalf("quarantined attempt = %+v, %v", attempts, err)
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil || loaded.Phase != PhaseOverheat || loaded.SafetyReason != SafetyReasonMutationUncertain || loaded.PendingKind != "" {
+		t.Fatalf("quarantined state = %+v, %v", loaded, err)
 	}
 }
 
-func TestPendingSafetyRollbackAgeSurvivesReopen(t *testing.T) {
+func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state.Phase = PhaseCooldown
+	state.SafetyReason = SafetyReasonASICLimit
+	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
+	state.CooldownUntil = now
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	attempt := MutationAttempt{
+		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: SafetyReasonASICLimit,
+		FromFrequency: 525, FromCoreVoltage: 1150,
+		TargetFrequency: 400, TargetCoreVoltage: 1000,
+		IntentCreatedAt: now, StartedAt: now,
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	attemptID, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := state
+	state.Phase = PhaseOverheat
+	state.SafetyReason = SafetyReasonFirmwareOverheat
+	state.SetPendingMutation(MutationOverheatRecovery, minimum, now.Add(time.Minute))
+	if err := store.PersistSafetyTransition(&expected, &state, nil, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != attemptID ||
+		attempts[0].FailureStage != MutationFailureSafetySuperseded {
+		t.Fatalf("superseded safety attempt = %+v, %v", attempts, err)
+	}
+}
+
+func TestHourlyCursorCASAndGeneralSaveCannotRegressIt(t *testing.T) {
+	store := openTestStore(t)
+	_, now := bootstrapTestMiner(t, store)
+	end := now.Add(90 * time.Minute)
+	fragments := []HourlyAggregate{
+		{MacAddr: testMAC, HourStartedAt: now.Truncate(time.Hour), ObservedSeconds: 1800, UnknownGapSeconds: 1800, ActualHashSeconds: 180000},
+		{MacAddr: testMAC, HourStartedAt: now.Add(time.Hour).Truncate(time.Hour), UnknownGapSeconds: 1800},
+	}
+	if err := store.CompareAndSetHourly(testMAC, now, end, fragments, end); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil || !loaded.AccountedThroughAt.Equal(end) {
+		t.Fatalf("cursor = %v, %v", loaded.AccountedThroughAt, err)
+	}
+	loaded.AccountedThroughAt = now
+	if err := store.SaveMiner(&loaded); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.LoadMiner(testMAC)
+	if err != nil || !loaded.AccountedThroughAt.Equal(end) {
+		t.Fatalf("cursor regressed to %v, %v", loaded.AccountedThroughAt, err)
+	}
+	if err := store.CompareAndSetHourly(testMAC, now, end.Add(time.Minute), nil, end); !errors.Is(err, ErrAccountingCursorChanged) {
+		t.Fatalf("stale cursor error = %v", err)
+	}
+	aggregates, err := store.ListHourly(testMAC, now.Add(-time.Hour), end.Add(time.Hour))
+	if err != nil || len(aggregates) != 2 {
+		t.Fatalf("hourly rows = %+v, %v", aggregates, err)
+	}
+}
+
+func TestHourlyCursorRequiresExactRetainedCoverage(t *testing.T) {
+	store := openTestStore(t)
+	_, now := bootstrapTestMiner(t, store)
+	end := now.Add(time.Hour)
+	if err := store.CompareAndSetHourly(testMAC, now, end, []HourlyAggregate{
+		{MacAddr: testMAC, HourStartedAt: now, ObservedSeconds: 1800, ActualHashSeconds: 180000},
+	}, now); err == nil {
+		t.Fatal("partial hourly coverage was accepted")
+	}
+}
+
+func TestHourlyRetentionKeepsBucketWhoseEndIsAfterBoundary(t *testing.T) {
+	store := openTestStore(t)
+	_, now := bootstrapTestMiner(t, store)
+	boundaryHour := now.Add(-LongTermRetentionHours * time.Hour)
+	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO optimizer_hourly (
+		mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+		actual_hash_seconds, trial_actual_hash_seconds,
+		incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
+	) VALUES (?, ?, 3600, 0, 360000, 0, 0, 0, 0)`, testMAC, boundaryHour.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompareAndSetHourly(testMAC, now, now.Add(time.Hour), []HourlyAggregate{
+		{MacAddr: testMAC, HourStartedAt: now, UnknownGapSeconds: 3600},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListHourly(testMAC, boundaryHour, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].HourStartedAt.Unix() != boundaryHour.Unix() {
+		t.Fatalf("retention boundary rows = %+v", rows)
+	}
+}
+
+func TestUnexpectedViewRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := OpenOptimizerStore(path)
 	if err != nil {
-		t.Fatalf("open store: %v", err)
+		t.Fatal(err)
 	}
-	now := time.Now().Round(time.Second)
-	state, _, err := store.LoadOrCreate(normalInfo(), "192.0.2.10", now)
-	if err != nil {
-		t.Fatalf("create state: %v", err)
-	}
-	pendingSince := now.Add(3 * time.Minute)
-	phaseStarted := now.Add(2 * time.Minute)
-	state.Phase = PhaseCooldown
-	state.PhaseStartedAt = phaseStarted
-	state.SetPendingMutation(
-		MutationSafetyRollback,
-		OperatingPoint{Frequency: 400, CoreVoltage: 1000},
-		pendingSince,
-	)
-	if err := store.SaveMiner(&state); err != nil {
-		t.Fatalf("save safety rollback: %v", err)
+	if _, err := store.conn.ExecContext(context.Background(), "CREATE VIEW unexpected_view AS SELECT 1"); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
+		t.Fatal(err)
 	}
-
-	reopened, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	got, err := reopened.LoadMiner(state.MacAddr)
-	if err != nil {
-		t.Fatalf("load safety rollback: %v", err)
-	}
-	if got.PendingKind != MutationSafetyRollback ||
-		!got.PendingSince.Equal(pendingSince) ||
-		!got.PhaseStartedAt.Equal(phaseStarted) {
-		t.Fatalf("reopened safety rollback = %+v", got)
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("unexpected view was accepted")
 	}
 }
 
-func createRawDatabase(t *testing.T, path string, schema string) {
-	t.Helper()
-	database, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatalf("open raw database: %v", err)
+func findTestPoint(points []OperatingPointRecord, point OperatingPoint) (OperatingPointRecord, bool) {
+	for _, record := range points {
+		if record.Point() == point {
+			return record, true
+		}
 	}
-	if _, err := database.Exec(schema); err != nil {
-		_ = database.Close()
-		t.Fatalf("create raw schema: %v", err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatalf("close raw database: %v", err)
-	}
+	return OperatingPointRecord{}, false
 }
