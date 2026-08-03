@@ -131,6 +131,109 @@ func TestSchemaV5BootstrapAndReopen(t *testing.T) {
 	}
 }
 
+func TestBootstrapOffGridPairIsBlockedWithoutFrontierRow(t *testing.T) {
+	store := openTestStore(t)
+	offGrid := testInfo()
+	offGrid.Frequency = 500
+	offGrid.CoreVoltage = 1000
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	state, created, err := store.BootstrapMiner(offGrid, testIP, now, time.Minute, 5*time.Minute, true)
+	if err != nil || !created {
+		t.Fatalf("off-grid bootstrap = %+v, %t, %v", state, created, err)
+	}
+	if state.Phase != PhaseHold || state.HoldReason != HoldBlocked ||
+		state.CurrentPoint() != (OperatingPoint{Frequency: offGrid.Frequency, CoreVoltage: offGrid.CoreVoltage}) {
+		t.Fatalf("off-grid bootstrap state = %+v", state)
+	}
+	points, err := store.ListPoints(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("off-grid bootstrap created frontier rows: %+v", points)
+	}
+}
+
+func TestAutomationPersistenceRejectsOffGridAuthority(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	offGrid := OperatingPoint{Frequency: 500, CoreVoltage: 1000}
+	if err := validatePointRecord(OperatingPointRecord{
+		MacAddr: testMAC, Frequency: offGrid.Frequency, CoreVoltage: offGrid.CoreVoltage,
+		Status: PointEntered, EnteredAt: now,
+	}); err == nil {
+		t.Fatal("off-grid point record was accepted")
+	}
+	for _, mutate := range []func(*MinerState){
+		func(value *MinerState) { value.SetBestPoint(offGrid) },
+		func(value *MinerState) { value.SetFallbackPoint(offGrid) },
+		func(value *MinerState) { value.SetPendingMutation(MutationOperatingPoint, offGrid, now) },
+	} {
+		candidate := state
+		mutate(&candidate)
+		if err := store.SaveMiner(&candidate); err == nil {
+			t.Fatalf("off-grid durable authority was accepted: %+v", candidate)
+		}
+	}
+	if err := validateMinerState(func() MinerState {
+		current := state
+		current.SetCurrentPoint(offGrid)
+		return current
+	}()); err != nil {
+		t.Fatalf("off-grid current observation was rejected: %v", err)
+	}
+}
+
+func TestReopenRejectsOffGridOperatingPointRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, now := bootstrapTestMiner(t, store)
+	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO operating_points (
+		mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
+		attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
+		accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id, reference_hash
+	) VALUES (?, 500, 1000, ?, 0, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, ?, 0, 0)`,
+		testMAC, PointEntered, timeValue(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("off-grid operating point record was accepted on reopen")
+	}
+}
+
+func TestReopenRejectsMutationAttemptForUnknownMiner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, now := bootstrapTestMiner(t, store)
+	unknownMAC := "aa:bb:cc:dd:ee:99"
+	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO mutation_attempts (
+		mac_addr, kind, reason, from_frequency, from_core_voltage,
+		target_frequency, target_core_voltage, intent_created_at, started_at,
+		patch_requested_at, configured_verified_at, configured_verified_uptime_seconds,
+		restart_requested_at, reboot_verified_at, completed_at, first_positive_at,
+		mining_resumed_at, failed_at, failure_stage
+	) VALUES (?, ?, '', 525, 1150, 0, 0, ?, ?, 0, 0, -1, 0, 0, 0, 0, 0, ?, ?)`,
+		unknownMAC, MutationMiningConfiguration, timeValue(now), timeValue(now.Add(time.Second)),
+		timeValue(now.Add(2*time.Second)), MutationFailurePreflight); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("mutation attempt for unknown miner was accepted on reopen")
+	}
+}
+
 func TestResetOptimizationPassPersistsCompleteBoundarySnapshot(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
@@ -558,6 +661,26 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	}
 	if _, ok, err := store.PendingMutationResume(testMAC); err != nil || ok {
 		t.Fatalf("pending resume = %t, %v", ok, err)
+	}
+}
+
+func TestStartMutationAttemptRequiresIntentTimestampMatch(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	state.SetPendingMutation(MutationOperatingPoint, target, now)
+	if err := store.SaveMiner(&state); err != nil {
+		t.Fatal(err)
+	}
+	attempt := MutationAttempt{
+		MacAddr: testMAC, Kind: MutationOperatingPoint,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: target.Frequency, TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt: now.Add(time.Second), StartedAt: now.Add(time.Second),
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	if _, err := store.StartMutationAttempt(&attempt); err == nil {
+		t.Fatal("mutation attempt with a mismatched intent timestamp was accepted")
 	}
 }
 

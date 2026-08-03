@@ -499,9 +499,14 @@ func (store *OptimizerStore) BootstrapMiner(
 		state.OverheatCount = 1
 		state.SafetyReason = SafetyReasonFirmwareOverheat
 		state.EvidenceDeadlineAt = time.Time{}
-	} else if pairAdvertised && validStoredPoint(point) {
+	} else if pairAdvertised && validCanonicalPoint(point) {
 		state.SetCurrentPoint(point)
 		state.SetBestPoint(OperatingPoint{})
+	} else if validStoredPoint(point) {
+		state.SetCurrentPoint(point)
+		state.Phase = PhaseHold
+		state.HoldReason = HoldBlocked
+		state.EvidenceDeadlineAt = time.Time{}
 	} else {
 		state.Phase = PhaseHold
 		state.HoldReason = HoldBlocked
@@ -510,7 +515,7 @@ func (store *OptimizerStore) BootstrapMiner(
 	if err := saveMiner(tx, &state); err != nil {
 		return MinerState{}, false, fmt.Errorf("bootstrap miner: save state: %w", err)
 	}
-	if !emergency && state.Phase == PhaseBaseline && validStoredPoint(point) {
+	if !emergency && state.Phase == PhaseBaseline && validCanonicalPoint(point) {
 		if err := insertPoint(tx, OperatingPointRecord{
 			MacAddr:     info.MacAddr,
 			Frequency:   point.Frequency,
@@ -559,7 +564,7 @@ func (store *OptimizerStore) resetOptimizationPass(
 	rampUntil time.Time,
 	evidenceDeadlineAt time.Time,
 ) error {
-	if strings.TrimSpace(macAddr) == "" || !validStoredPoint(point) || point.Frequency == 50 {
+	if strings.TrimSpace(macAddr) == "" || !validCanonicalPoint(point) {
 		return fmt.Errorf("start optimization pass: invalid miner or operating point")
 	}
 	if !validPassTrigger(trigger) || startedAt.IsZero() || rampUntil.IsZero() ||
@@ -697,8 +702,7 @@ func (store *OptimizerStore) AdmitTrial(
 	if state == nil {
 		return 0, fmt.Errorf("admit trial: state is nil")
 	}
-	if !validStoredPoint(candidate) || candidate.Frequency == 50 ||
-		!validStoredPoint(incumbent) || candidate == incumbent ||
+	if !validCanonicalPoint(candidate) || !validCanonicalPoint(incumbent) || candidate == incumbent ||
 		(phase != PhaseUndervolt && phase != PhaseFrequencyTest && phase != PhaseVoltageTest) ||
 		!finite(referenceHash) || referenceHash <= 0 || enteredAt.IsZero() || evidenceDeadlineAt.IsZero() {
 		return 0, fmt.Errorf("admit trial: invalid candidate, incumbent, phase, or evidence timing")
@@ -1234,7 +1238,7 @@ func (store *OptimizerStore) AdoptExternalPoint(
 	rampUntil time.Time,
 	evidenceDeadlineAt time.Time,
 ) error {
-	if state == nil || !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 ||
+	if state == nil || !validCanonicalPoint(point) || attemptID <= 0 ||
 		at.IsZero() || rampUntil.IsZero() || evidenceDeadlineAt.IsZero() || evidenceDeadlineAt.Before(rampUntil) {
 		return fmt.Errorf("adopt external point: invalid state, point, attempt, or timing")
 	}
@@ -1549,10 +1553,10 @@ func (store *OptimizerStore) StartMutationAttempt(
 	} else if durable.PendingKind != attempt.Kind || durable.PendingPoint() != attempt.TargetPoint() {
 		return 0, fmt.Errorf("start mutation attempt: operating-point intent does not match durable state")
 	}
-	if attempt.Kind == MutationOperatingPoint &&
+	if attempt.Kind != MutationMiningConfiguration &&
 		(durable.PendingSince.IsZero() || attempt.IntentCreatedAt.IsZero() ||
 			!attempt.IntentCreatedAt.Equal(durable.PendingSince)) {
-		return 0, fmt.Errorf("start mutation attempt: candidate intent timestamp does not match durable pending intent")
+		return 0, fmt.Errorf("start mutation attempt: intent timestamp does not match durable pending intent")
 	}
 	if attempt.Kind == MutationOperatingPoint && durable.CurrentPoint() != attempt.FromPoint() {
 		return 0, fmt.Errorf("start mutation attempt: source operating point does not match durable state")
@@ -3852,6 +3856,9 @@ func validateCrossTableState(
 		if attempt.MacAddr == "" {
 			return fmt.Errorf("mutation attempt %d has no miner", attempt.ID)
 		}
+		if _, known := states[attempt.MacAddr]; !known {
+			return fmt.Errorf("mutation attempt %d belongs to unknown miner %s", attempt.ID, attempt.MacAddr)
+		}
 		if attempt.FailureStage == "" && attempt.MiningResumedAt.IsZero() {
 			// There is exactly one unfinished row per MAC by the partial index;
 			// querying it here also catches databases that were altered outside
@@ -4215,8 +4222,12 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("current operating point is invalid")
 	case !validOptionalPoint(state.BestPoint()):
 		return fmt.Errorf("best operating point is invalid")
+	case !validCanonicalOptionalPoint(state.BestPoint()):
+		return fmt.Errorf("best operating point is not on the supported automation grid")
 	case !validOptionalPoint(state.FallbackPoint()):
 		return fmt.Errorf("fallback operating point is invalid")
+	case !validCanonicalOptionalPoint(state.FallbackPoint()):
+		return fmt.Errorf("fallback operating point is not on the supported automation grid")
 	case state.CurrentFrequency == 50:
 		return fmt.Errorf("firmware emergency sentinel cannot be durable current")
 	case state.PendingKind == "" &&
@@ -4231,6 +4242,8 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("pending mutation kind %q is invalid", state.PendingKind)
 	case state.PendingKind != "" && !validStoredPoint(state.PendingPoint()):
 		return fmt.Errorf("pending operating point is invalid")
+	case state.PendingKind != "" && !validCanonicalPoint(state.PendingPoint()):
+		return fmt.Errorf("pending operating point is not on the supported automation grid")
 	case state.PendingKind != "" && state.PendingSince.IsZero():
 		return fmt.Errorf("pending mutation has no timestamp")
 	case state.MiningPending && state.PendingKind == MutationOperatingPoint:
@@ -4355,8 +4368,8 @@ func validatePointRecord(record OperatingPointRecord) error {
 		return fmt.Errorf("MAC address is invalid or non-canonical")
 	case !validStoredPoint(record.Point()):
 		return fmt.Errorf("operating point is invalid")
-	case record.Frequency == 50:
-		return fmt.Errorf("firmware emergency sentinel cannot enter point history")
+	case !validCanonicalPoint(record.Point()):
+		return fmt.Errorf("operating point is not on the supported automation grid")
 	case strings.TrimSpace(record.Status) == "":
 		return fmt.Errorf("status is empty")
 	case !validPointStatus(record.Status):
@@ -4433,6 +4446,9 @@ func validateMutationAttempt(attempt MutationAttempt, requireID bool) error {
 	case attempt.Kind != MutationMiningConfiguration &&
 		!validStoredPoint(target):
 		return fmt.Errorf("target operating point is invalid")
+	case attempt.Kind != MutationMiningConfiguration &&
+		!validCanonicalPoint(target):
+		return fmt.Errorf("target operating point is not on the supported automation grid")
 	case attempt.IntentCreatedAt.IsZero():
 		return fmt.Errorf("intent timestamp is required")
 	case attempt.StartedAt.IsZero():
@@ -4659,6 +4675,14 @@ func validOptionalPoint(point OperatingPoint) bool {
 		return true
 	}
 	return validStoredPoint(point)
+}
+
+func validCanonicalOptionalPoint(point OperatingPoint) bool {
+	return point == (OperatingPoint{}) || validCanonicalPoint(point)
+}
+
+func validCanonicalPoint(point OperatingPoint) bool {
+	return validStoredPoint(point) && point.Frequency != 50 && IsCanonicalOperatingPoint(point)
 }
 
 func validStoredPoint(point OperatingPoint) bool {
