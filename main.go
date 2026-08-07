@@ -886,23 +886,24 @@ func hourlyFragments(
 		if segmentEnd.After(end.UTC()) {
 			segmentEnd = end.UTC()
 		}
-		seconds := segmentEnd.Sub(cursor).Seconds()
+		duration := segmentEnd.Sub(cursor)
+		seconds := duration.Seconds()
 		fragment := lib.HourlyAggregate{MacAddr: macAddr, HourStartedAt: hour}
 		if actual {
-			fragment.ObservedSeconds = seconds
+			fragment.ObservedDuration = duration
 			fragment.ActualHashSeconds = current.hashRate * seconds
 			if current.phase == lib.PhaseUndervolt || current.phase == lib.PhaseFrequencyTest || current.phase == lib.PhaseVoltageTest {
 				if current.state.CurrentPoint() != current.state.FallbackPoint() {
-					fragment.TrialSeconds = seconds
+					fragment.TrialDuration = duration
 					fragment.TrialActualHashSeconds = fragment.ActualHashSeconds
 					fragment.IncumbentCounterfactualHashSeconds = current.referenceHash * seconds
 				}
 			}
 			if current.settled {
-				fragment.SettledSeconds = seconds
+				fragment.SettledDuration = duration
 			}
 		} else {
-			fragment.UnknownGapSeconds = seconds
+			fragment.UnknownGapDuration = duration
 		}
 		fragments = append(fragments, fragment)
 		cursor = segmentEnd

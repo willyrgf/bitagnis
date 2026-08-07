@@ -99,7 +99,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return state, now
 }
 
-func TestSchemaV5BootstrapAndReopen(t *testing.T) {
+func TestSchemaV6BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -113,7 +113,7 @@ func TestSchemaV5BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 5 {
+	if err != nil || version != 6 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -532,6 +532,23 @@ func TestRejectSchemaV4WithoutMigration(t *testing.T) {
 	}
 }
 
+func TestRejectSchemaV5WithoutMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil {
+		t.Fatal("schema v5 was accepted")
+	}
+}
+
 func TestReopenRejectsOrphanedUnfinishedMutationAuthority(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := OpenOptimizerStore(path)
@@ -864,8 +881,8 @@ func TestHourlyCursorCASAndGeneralSaveCannotRegressIt(t *testing.T) {
 	_, now := bootstrapTestMiner(t, store)
 	end := now.Add(90 * time.Minute)
 	fragments := []HourlyAggregate{
-		{MacAddr: testMAC, HourStartedAt: now.Truncate(time.Hour), ObservedSeconds: 1800, UnknownGapSeconds: 1800, ActualHashSeconds: 180000},
-		{MacAddr: testMAC, HourStartedAt: now.Add(time.Hour).Truncate(time.Hour), UnknownGapSeconds: 1800},
+		{MacAddr: testMAC, HourStartedAt: now.Truncate(time.Hour), ObservedDuration: 30 * time.Minute, UnknownGapDuration: 30 * time.Minute, ActualHashSeconds: 180000},
+		{MacAddr: testMAC, HourStartedAt: now.Add(time.Hour).Truncate(time.Hour), UnknownGapDuration: 30 * time.Minute},
 	}
 	if err := store.CompareAndSetHourly(testMAC, now, end, fragments, end); err != nil {
 		t.Fatal(err)
@@ -896,9 +913,69 @@ func TestHourlyCursorRequiresExactRetainedCoverage(t *testing.T) {
 	_, now := bootstrapTestMiner(t, store)
 	end := now.Add(time.Hour)
 	if err := store.CompareAndSetHourly(testMAC, now, end, []HourlyAggregate{
-		{MacAddr: testMAC, HourStartedAt: now, ObservedSeconds: 1800, ActualHashSeconds: 180000},
+		{MacAddr: testMAC, HourStartedAt: now, ObservedDuration: 30 * time.Minute, ActualHashSeconds: 180000},
 	}, now); err == nil {
 		t.Fatal("partial hourly coverage was accepted")
+	}
+}
+
+func TestHourlyAggregateDurationUsesExactBounds(t *testing.T) {
+	hour := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		aggregate HourlyAggregate
+		wantErr   bool
+	}{
+		{name: "exact hour", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: time.Hour}},
+		{name: "exact partial hour", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: 3527*time.Second + 352860000*time.Nanosecond, UnknownGapDuration: 72*time.Second + 647140000*time.Nanosecond}},
+		{name: "duration overage", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: time.Hour, UnknownGapDuration: time.Nanosecond}, wantErr: true},
+		{name: "duration exceeds hour", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: time.Hour + time.Nanosecond}, wantErr: true},
+		{name: "settled exceeds observed", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: time.Minute, SettledDuration: time.Minute + time.Nanosecond}, wantErr: true},
+		{name: "trial exceeds observed", aggregate: HourlyAggregate{HourStartedAt: hour, ObservedDuration: time.Minute, TrialDuration: time.Minute + time.Nanosecond}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateHourlyAggregate(test.aggregate)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("aggregate %+v error = %v, want error: %t", test.aggregate, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestHourlyCursorUsesExactDurationClosure(t *testing.T) {
+	store := openTestStore(t)
+	hour := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cursor := hour.Add(3527*time.Second + 352860000*time.Nanosecond)
+	end := hour.Add(time.Hour)
+	observed := cursor.Sub(hour)
+	if _, created, err := store.BootstrapMiner(testInfo(), testIP, cursor, time.Minute, 5*time.Minute, true); err != nil || !created {
+		t.Fatalf("bootstrap = created:%t err:%v", created, err)
+	}
+	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO optimizer_hourly (
+		mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
+		actual_hash_seconds, trial_actual_hash_seconds,
+		incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
+	) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)`,
+		testMAC, hour.Unix(), observed.Nanoseconds()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompareAndSetHourly(testMAC, cursor, end, []HourlyAggregate{
+		{MacAddr: testMAC, HourStartedAt: hour, UnknownGapDuration: end.Sub(cursor)},
+	}, end); err != nil {
+		t.Fatalf("rounded hour closure: %v", err)
+	}
+	state, err := store.LoadMiner(testMAC)
+	if err != nil || !state.AccountedThroughAt.Equal(end) {
+		t.Fatalf("cursor after rounded closure = %v, %v", state.AccountedThroughAt, err)
+	}
+	rows, err := store.ListHourly(testMAC, hour, end.Add(time.Hour))
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("exact closure rows = %+v, %v", rows, err)
+	}
+	if rows[0].ObservedDuration != observed || rows[0].UnknownGapDuration != end.Sub(cursor) ||
+		rows[0].ObservedDuration+rows[0].UnknownGapDuration != time.Hour {
+		t.Fatalf("exact closure durations = %+v", rows[0])
 	}
 }
 
@@ -907,14 +984,14 @@ func TestHourlyRetentionKeepsBucketWhoseEndIsAfterBoundary(t *testing.T) {
 	_, now := bootstrapTestMiner(t, store)
 	boundaryHour := now.Add(-LongTermRetentionHours * time.Hour)
 	if _, err := store.conn.ExecContext(context.Background(), `INSERT INTO optimizer_hourly (
-		mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+		mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
 		actual_hash_seconds, trial_actual_hash_seconds,
-		incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
-	) VALUES (?, ?, 3600, 0, 360000, 0, 0, 0, 0)`, testMAC, boundaryHour.Unix()); err != nil {
+		incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
+	) VALUES (?, ?, ?, 0, 360000, 0, 0, 0, 0)`, testMAC, boundaryHour.Unix(), time.Hour.Nanoseconds()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CompareAndSetHourly(testMAC, now, now.Add(time.Hour), []HourlyAggregate{
-		{MacAddr: testMAC, HourStartedAt: now, UnknownGapSeconds: 3600},
+		{MacAddr: testMAC, HourStartedAt: now, UnknownGapDuration: time.Hour},
 	}, now); err != nil {
 		t.Fatal(err)
 	}

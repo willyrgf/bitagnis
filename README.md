@@ -103,16 +103,18 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 5, with typed pending mutations, finite frontier
+The current schema is version 6, with typed pending mutations, finite frontier
 state, hourly accounting, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema versions 3
-and 4,
-an old partial database, or an unknown application object is rejected without
-modification; move it aside or remove it to create the current baseline.
+`overheat_pending` field, migration, or compatibility reader. Schema versions
+3, 4, and 5, an old partial database, or an unknown application object
+is rejected without modification; move it aside or remove it to create the current baseline.
 Evaluated history, cooldown, pending mutation ages, emergency episode ages,
 mutation attempts, and the bounded 384-hour hourly accounting history persist
 across ordinary restarts after that baseline is created.
+
+Hourly wall-clock coverage is stored as integer nanoseconds, so merged bucket bounds and
+accounting-cursor coverage are exact. Hash-work totals remain floating-point measurements.
 
 An optimized operator retune atomically preserves the prior selected point's
 complete frequency/voltage pair, conservative median hash, and settled

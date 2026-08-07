@@ -844,9 +844,9 @@ control-uplift acceptance result.
 Temperature therefore has three roles only: hard feasibility, exploration headroom, and a tie-break
 inside the measurement-equivalent band. The controller never tries to heat the ASIC up to 65°C.
 
-### Exact Schema-Version-5 Contract
+### Exact Schema-Version-6 Contract
 
-Schema version 5 replaces versions 3 and 4. Opening any other nonzero version fails with an explicit
+Schema version 6 replaces versions 3, 4, and 5. Opening any other nonzero version fails with an explicit
 incompatible-schema error; there is no migration, dual reader, or silent reinterpretation.
 
 `optimizer_miners` keeps the current canonical fields and adds:
@@ -983,20 +983,21 @@ For reporting, add `optimizer_hourly` with this exact application-owned shape:
 CREATE TABLE optimizer_hourly (
     mac_addr TEXT NOT NULL,
     hour_started_at INTEGER NOT NULL,
-    observed_seconds REAL NOT NULL,
-    unknown_gap_seconds REAL NOT NULL,
+    observed_duration_nanos INTEGER NOT NULL,
+    unknown_gap_duration_nanos INTEGER NOT NULL,
     actual_hash_seconds REAL NOT NULL,
     trial_actual_hash_seconds REAL NOT NULL,
     incumbent_counterfactual_hash_seconds REAL NOT NULL,
-    settled_seconds REAL NOT NULL,
-    trial_seconds REAL NOT NULL,
+    settled_duration_nanos INTEGER NOT NULL,
+    trial_duration_nanos INTEGER NOT NULL,
     PRIMARY KEY (mac_addr, hour_started_at)
 );
 ```
 
-`hour_started_at` must be a positive UTC Unix-second value aligned to an hour. Every REAL must be
-finite and nonnegative, with the cross-field bounds below. This table has no optimizer-authority
-fields. Retain 384 UTC hours so two 168-hour crossover arms plus transition fit.
+`hour_started_at` must be a positive UTC Unix-second value aligned to an hour. Duration columns are
+nonnegative integer nanoseconds and hash-work columns are finite, nonnegative REAL values. This
+table has no optimizer-authority fields. Retain 384 UTC hours so two 168-hour crossover arms plus
+transition fit.
 `optimizer_miners.accounted_through_at` is advanced atomically with all affected hourly fragments;
 it prevents additive replay after an ambiguous commit or reopen. These fields are credential-free
 reporting state and never authorize a candidate or rollback; raw telemetry remains in memory.
@@ -1321,26 +1322,27 @@ ambiguous store error, discard the in-memory predecessor and reload the cursor b
 again; a committed cursor suppresses replay, while an unchanged cursor makes the elapsed interval
 unknown rather than double-counting actual work.
 
-`trial_seconds` means candidate-live time: a trial phase with `current != fallback`. Entry preflight
+`trial_duration_nanos` means candidate-live time: a trial phase with `current != fallback`. Entry preflight
 while the incumbent remains active is not trial time. `trial_actual_hash_seconds` and
 `incumbent_counterfactual_hash_seconds` cover those same observed seconds, using the candidate row's
-frozen `reference_hash`. `settled_seconds` requires `verifiedSettled`; manual or blocked `HOLD` never
+frozen `reference_hash`. `settled_duration_nanos` requires `verifiedSettled`; manual or blocked `HOLD` never
 counts. Restart intervals classify availability exposure through mutation history and are not
 subtracted again from actual work.
 
-Every bucket validates finite, nonnegative values and:
+Every bucket validates exact, nonnegative duration values and finite, nonnegative hash-work values,
+with the cross-field bounds below:
 
 ```text
-observed_seconds + unknown_gap_seconds <= 3600
-settled_seconds <= observed_seconds
-trial_seconds <= observed_seconds
+observed_duration_nanos + unknown_gap_duration_nanos <= 3,600,000,000,000
+settled_duration_nanos <= observed_duration_nanos
+trial_duration_nanos <= observed_duration_nanos
 trial_actual_hash_seconds <= actual_hash_seconds
 ```
 
 Report starts are arbitrary UTC timestamps because an accepted retune records the actual
 `pass_started_at`. When a report boundary falls inside an hourly bucket, the overlapping boundary
 portion is conservatively unknown: the evaluator never invents sub-hour state history from an
-aggregate row. Report mode opens the schema-v5 database read-only and rejects missing or
+aggregate row. Report mode opens the schema-v6 database read-only and rejects missing or
 incompatible durable evidence.
 
 The first/second positive timestamps bound restart loss, while hourly actual work is the treatment
@@ -1458,7 +1460,7 @@ chosen point with the 168-hour settled-control result. Changing the band or wind
 evidence is a new explicit policy revision, not a time-based retry.
 
 No architecture, ownership, recovery-action, retune-contract, pass-cap, or schema-boundary
-uncertainty remains for implementation. The schema-v5 snapshot is the canonical durable source for a
+uncertainty remains for implementation. The schema-v6 snapshot is the canonical durable source for a
 historical control boundary, and the report reader consumes it without inferring an unavailable
 boundary from current state.
 
@@ -1470,7 +1472,7 @@ The implementation must replace the current design completely:
 - retain the three current trial-purpose phases but replace candidate chaining with isolated
   admission, reserved return, and two-window promotion;
 - make `HOLD` terminal and make safety cooldown recovery lead to `HOLD`;
-- add the exact schema-v5 fields, enums, unique indexes, and atomic store operations above;
+- add the exact schema-v6 fields, enums, unique indexes, and atomic store operations above;
 - add configured post-PATCH readback and exhaustive same-attempt reconciliation;
 - stop `StartMutationAttempt` from auto-closing older work and stop completion failures from being
   marked terminal;
@@ -1505,10 +1507,10 @@ a miner.
 1. `replace timed retries with finite frontier settlement`: complete the inseparable schema,
    persistence, optimizer, mutation reconciliation, CLI, hourly accounting population, tests,
    README, and RFC cutover; delete the old retry path and reject schema v3.
-2. `persist crossover boundary evidence in schema v5`: add the complete pass-reference snapshot,
+2. `persist crossover boundary evidence in schema v6`: add the complete pass-reference snapshot,
    exact schema rejection, reset capture, and reopen validation.
 3. `report long-term optimizer economics`: add terminal rendering and multi-day queries over the
-   already-populated schema-v5 aggregates, consume historical boundary snapshots, and add their
+   already-populated schema-v6 aggregates, consume historical boundary snapshots, and add their
    query, formatting, and historical-AB/BA regression tests.
 
 ## Conclusion

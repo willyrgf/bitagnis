@@ -373,14 +373,14 @@ func TestHourlyFragmentsSplitUTCAndClassifyTrials(t *testing.T) {
 	start := time.Date(2026, 8, 1, 11, 30, 0, 0, time.UTC)
 	end := time.Date(2026, 8, 1, 13, 15, 0, 0, time.UTC)
 	fragments := hourlyFragments(rootTestMAC, start, end, sample, true)
-	if len(fragments) != 3 || fragments[0].ObservedSeconds != 1800 || fragments[1].ObservedSeconds != 3600 || fragments[2].ObservedSeconds != 900 {
+	if len(fragments) != 3 || fragments[0].ObservedDuration != 30*time.Minute || fragments[1].ObservedDuration != time.Hour || fragments[2].ObservedDuration != 15*time.Minute {
 		t.Fatalf("hourly split = %+v", fragments)
 	}
-	if fragments[0].TrialSeconds != 1800 || fragments[0].IncumbentCounterfactualHashSeconds != 180000 {
+	if fragments[0].TrialDuration != 30*time.Minute || fragments[0].IncumbentCounterfactualHashSeconds != 180000 {
 		t.Fatalf("trial classification = %+v", fragments[0])
 	}
 	unknown := hourlyFragments(rootTestMAC, start, end, sample, false)
-	if unknown[0].UnknownGapSeconds != 1800 || unknown[0].ActualHashSeconds != 0 {
+	if unknown[0].UnknownGapDuration != 30*time.Minute || unknown[0].ActualHashSeconds != 0 {
 		t.Fatalf("unknown classification = %+v", unknown[0])
 	}
 }

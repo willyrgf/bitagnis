@@ -13,8 +13,8 @@ func TestSummarizeReportMinerUsesFullWallDurationAndMergesExposure(t *testing.T)
 		Hostname:              "treatment",
 		PreArmSettledHashRate: 100,
 		Hourly: []HourlyAggregate{
-			{MacAddr: testMAC, HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000},
-			{MacAddr: testMAC, HourStartedAt: from.Add(time.Hour), UnknownGapSeconds: 3600},
+			{MacAddr: testMAC, HourStartedAt: from, ObservedDuration: time.Hour, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: from.Add(time.Hour), UnknownGapDuration: time.Hour},
 		},
 		MutationAttempts: []MutationAttempt{
 			{ID: 1, MacAddr: testMAC, Kind: MutationOperatingPoint, IntentCreatedAt: from, StartedAt: from, RestartRequestedAt: from.Add(30 * time.Minute), MiningResumedAt: from.Add(90 * time.Minute)},
@@ -118,11 +118,11 @@ func TestEvaluateArmAndCrossover(t *testing.T) {
 	makeHourly := func(mac string, hash float64, start time.Time) []HourlyAggregate {
 		rows := make([]HourlyAggregate, 0, 168)
 		for index := 0; index < 168; index++ {
-			settled := 0.0
+			var settled time.Duration
 			if index >= 24 {
-				settled = 3600
+				settled = time.Hour
 			}
-			rows = append(rows, HourlyAggregate{MacAddr: mac, HourStartedAt: start.Add(time.Duration(index) * time.Hour), ObservedSeconds: 3600, ActualHashSeconds: hash * 3600, SettledSeconds: settled})
+			rows = append(rows, HourlyAggregate{MacAddr: mac, HourStartedAt: start.Add(time.Duration(index) * time.Hour), ObservedDuration: time.Hour, ActualHashSeconds: hash * 3600, SettledDuration: settled})
 		}
 		return rows
 	}
@@ -168,8 +168,8 @@ func TestEvaluateArmAndCrossover(t *testing.T) {
 
 func TestEvaluateArmRejectsLowCoverage(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	rows := []HourlyAggregate{{MacAddr: testMAC, HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000}}
-	controlRows := []HourlyAggregate{{MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from, ObservedSeconds: 3600, ActualHashSeconds: 360000}}
+	rows := []HourlyAggregate{{MacAddr: testMAC, HourStartedAt: from, ObservedDuration: time.Hour, ActualHashSeconds: 360000}}
+	controlRows := []HourlyAggregate{{MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from, ObservedDuration: time.Hour, ActualHashSeconds: 360000}}
 	result, err := EvaluateArm(ReportArmInput{
 		Start:     from,
 		Treatment: ReportMinerInput{MacAddr: testMAC, Hostname: "a", PreArmSettledHashRate: 100, PassStartedAt: from, PassReferenceHash: 100, BoundaryPoint: OperatingPoint{Frequency: 525, CoreVoltage: 1150}, BoundarySettledAt: from.Add(-time.Hour), SettledAt: from.Add(24 * time.Hour), PointStable: true, NormalRestartBaselineObserved: true, Hourly: rows},
@@ -202,9 +202,9 @@ func TestSummarizeReportMinerTreatsPartialBoundaryHoursAsUnknown(t *testing.T) {
 		MacAddr:               testMAC,
 		PreArmSettledHashRate: 100,
 		Hourly: []HourlyAggregate{
-			{MacAddr: testMAC, HourStartedAt: start.Add(-30 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
-			{MacAddr: testMAC, HourStartedAt: start.Add(30 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
-			{MacAddr: testMAC, HourStartedAt: start.Add(90 * time.Minute), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(-30 * time.Minute), ObservedDuration: time.Hour, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(30 * time.Minute), ObservedDuration: time.Hour, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(90 * time.Minute), ObservedDuration: time.Hour, ActualHashSeconds: 360000},
 		},
 	}, window)
 	if err != nil {
@@ -221,8 +221,8 @@ func TestSummarizeReportMinerTreatsMissingHourlyBucketsAsUnknown(t *testing.T) {
 		MacAddr:               testMAC,
 		PreArmSettledHashRate: 100,
 		Hourly: []HourlyAggregate{
-			{MacAddr: testMAC, HourStartedAt: start, ObservedSeconds: 3600, ActualHashSeconds: 360000},
-			{MacAddr: testMAC, HourStartedAt: start.Add(2 * time.Hour), ObservedSeconds: 3600, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start, ObservedDuration: time.Hour, ActualHashSeconds: 360000},
+			{MacAddr: testMAC, HourStartedAt: start.Add(2 * time.Hour), ObservedDuration: time.Hour, ActualHashSeconds: 360000},
 		},
 	}, ReportWindow{Start: start, End: start.Add(3 * time.Hour)})
 	if err != nil {
@@ -239,14 +239,14 @@ func TestEvaluateArmSeparatesCoverageValidityFromAcceptance(t *testing.T) {
 	for index := 0; index < 168; index++ {
 		rows = append(rows, HourlyAggregate{
 			MacAddr: testMAC, HourStartedAt: from.Add(time.Duration(index) * time.Hour),
-			ObservedSeconds: 3600, ActualHashSeconds: 360000, SettledSeconds: 3600,
+			ObservedDuration: time.Hour, ActualHashSeconds: 360000, SettledDuration: time.Hour,
 		})
 	}
 	controlRows := make([]HourlyAggregate, 0, 168)
 	for index := 0; index < 168; index++ {
 		controlRows = append(controlRows, HourlyAggregate{
 			MacAddr: "aa:bb:cc:dd:ee:03", HourStartedAt: from.Add(time.Duration(index) * time.Hour),
-			ObservedSeconds: 3600, ActualHashSeconds: 360000,
+			ObservedDuration: time.Hour, ActualHashSeconds: 360000,
 		})
 	}
 	input := ReportArmInput{

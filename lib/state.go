@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -16,7 +15,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 5
+const optimizerSchemaVersion = 6
 
 // LongTermRetentionHours bounds the credential-free hourly accounting history.
 const LongTermRetentionHours = 384
@@ -316,7 +315,7 @@ func OpenOptimizerStore(path string) (*OptimizerStore, error) {
 	return openOptimizerStore(path, false)
 }
 
-// OpenOptimizerStoreReadOnly opens an existing schema-v5 database without
+// OpenOptimizerStoreReadOnly opens an existing schema-v6 database without
 // creating, migrating, locking, or otherwise mutating it. Report mode uses
 // this path so a missing or incompatible database fails rather than changing
 // durable state.
@@ -2667,17 +2666,45 @@ func (store *OptimizerStore) ListMutationAttempts(
 }
 
 // HourlyAggregate is the credential-free, bounded reporting row persisted for
-// one UTC hour. It contains no optimizer authority and no raw telemetry.
+// one UTC hour. Duration fields are exact nanoseconds in time.Duration values;
+// hash-work fields remain floating-point H/s·s measurements.
 type HourlyAggregate struct {
 	MacAddr                            string
 	HourStartedAt                      time.Time
-	ObservedSeconds                    float64
-	UnknownGapSeconds                  float64
+	ObservedDuration                   time.Duration
+	UnknownGapDuration                 time.Duration
 	ActualHashSeconds                  float64
 	TrialActualHashSeconds             float64
 	IncumbentCounterfactualHashSeconds float64
-	SettledSeconds                     float64
-	TrialSeconds                       float64
+	SettledDuration                    time.Duration
+	TrialDuration                      time.Duration
+}
+
+type hourlyAggregateScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanHourlyAggregate(scanner hourlyAggregateScanner) (HourlyAggregate, error) {
+	var aggregate HourlyAggregate
+	var hour int64
+	var observedNanos int64
+	var unknownGapNanos int64
+	var settledNanos int64
+	var trialNanos int64
+	if err := scanner.Scan(
+		&aggregate.MacAddr, &hour, &observedNanos, &unknownGapNanos,
+		&aggregate.ActualHashSeconds, &aggregate.TrialActualHashSeconds,
+		&aggregate.IncumbentCounterfactualHashSeconds, &settledNanos,
+		&trialNanos,
+	); err != nil {
+		return HourlyAggregate{}, err
+	}
+	aggregate.HourStartedAt = time.Unix(hour, 0).UTC()
+	aggregate.ObservedDuration = time.Duration(observedNanos)
+	aggregate.UnknownGapDuration = time.Duration(unknownGapNanos)
+	aggregate.SettledDuration = time.Duration(settledNanos)
+	aggregate.TrialDuration = time.Duration(trialNanos)
+	return aggregate, nil
 }
 
 // CompareAndSetHourly applies additive hourly fragments and advances the
@@ -2740,45 +2767,37 @@ func (store *OptimizerStore) CompareAndSetHourly(
 	for _, fragment := range fragments {
 		hour := fragment.HourStartedAt.UTC()
 		_, err := tx.ExecContext(context.Background(), `INSERT INTO optimizer_hourly (
-			mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+			mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
 			actual_hash_seconds, trial_actual_hash_seconds,
-			incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
+			incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(mac_addr, hour_started_at) DO UPDATE SET
-			observed_seconds = observed_seconds + excluded.observed_seconds,
-			unknown_gap_seconds = unknown_gap_seconds + excluded.unknown_gap_seconds,
+			observed_duration_nanos = observed_duration_nanos + excluded.observed_duration_nanos,
+			unknown_gap_duration_nanos = unknown_gap_duration_nanos + excluded.unknown_gap_duration_nanos,
 			actual_hash_seconds = actual_hash_seconds + excluded.actual_hash_seconds,
 			trial_actual_hash_seconds = trial_actual_hash_seconds + excluded.trial_actual_hash_seconds,
 			incumbent_counterfactual_hash_seconds = incumbent_counterfactual_hash_seconds + excluded.incumbent_counterfactual_hash_seconds,
-			settled_seconds = settled_seconds + excluded.settled_seconds,
-			trial_seconds = trial_seconds + excluded.trial_seconds`,
-			macAddr, hour.Unix(), fragment.ObservedSeconds, fragment.UnknownGapSeconds,
+			settled_duration_nanos = settled_duration_nanos + excluded.settled_duration_nanos,
+			trial_duration_nanos = trial_duration_nanos + excluded.trial_duration_nanos`,
+			macAddr, hour.Unix(), fragment.ObservedDuration.Nanoseconds(), fragment.UnknownGapDuration.Nanoseconds(),
 			fragment.ActualHashSeconds, fragment.TrialActualHashSeconds,
-			fragment.IncumbentCounterfactualHashSeconds, fragment.SettledSeconds,
-			fragment.TrialSeconds,
+			fragment.IncumbentCounterfactualHashSeconds, fragment.SettledDuration.Nanoseconds(),
+			fragment.TrialDuration.Nanoseconds(),
 		)
 		if err != nil {
 			return fmt.Errorf("account hourly: save %s: %w", hour, err)
 		}
 	}
 	for _, fragment := range fragments {
-		var aggregate HourlyAggregate
-		var hour int64
-		if err := tx.QueryRowContext(context.Background(), `SELECT
-			mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+		aggregate, err := scanHourlyAggregate(tx.QueryRowContext(context.Background(), `SELECT
+			mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
 			actual_hash_seconds, trial_actual_hash_seconds,
-			incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
+			incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
 			FROM optimizer_hourly WHERE mac_addr = ? AND hour_started_at = ?`,
-			macAddr, fragment.HourStartedAt.UTC().Unix()).Scan(
-			&aggregate.MacAddr, &hour, &aggregate.ObservedSeconds,
-			&aggregate.UnknownGapSeconds, &aggregate.ActualHashSeconds,
-			&aggregate.TrialActualHashSeconds,
-			&aggregate.IncumbentCounterfactualHashSeconds,
-			&aggregate.SettledSeconds, &aggregate.TrialSeconds,
-		); err != nil {
+			macAddr, fragment.HourStartedAt.UTC().Unix()))
+		if err != nil {
 			return fmt.Errorf("account hourly: validate merged row: %w", err)
 		}
-		aggregate.HourStartedAt = time.Unix(hour, 0).UTC()
 		if err := validateHourlyAggregate(aggregate); err != nil {
 			return fmt.Errorf("account hourly: validate merged row: %w", err)
 		}
@@ -2816,9 +2835,9 @@ func (store *OptimizerStore) ListHourly(macAddr string, from, to time.Time) ([]H
 		return nil, err
 	}
 	rows, err := store.conn.QueryContext(context.Background(), `SELECT
-		mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+		mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
 		actual_hash_seconds, trial_actual_hash_seconds,
-		incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
+		incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
 		FROM optimizer_hourly WHERE mac_addr = ? AND hour_started_at >= ?
 		AND hour_started_at < ? ORDER BY hour_started_at`,
 		macAddr, from.UTC().Truncate(time.Hour).Unix(), to.UTC().Unix())
@@ -2828,16 +2847,10 @@ func (store *OptimizerStore) ListHourly(macAddr string, from, to time.Time) ([]H
 	defer rows.Close()
 	var aggregates []HourlyAggregate
 	for rows.Next() {
-		var aggregate HourlyAggregate
-		var hour int64
-		if err := rows.Scan(&aggregate.MacAddr, &hour, &aggregate.ObservedSeconds,
-			&aggregate.UnknownGapSeconds, &aggregate.ActualHashSeconds,
-			&aggregate.TrialActualHashSeconds,
-			&aggregate.IncumbentCounterfactualHashSeconds,
-			&aggregate.SettledSeconds, &aggregate.TrialSeconds); err != nil {
+		aggregate, err := scanHourlyAggregate(rows)
+		if err != nil {
 			return nil, fmt.Errorf("list hourly aggregates: %w", err)
 		}
-		aggregate.HourStartedAt = time.Unix(hour, 0).UTC()
 		if err := validateHourlyAggregate(aggregate); err != nil {
 			return nil, fmt.Errorf("list hourly aggregates: %w", err)
 		}
@@ -2855,22 +2868,22 @@ func validateHourlyAggregate(aggregate HourlyAggregate) error {
 		return fmt.Errorf("hour is not a positive UTC hour")
 	}
 	values := []float64{
-		aggregate.ObservedSeconds,
-		aggregate.UnknownGapSeconds,
 		aggregate.ActualHashSeconds,
 		aggregate.TrialActualHashSeconds,
 		aggregate.IncumbentCounterfactualHashSeconds,
-		aggregate.SettledSeconds,
-		aggregate.TrialSeconds,
 	}
 	for _, value := range values {
 		if !finite(value) || value < 0 {
 			return fmt.Errorf("hour contains invalid aggregate")
 		}
 	}
-	if aggregate.ObservedSeconds+aggregate.UnknownGapSeconds > 3600 ||
-		aggregate.SettledSeconds > aggregate.ObservedSeconds ||
-		aggregate.TrialSeconds > aggregate.ObservedSeconds ||
+	if aggregate.ObservedDuration < 0 || aggregate.ObservedDuration > time.Hour ||
+		aggregate.UnknownGapDuration < 0 || aggregate.UnknownGapDuration > time.Hour ||
+		aggregate.SettledDuration < 0 || aggregate.SettledDuration > time.Hour ||
+		aggregate.TrialDuration < 0 || aggregate.TrialDuration > time.Hour ||
+		aggregate.ObservedDuration > time.Hour-aggregate.UnknownGapDuration ||
+		aggregate.SettledDuration > aggregate.ObservedDuration ||
+		aggregate.TrialDuration > aggregate.ObservedDuration ||
 		aggregate.TrialActualHashSeconds > aggregate.ActualHashSeconds {
 		return fmt.Errorf("hour aggregate violates bounds")
 	}
@@ -2894,10 +2907,10 @@ func validateHourlyCoverage(start, end time.Time, fragments []HourlyAggregate) e
 		if segmentEnd.After(end.UTC()) {
 			segmentEnd = end.UTC()
 		}
-		expectedSeconds := segmentEnd.Sub(cursor).Seconds()
-		coveredSeconds := fragment.ObservedSeconds + fragment.UnknownGapSeconds
-		if math.Abs(coveredSeconds-expectedSeconds) > 1e-9 {
-			return fmt.Errorf("hourly fragment at %s covers %.9f seconds, expected %.9f", hour, coveredSeconds, expectedSeconds)
+		expectedDuration := segmentEnd.Sub(cursor)
+		coveredDuration := fragment.ObservedDuration + fragment.UnknownGapDuration
+		if coveredDuration != expectedDuration {
+			return fmt.Errorf("hourly fragment at %s covers %.9f seconds, expected %.9f", hour, coveredDuration.Seconds(), expectedDuration.Seconds())
 		}
 		cursor = segmentEnd
 	}
@@ -3421,13 +3434,13 @@ var optimizerSchema = map[string][]schemaColumn{
 	"optimizer_hourly": {
 		{name: "mac_addr", sqlType: "TEXT", notNull: 1, pk: 1},
 		{name: "hour_started_at", sqlType: "INTEGER", notNull: 1, pk: 2},
-		{name: "observed_seconds", sqlType: "REAL", notNull: 1},
-		{name: "unknown_gap_seconds", sqlType: "REAL", notNull: 1},
+		{name: "observed_duration_nanos", sqlType: "INTEGER", notNull: 1},
+		{name: "unknown_gap_duration_nanos", sqlType: "INTEGER", notNull: 1},
 		{name: "actual_hash_seconds", sqlType: "REAL", notNull: 1},
 		{name: "trial_actual_hash_seconds", sqlType: "REAL", notNull: 1},
 		{name: "incumbent_counterfactual_hash_seconds", sqlType: "REAL", notNull: 1},
-		{name: "settled_seconds", sqlType: "REAL", notNull: 1},
-		{name: "trial_seconds", sqlType: "REAL", notNull: 1},
+		{name: "settled_duration_nanos", sqlType: "INTEGER", notNull: 1},
+		{name: "trial_duration_nanos", sqlType: "INTEGER", notNull: 1},
 	},
 }
 
@@ -3523,16 +3536,16 @@ CREATE UNIQUE INDEX operating_points_one_entry_attempt
 CREATE TABLE optimizer_hourly (
 	mac_addr TEXT NOT NULL,
 	hour_started_at INTEGER NOT NULL,
-	observed_seconds REAL NOT NULL,
-	unknown_gap_seconds REAL NOT NULL,
+	observed_duration_nanos INTEGER NOT NULL,
+	unknown_gap_duration_nanos INTEGER NOT NULL,
 	actual_hash_seconds REAL NOT NULL,
 	trial_actual_hash_seconds REAL NOT NULL,
 	incumbent_counterfactual_hash_seconds REAL NOT NULL,
-	settled_seconds REAL NOT NULL,
-	trial_seconds REAL NOT NULL,
+	settled_duration_nanos INTEGER NOT NULL,
+	trial_duration_nanos INTEGER NOT NULL,
 	PRIMARY KEY (mac_addr, hour_started_at)
 );
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -3818,25 +3831,19 @@ func validateStoredOptimizerData(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	rows, err = conn.QueryContext(ctx, `SELECT
-		mac_addr, hour_started_at, observed_seconds, unknown_gap_seconds,
+		mac_addr, hour_started_at, observed_duration_nanos, unknown_gap_duration_nanos,
 		actual_hash_seconds, trial_actual_hash_seconds,
-		incumbent_counterfactual_hash_seconds, settled_seconds, trial_seconds
+		incumbent_counterfactual_hash_seconds, settled_duration_nanos, trial_duration_nanos
 		FROM optimizer_hourly ORDER BY mac_addr, hour_started_at`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var aggregate HourlyAggregate
-		var hour int64
-		if err := rows.Scan(&aggregate.MacAddr, &hour, &aggregate.ObservedSeconds,
-			&aggregate.UnknownGapSeconds, &aggregate.ActualHashSeconds,
-			&aggregate.TrialActualHashSeconds,
-			&aggregate.IncumbentCounterfactualHashSeconds,
-			&aggregate.SettledSeconds, &aggregate.TrialSeconds); err != nil {
+		aggregate, err := scanHourlyAggregate(rows)
+		if err != nil {
 			_ = rows.Close()
 			return err
 		}
-		aggregate.HourStartedAt = time.Unix(hour, 0).UTC()
 		if _, ok := states[aggregate.MacAddr]; !ok {
 			_ = rows.Close()
 			return fmt.Errorf("hourly row belongs to unknown miner %s", aggregate.MacAddr)

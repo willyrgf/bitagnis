@@ -166,6 +166,13 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 	)
 	result.Frontier24Valid = result.Frontier24Audited &&
 		result.DuplicateEnteredTargets == 0 && result.TimeCreatedEligibility == 0
+	var observedDuration time.Duration
+	var unknownGapDuration time.Duration
+	var settledDuration time.Duration
+	var trialDuration time.Duration
+	var actualHashSeconds float64
+	var trialActualHashSeconds float64
+	var incumbentCounterfactualHashSeconds float64
 	hourlyByStart := make(map[int64]HourlyAggregate, len(input.Hourly))
 	expectedMAC := ""
 	for _, aggregate := range input.Hourly {
@@ -219,24 +226,31 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 		}
 		aggregate, found := hourlyByStart[cursor.Unix()]
 		if !found || !segmentStart.Equal(cursor) || !segmentEnd.Equal(hourEnd) {
-			result.UnknownGapSeconds += segmentEnd.Sub(segmentStart).Seconds()
+			unknownGapDuration += segmentEnd.Sub(segmentStart)
 			continue
 		}
-		result.ObservedSeconds += aggregate.ObservedSeconds
-		result.UnknownGapSeconds += aggregate.UnknownGapSeconds
-		result.ActualHashSeconds += aggregate.ActualHashSeconds
-		result.TrialActualHashSeconds += aggregate.TrialActualHashSeconds
-		result.IncumbentCounterfactualHashSeconds += aggregate.IncumbentCounterfactualHashSeconds
-		result.SettledSeconds += aggregate.SettledSeconds
-		result.TrialSeconds += aggregate.TrialSeconds
+		observedDuration += aggregate.ObservedDuration
+		unknownGapDuration += aggregate.UnknownGapDuration
+		actualHashSeconds += aggregate.ActualHashSeconds
+		trialActualHashSeconds += aggregate.TrialActualHashSeconds
+		incumbentCounterfactualHashSeconds += aggregate.IncumbentCounterfactualHashSeconds
+		settledDuration += aggregate.SettledDuration
+		trialDuration += aggregate.TrialDuration
 	}
-	duration := window.End.Sub(window.Start).Seconds()
-	if result.ObservedSeconds+result.UnknownGapSeconds > duration+1e-9 ||
-		result.SettledSeconds > result.ObservedSeconds+1e-9 ||
-		result.TrialSeconds > result.ObservedSeconds+1e-9 ||
-		result.TrialActualHashSeconds > result.ActualHashSeconds+1e-9 {
+	duration := window.End.Sub(window.Start)
+	if observedDuration > duration || unknownGapDuration > duration ||
+		observedDuration > duration-unknownGapDuration ||
+		settledDuration > observedDuration || trialDuration > observedDuration ||
+		trialActualHashSeconds > actualHashSeconds+1e-9 {
 		return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly totals violate bounds")
 	}
+	result.ObservedSeconds = observedDuration.Seconds()
+	result.UnknownGapSeconds = unknownGapDuration.Seconds()
+	result.ActualHashSeconds = actualHashSeconds
+	result.TrialActualHashSeconds = trialActualHashSeconds
+	result.IncumbentCounterfactualHashSeconds = incumbentCounterfactualHashSeconds
+	result.SettledSeconds = settledDuration.Seconds()
+	result.TrialSeconds = trialDuration.Seconds()
 	for _, value := range []float64{
 		result.ObservedSeconds, result.UnknownGapSeconds, result.ActualHashSeconds,
 		result.TrialActualHashSeconds, result.IncumbentCounterfactualHashSeconds,
@@ -246,10 +260,11 @@ func SummarizeReportMiner(input ReportMinerInput, window ReportWindow) (ReportMi
 			return ReportMinerMetrics{}, fmt.Errorf("summarize report miner: hourly totals are non-finite")
 		}
 	}
-	result.Coverage = result.ObservedSeconds / duration
+	durationSeconds := duration.Seconds()
+	result.Coverage = result.ObservedSeconds / durationSeconds
 	if result.PreArmSettledHashRate > 0 {
 		result.NormalizedWork = result.ActualHashSeconds /
-			(result.PreArmSettledHashRate * duration)
+			(result.PreArmSettledHashRate * durationSeconds)
 	}
 	restart, err := SummarizeRestartExposure(input.MutationAttempts, window)
 	if err != nil {
