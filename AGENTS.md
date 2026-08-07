@@ -1,32 +1,86 @@
 # Bitagnis Development Guide for AI Agents
 
 This document is the source of truth for AI-agent behavior and contribution rules in this
-repository. `README.md` describes the current controller behavior and operator contract. The source
-and tests are the executable description of the current system.
+repository. It opens with design and engineering principles that apply to any change here, then
+states the bitagnis-specific facts and constraints those principles must respect. `README.md`
+describes the current controller behavior and operator contract; the source and tests are the
+executable description of the current system.
 
-## Non-Negotiables
+## Design and Engineering Principles
 
-- Never weaken ASIC-temperature, voltage-regulator-temperature, power, or overheat protections to
-  make optimization faster or tests easier.
-- Treat every AxeOS mutation as hardware-affecting and high risk. Validate it before any request,
-  preserve enough durable state to recover, and test failure paths.
-- Always change ASIC frequency and core voltage as one complete `OperatingPoint`; never tune or
-  apply either field independently.
-- Never log, print, commit, or persist secrets such as Stratum passwords. Keep real credentials out
-  of YAML, tests, fixtures, errors, terminal output, and SQLite.
-- Preserve package boundaries and keep `lib` usable without the executable.
-- Add dependencies only with strong justification. Prefer the standard library and the existing
-  dependency set.
-- Verification is scope-driven. Run the narrowest command that exercises the changed behavior, then
-  expand when the affected boundary or risk requires it.
-- Divide non-trivial work into ordered logical commits. Each commit must leave one coherent current
-  design; keep inseparable cutovers together instead of staging compatibility paths.
-- Do not create commits unless the user asks.
-- Write commit subjects in lower case, for example
-  `preserve thermal history across overheat recovery`.
-- Preserve unrelated user changes and never commit local runtime state.
+### One Current Design and Complete Cutovers
 
-## When Architecture Is Unclear
+Optimize the repository as a whole for fewer concepts, code paths, public types and schemas,
+duplicated responsibilities, places a future change must touch, and LOC. Each responsibility must
+have one clear owner, one canonical representation, and one implementation path.
+
+Reuse code when behavior and ownership are genuinely shared. Prefer extending the existing owner or
+extracting a small shared helper over copying logic, adding a second service, or introducing another
+representation. An abstraction must reduce total concepts, duplication, future change sites, or LOC
+after its call sites are considered. Do not add indirection, interfaces, generic frameworks,
+configuration switches, or extension points for hypothetical future reuse. Add a dependency only
+with strong justification; prefer the standard library and the existing dependency set.
+
+Reducing LOC is valuable when it deletes duplication, indirection, obsolete behavior, or unnecessary
+surface area. Do not make code smaller by compressing readable logic, combining unrelated
+responsibilities, or removing validation, safety controls, error context, tests, or necessary
+documentation. Clear direct code is simpler than clever short code.
+
+Prefer the best current design over backward compatibility with an inferior internal design.
+Breaking internal APIs, CLI contracts, schemas, persisted formats, and documented behavior is
+allowed when the replacement is deliberate and complete. When a design changes, complete the cutover
+and delete the superseded implementation, types, entry points, aliases, adapters, feature flags,
+readers and writers, tests, fixtures, and documentation. Do not deprecate old paths, hide them, or
+retain compatibility shims, dual paths, legacy modes, or fallbacks for old behavior — git history is
+the archive. Update every current producer and consumer in the same logical change. For a changed
+persisted contract, deliberately update or reset its baseline and reject incompatible old data
+explicitly; never silently reinterpret old bytes or retain a legacy reader unless an externally
+required migration contract has been approved. A breaking change never relaxes correctness, safety,
+secret handling, or data integrity.
+
+Fix the underlying design or add missing support properly. Do not introduce hacks, monkey patches,
+partial workarounds, fragile schema shims, duplicated wrappers, or parallel implementations. Do not
+split an inseparable cutover merely to make individual commits smaller — keep it together instead of
+staging a compatibility path. If a correct complete solution is not possible, report the blocker
+instead of approximating it.
+
+### Correctness by Construction
+
+Make illegal states unrepresentable. Move correctness obligations out of repeated control flow and
+programmer discipline and into representation and construction. A trusted-core value should carry
+evidence of the facts its consumers rely on, not just the data those facts were derived from.
+
+Use the smallest Go mechanism that expresses the guarantee:
+
+- A struct for facts that must always travel together, so no path can construct or use one without
+  the other.
+- A closed set of typed constants for alternatives, paired with an exhaustiveness check that stays
+  current whenever a variant is added, removed, or renamed, called at every deserialization and
+  durable-state load path — Go cannot make an arbitrary string un-constructible, so that check is
+  the enforcement point.
+- A distinct named type with an unexported field and a fallible constructor when a value carries an
+  invariant beyond its primitive. Every public constructor, `Default`, decode path, and store read
+  must go through that constructor so the invariant cannot be bypassed by a second entry point.
+- Structural proof over a checked wrapper where it is cheap: a head element plus a slice tail proves
+  non-emptiness at compile time; a length check only proves it where that check happens to run.
+- An unexported interface method to close a set of implementations to the package when a switch over
+  alternatives must stay exhaustive, and single-owner discipline when a value must be written by
+  exactly one path.
+
+Parse untrusted YAML, HTTP, CLI, and store data into domain types at the boundary; do not validate a
+primitive and then keep passing the primitive through the core. Fallible construction returns a
+typed, redaction-safe error; methods on the constructed type preserve the invariant; internal APIs
+accept the domain type, never the raw primitive it was built from.
+
+Use a runtime check only for an ambient or changing fact that no single value can prove by
+construction alone. Put each such check at the capability that owns the fact, and return an explicit
+checked outcome that downstream code is required to consume before it may act. Do not add type
+machinery that is more complex than the invalid states, branches, or future change sites it removes.
+
+Test constructor and decode rejection paths and invariant-preserving transformations as part of the
+feature's tests, not as separate follow-up coverage.
+
+### When Architecture Is Unclear
 
 Read `README.md`, the relevant implementation, and its tests before deciding that architecture is
 unclear. If architecture, ownership, or design-contract direction is still unclear, spawn a
@@ -46,48 +100,32 @@ wrong, and how to resolve or validate it. Write `none` when no material uncertai
 pad the section with routine, low-impact choices. Any item involving architecture, ownership, or
 the design contract triggers the architect-agent rule above.
 
-## One Current Design
+### Commits, Verification, and Reporting
 
-Optimize the repository as a whole for fewer concepts, code paths, public types and schemas,
-duplicated responsibilities, places a future change must touch, and LOC. Each responsibility must
-have one clear owner, one canonical representation, and one implementation path.
+Divide non-trivial work into ordered logical commits; each commit must leave one coherent current
+design. Do not create commits unless the user asks. Write commit subjects in lower case, for example
+`preserve thermal history across overheat recovery`. Preserve unrelated user changes and never
+commit local runtime state.
 
-Reuse code when behavior and ownership are genuinely shared. Prefer extending the existing owner or
-extracting a small shared helper over copying logic, adding a second service, or introducing another
-representation. An abstraction must reduce total concepts, duplication, future change sites, or LOC
-after its call sites are considered. Do not add indirection, interfaces, generic frameworks,
-configuration switches, or extension points for hypothetical future reuse.
+Verification is scope-driven: run the narrowest command that exercises the changed behavior, then
+expand when the affected boundary or risk requires it.
 
-Reducing LOC is valuable when it deletes duplication, indirection, obsolete behavior, or unnecessary
-surface area. Do not make code smaller by compressing readable logic, combining unrelated
-responsibilities, or removing validation, safety controls, error context, tests, or necessary
-documentation. Clear direct code is simpler than clever short code.
+Report what changed, what was deleted, which verification ran, and any remaining unverified risk or
+blocker. If verification was intentionally omitted, say so explicitly.
 
-### Replace; Do Not Preserve
+## Bitagnis Non-Negotiables
 
-Prefer the best current design over backward compatibility with an inferior internal design.
-Breaking internal APIs, CLI contracts, schemas, persisted formats, and documented behavior is
-allowed when the replacement is deliberate and complete.
-
-When a design changes, complete the cutover and delete the superseded implementation, types, entry
-points, aliases, adapters, feature flags, readers and writers, tests, fixtures, and documentation.
-Do not deprecate old paths, hide them, or retain compatibility shims, dual paths, legacy modes, or
-fallbacks for old behavior. Git history is the source archive.
-
-Update every current in-repository producer and consumer in the same logical change. For a changed
-persisted contract, deliberately update or reset its baseline and reject incompatible old data
-explicitly. Never silently reinterpret old bytes or retain a legacy reader unless an externally
-required migration contract has been approved.
-
-A breaking change never relaxes correctness, hardware safety, secret handling, data integrity, or
-the thermal-control invariants in this guide.
-
-### Complete Changes
-
-Fix the underlying design or add missing support properly. Do not introduce hacks, monkey patches,
-partial workarounds, fragile schema shims, duplicated wrappers, or parallel implementations. Do not
-split an inseparable cutover merely to make individual commits smaller. If a correct complete
-solution is not possible, report the blocker instead of approximating it.
+- Never weaken ASIC-temperature, voltage-regulator-temperature, power, or overheat protections to
+  make optimization faster or tests easier.
+- Treat every AxeOS mutation as hardware-affecting and high risk: validate it before any request,
+  preserve enough durable state to recover, and test failure paths (see AxeOS Mutation Constraint
+  below).
+- Always change ASIC frequency and core voltage as one complete `OperatingPoint`; never tune or
+  apply either field independently. This is Correctness by Construction applied: the type itself
+  makes changing one field without the other unrepresentable.
+- Never log, print, commit, or persist secrets such as Stratum passwords. Keep real credentials out
+  of YAML, tests, fixtures, errors, terminal output, and SQLite.
+- Preserve package boundaries and keep `lib` usable without the executable.
 
 ## Repository Boundaries
 
@@ -224,7 +262,7 @@ go vet ./...
 go build ./...
 ```
 
-Choose verification by scope:
+Map verification to scope:
 
 - `go test ./lib` for isolated AxeOS client, settings, or persistence changes.
 - `go test .` for optimizer, controller, polling, or rendering changes.
@@ -264,14 +302,10 @@ turn a canary test into an implicit fleet rollout.
 - Do not add generated binaries, coverage output, editor state, module caches, or temporary
   artifacts.
 
-## Reporting
-
-Report what changed, what was deleted, which verification ran, and any remaining unverified risk or
-blocker. If verification was intentionally omitted for a documentation-only change, say so
-explicitly.
-
 ## Next Time
 
 - Look for an existing owner and implementation path before adding a new abstraction or type.
 - Delete superseded code and compatibility paths as part of the same complete cutover.
 - Read the safety tests and check the AxeOS restart constraint before changing mutation behavior.
+- Favor construction that makes an invalid state unrepresentable over a new runtime check; add the
+  runtime check only when the fact is genuinely ambient or changing.
