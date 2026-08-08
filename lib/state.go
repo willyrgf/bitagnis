@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -15,7 +16,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 6
+const optimizerSchemaVersion = 7
 
 // LongTermRetentionHours bounds the credential-free hourly accounting history.
 const LongTermRetentionHours = 384
@@ -36,15 +37,45 @@ const (
 	PhaseOverheat      OptimizerPhase = "OVERHEAT"
 )
 
+// PointStatus is the closed set of terminal (and entry-in-progress) outcomes
+// for one evaluated operating point. It is a named type, not a bare string,
+// so an unknown status cannot be carried into the core from a decode or
+// durable-load path; validPointStatus is the exhaustiveness check.
+type PointStatus string
+
 const (
-	PointEntered      = "entered"
-	PointValidated    = "validated"
-	PointUnstable     = "unstable"
-	PointNoGain       = "no_gain"
-	PointUnobservable = "unobservable"
-	PointThermal      = "thermal"
-	PointPower        = "power"
-	PointVRHot        = "vr_hot"
+	PointEntered      PointStatus = "entered"
+	PointValidated    PointStatus = "validated"
+	PointUnstable     PointStatus = "unstable"
+	PointNoGain       PointStatus = "no_gain"
+	PointStarved      PointStatus = "starved"
+	PointUnobservable PointStatus = "unobservable"
+	PointThermal      PointStatus = "thermal"
+	PointPower        PointStatus = "power"
+	PointVRHot        PointStatus = "vr_hot"
+)
+
+// EpochPurpose is the closed set of reasons an evidence epoch was opened.
+type EpochPurpose string
+
+const (
+	EpochBaseline         EpochPurpose = "baseline"
+	EpochTrial            EpochPurpose = "trial"
+	EpochHoldValidation   EpochPurpose = "hold_validation"
+	EpochSafetyValidation EpochPurpose = "safety_validation"
+	EpochProbation        EpochPurpose = "probation"
+)
+
+// EpochOutcome is the closed set of terminal outcomes for an evidence epoch.
+// EpochOpen (the empty string) represents an epoch that has not yet closed.
+type EpochOutcome string
+
+const (
+	EpochOpen         EpochOutcome = ""
+	EpochValidated    EpochOutcome = "validated"
+	EpochRejected     EpochOutcome = "rejected"
+	EpochStarved      EpochOutcome = "starved"
+	EpochContradicted EpochOutcome = "contradicted"
 )
 
 // PassTrigger identifies the event that created a finite optimization pass.
@@ -62,7 +93,17 @@ const (
 	HoldOptimized HoldReason = "optimized"
 	HoldSafety    HoldReason = "safety"
 	HoldManual    HoldReason = "manual"
-	HoldBlocked   HoldReason = "blocked"
+	// HoldStarved means the controller could not measure: an evidence epoch's rejected-window
+	// budget was exhausted with no admissible window produced. The miner is not known to be bad,
+	// only unmeasured, so it exits automatically once a probation epoch proves the environment can
+	// deliver windowMinSamples consecutive samples again (RFC "Terminal States Get Exit
+	// Predicates"). Scoped to baseline evidence epochs; see optimizer.go's starveBaseline.
+	HoldStarved HoldReason = "starved"
+	// HoldRejected means the controller did measure (or observed a live point it can never
+	// automate, or a mutation never reached a confirmed-running state to measure at all) and the
+	// result is a real, terminal conclusion about this hardware/configuration. It remains terminal
+	// until an operator retune, exactly as HoldBlocked did before this split.
+	HoldRejected HoldReason = "rejected"
 )
 
 // SafetyReason is the durable cause of a safety episode. It is deliberately
@@ -100,7 +141,6 @@ type MinerState struct {
 
 	Phase          OptimizerPhase
 	PhaseStartedAt time.Time
-	RampUntil      time.Time
 
 	CurrentFrequency   int
 	CurrentCoreVoltage int
@@ -122,9 +162,14 @@ type MinerState struct {
 	ObservedCoreVoltage int
 	ObservedCount       int
 
-	ConsecutiveBadWindows int
-	OverheatCount         int
-	CooldownUntil         time.Time
+	OverheatCount int
+
+	// RecoveryHealthyCount and UnreadablePollCount are durable monotone counters replacing the
+	// deleted cooldown_until wall clock and the unreadable-poll escalation window respectively.
+	// RecoveryHealthyCount is nonzero only inside COOLDOWN/OVERHEAT (see recoveryHealthyPolls in
+	// optimizer.go); UnreadablePollCount resets to zero on escalation (see unreadablePollLimit).
+	RecoveryHealthyCount int
+	UnreadablePollCount  int
 
 	PassStartedAt            time.Time
 	PassTrigger              PassTrigger
@@ -135,7 +180,6 @@ type MinerState struct {
 	SafetyReason             SafetyReason
 	HoldReason               HoldReason
 	SettledAt                time.Time
-	EvidenceDeadlineAt       time.Time
 	AccountedThroughAt       time.Time
 }
 
@@ -192,7 +236,6 @@ func (state *MinerState) SetPendingMutation(
 	state.PendingFrequency = point.Frequency
 	state.PendingCoreVoltage = point.CoreVoltage
 	state.PendingSince = since
-	state.EvidenceDeadlineAt = time.Time{}
 }
 
 // ClearPendingMutation clears only the operating-point mutation; an independent
@@ -208,7 +251,7 @@ type OperatingPointRecord struct {
 	MacAddr        string
 	Frequency      int
 	CoreVoltage    int
-	Status         string
+	Status         PointStatus
 	MedianHash     float64
 	ExpectedHash   float64
 	Attainment     float64
@@ -223,6 +266,14 @@ type OperatingPointRecord struct {
 	EnteredAt      time.Time
 	EntryAttemptID int64
 	ReferenceHash  float64
+	// EvidenceEpochID is the closed evidence epoch that produced this record's
+	// measurement. It is zero for "entered" (still in progress) and "starved"
+	// (no measurement was ever obtained) rows; every other terminal status
+	// resolves to a closed epoch with outcome "validated", "rejected", or
+	// "contradicted" (a safety transition that interrupted an entered
+	// candidate closes its epoch as contradicted rather than validated or
+	// rejected, since no window predicate was evaluated).
+	EvidenceEpochID int64
 }
 
 func (record OperatingPointRecord) Point() OperatingPoint {
@@ -425,33 +476,459 @@ func optimizerSQLiteDSN(path string, readOnly bool) string {
 	}).String()
 }
 
-// BootstrapMiner is the canonical new-miner load path. Creation of the
-// optimizer row and its baseline entered row is one transaction with a fixed
-// evidence deadline; a process reopen cannot observe a miner without its pass
-// authority.
-func (store *OptimizerStore) BootstrapMiner(
-	info Info,
-	ip string,
-	now time.Time,
-	rampUp time.Duration,
-	evaluationWindow time.Duration,
-	pairAdvertised bool,
-) (MinerState, bool, error) {
-	if strings.TrimSpace(info.Hostname) == "" || strings.TrimSpace(info.MacAddr) == "" {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: hostname and MAC address are required")
+// WindowAggregate is a closed evaluation window. It carries the sample count and span that admitted
+// it, so a consumer cannot use the measurement without the evidence of its quality. Fields are
+// unexported; every consumer goes through NewWindowAggregate or Combine, so a window aggregate
+// cannot exist with a non-finite or out-of-range measurement.
+type WindowAggregate struct {
+	sampleCount   int
+	span          time.Duration
+	medianHash    float64
+	expectedHash  float64
+	attainment    float64
+	meanTemp      float64
+	p95Temp       float64
+	p95VRTemp     float64
+	p95Power      float64
+	errorPercent  *float64
+	acceptedDelta int
+	rejectedDelta int
+}
+
+// NewWindowAggregate is the only constructor for WindowAggregate. It subsumes the validation the
+// pre-epoch windowSummary type deferred to a separate validateWindowSummary call.
+func NewWindowAggregate(
+	sampleCount int,
+	span time.Duration,
+	medianHash, expectedHash, attainment float64,
+	meanTemp, p95Temp, p95VRTemp, p95Power float64,
+	errorPercent *float64,
+	acceptedDelta, rejectedDelta int,
+) (WindowAggregate, error) {
+	if sampleCount <= 0 {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: sample count must be positive")
 	}
-	if net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil || now.IsZero() ||
-		rampUp < 0 || evaluationWindow <= 0 {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: invalid identity, timing, or IP")
+	if span < 0 {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: span cannot be negative")
+	}
+	if !finite(medianHash) || medianHash < 0 ||
+		!finite(expectedHash) || expectedHash < 0 ||
+		!finite(attainment) || attainment < 0 ||
+		!finite(meanTemp) || meanTemp < 0 ||
+		!finite(p95Temp) || p95Temp < 0 ||
+		!finite(p95VRTemp) || p95VRTemp < 0 ||
+		!finite(p95Power) || p95Power < 0 {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: measurement is invalid")
+	}
+	if errorPercent != nil && (!finite(*errorPercent) || *errorPercent < 0 || *errorPercent > 100) {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: error percentage is invalid")
+	}
+	if acceptedDelta < 0 || rejectedDelta < 0 {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: share delta cannot be negative")
+	}
+	return WindowAggregate{
+		sampleCount: sampleCount, span: span, medianHash: medianHash, expectedHash: expectedHash,
+		attainment: attainment, meanTemp: meanTemp, p95Temp: p95Temp, p95VRTemp: p95VRTemp,
+		p95Power: p95Power, errorPercent: cloneFloat(errorPercent),
+		acceptedDelta: acceptedDelta, rejectedDelta: rejectedDelta,
+	}, nil
+}
+
+func (aggregate WindowAggregate) SampleCount() int       { return aggregate.sampleCount }
+func (aggregate WindowAggregate) Span() time.Duration    { return aggregate.span }
+func (aggregate WindowAggregate) MedianHash() float64    { return aggregate.medianHash }
+func (aggregate WindowAggregate) ExpectedHash() float64  { return aggregate.expectedHash }
+func (aggregate WindowAggregate) Attainment() float64    { return aggregate.attainment }
+func (aggregate WindowAggregate) MeanTemp() float64      { return aggregate.meanTemp }
+func (aggregate WindowAggregate) P95Temp() float64       { return aggregate.p95Temp }
+func (aggregate WindowAggregate) P95VRTemp() float64     { return aggregate.p95VRTemp }
+func (aggregate WindowAggregate) P95Power() float64      { return aggregate.p95Power }
+func (aggregate WindowAggregate) ErrorPercent() *float64 { return cloneFloat(aggregate.errorPercent) }
+func (aggregate WindowAggregate) AcceptedDelta() int     { return aggregate.acceptedDelta }
+func (aggregate WindowAggregate) RejectedDelta() int     { return aggregate.rejectedDelta }
+
+// Combine merges two admitted windows into one aggregate over their union, using the same
+// conservative combination rule the pre-epoch controller applied: the worse of the two values wins
+// on every safety-relevant dimension, and hash-rate combination is the minimum (never rewarded for
+// a lucky window). It is controller-side arithmetic, not persistence: the epoch never stores a
+// combined aggregate, only the first admitted window and, on the second, this in-memory value used
+// once to build the outcome.
+func (aggregate WindowAggregate) Combine(next WindowAggregate) (WindowAggregate, error) {
+	medianHash := aggregate.medianHash
+	if next.medianHash < medianHash {
+		medianHash = next.medianHash
+	}
+	expectedHash := aggregate.expectedHash
+	if next.expectedHash > expectedHash {
+		expectedHash = next.expectedHash
+	}
+	meanTemp := math.Max(aggregate.meanTemp, next.meanTemp)
+	p95Temp := math.Max(aggregate.p95Temp, next.p95Temp)
+	p95VRTemp := math.Max(aggregate.p95VRTemp, next.p95VRTemp)
+	p95Power := math.Max(aggregate.p95Power, next.p95Power)
+	attainment := 0.0
+	if expectedHash > 0 {
+		attainment = medianHash / expectedHash
+	}
+	var errorPercent *float64
+	switch {
+	case aggregate.errorPercent == nil && next.errorPercent == nil:
+		errorPercent = nil
+	case aggregate.errorPercent == nil:
+		errorPercent = cloneFloat(next.errorPercent)
+	case next.errorPercent == nil:
+		errorPercent = cloneFloat(aggregate.errorPercent)
+	default:
+		value := math.Max(*aggregate.errorPercent, *next.errorPercent)
+		errorPercent = &value
+	}
+	if math.MaxInt-aggregate.acceptedDelta < next.acceptedDelta ||
+		math.MaxInt-aggregate.rejectedDelta < next.rejectedDelta {
+		return WindowAggregate{}, fmt.Errorf("window aggregate: share delta overflow")
+	}
+	return NewWindowAggregate(
+		aggregate.sampleCount+next.sampleCount, aggregate.span+next.span,
+		medianHash, expectedHash, attainment, meanTemp, p95Temp, p95VRTemp, p95Power,
+		errorPercent, aggregate.acceptedDelta+next.acceptedDelta, aggregate.rejectedDelta+next.rejectedDelta,
+	)
+}
+
+// EpochProgress is the single owner of one evidence epoch's accumulated progress. Its only exported
+// mutators are the legal advances, ObserveSample and CloseWindow; there is deliberately no reset
+// method, because contradiction ends the epoch rather than emptying it in place (see CloseEpoch).
+type EpochProgress struct {
+	settledSamples  int
+	closedWindows   int
+	rejectedWindows int
+	missedPolls     int
+	window          *WindowAggregate // non-nil exactly when closedWindows >= 1
+}
+
+// newEpochProgress is the only path from stored columns to a progress value. It rejects the
+// combinations the CHECK constraints also reject, so a hand-edited row cannot enter the core.
+func newEpochProgress(settled, closed, rejected, missed int, window *WindowAggregate) (EpochProgress, error) {
+	if settled < 0 || closed < 0 || rejected < 0 || missed < 0 {
+		return EpochProgress{}, fmt.Errorf("epoch progress: counters cannot be negative")
+	}
+	if closed > 2 {
+		return EpochProgress{}, fmt.Errorf("epoch progress: at most two windows may close in one epoch")
+	}
+	if (closed == 0) != (window == nil) {
+		return EpochProgress{}, fmt.Errorf("epoch progress: window presence does not match closed-window count")
+	}
+	var stored *WindowAggregate
+	if window != nil {
+		copy := *window
+		stored = &copy
+	}
+	return EpochProgress{
+		settledSamples: settled, closedWindows: closed, rejectedWindows: rejected,
+		missedPolls: missed, window: stored,
+	}, nil
+}
+
+func (progress EpochProgress) SettledSamples() int  { return progress.settledSamples }
+func (progress EpochProgress) ClosedWindows() int   { return progress.closedWindows }
+func (progress EpochProgress) RejectedWindows() int { return progress.rejectedWindows }
+func (progress EpochProgress) MissedPolls() int     { return progress.missedPolls }
+
+// ClosedWindow returns the durably stored first admitted window, if one has closed.
+func (progress EpochProgress) ClosedWindow() (WindowAggregate, bool) {
+	if progress.window == nil {
+		return WindowAggregate{}, false
+	}
+	return *progress.window, true
+}
+
+// ObserveSample advances settled-sample progress. It takes the count of polls missed since the
+// previous sample so the diagnostic counter cannot drift from the progress it describes.
+func (progress *EpochProgress) ObserveSample(missedSincePrevious int) {
+	if missedSincePrevious > 0 {
+		progress.missedPolls += missedSincePrevious
+	}
+	progress.settledSamples++
+}
+
+// CloseWindow records an admitted or rejected window. The first admitted window is stored; a second
+// admitted window is counted but not stored, because at most two windows exist per epoch and the
+// controller combines the second against the stored first without persisting the combination.
+func (progress *EpochProgress) CloseWindow(admitted bool, aggregate WindowAggregate) error {
+	if !admitted {
+		progress.rejectedWindows++
+		return nil
+	}
+	if progress.closedWindows >= 2 {
+		return fmt.Errorf("epoch progress: at most two windows may close in one epoch")
+	}
+	if progress.closedWindows == 0 {
+		copy := aggregate
+		progress.window = &copy
+	}
+	progress.closedWindows++
+	return nil
+}
+
+// EvidenceEpoch is one durable evidence-collection episode for a miner's current operating point.
+// At most one epoch per miner is open (closed_at = 0) at a time, enforced by the
+// evidence_epochs_one_open partial unique index; there is no mirroring optimizer_miners column.
+type EvidenceEpoch struct {
+	ID              int64
+	MacAddr         string
+	Point           OperatingPoint
+	Purpose         EpochPurpose
+	RequiredWindows int
+	OpenedAt        time.Time
+	Progress        EpochProgress
+	ClosedAt        time.Time
+	Outcome         EpochOutcome
+}
+
+// Transition is one durable optimizer state change. The unexported method closes the set to this
+// package: a transition cannot be constructed elsewhere, and Apply's switch is exhaustive over it.
+type Transition interface{ isOptimizerTransition() }
+
+// TransitionResult carries what a transition produced: the resulting durable MinerState and, for a
+// transition that creates a row, the id of that row. Returning it instead of mutating a *MinerState
+// argument in place removes a class of half-updated-state bug.
+type TransitionResult struct {
+	State     MinerState
+	Created   bool
+	AttemptID int64
+}
+
+// Bootstrap replaces BootstrapMiner, the canonical new-miner load path. Creation of the optimizer
+// row, its baseline entered row, and (when the pass starts in BASELINE) its baseline evidence epoch
+// is one transaction. Ramp is now a sample count derived from settings, so bootstrap no longer
+// carries any duration.
+type Bootstrap struct {
+	Info           Info
+	IP             string
+	PairAdvertised bool
+}
+
+func (Bootstrap) isOptimizerTransition() {}
+
+// ResetPass replaces ResetOptimizationPass. It atomically deletes the selected miner's prior point
+// summaries, starts the one explicitly authorized operator pass, and opens its baseline evidence
+// epoch. The mutation coordinator's lock is the qualification boundary: it holds the validated live
+// observation while this serialized store transaction rechecks durable HOLD/current/attempt state.
+// The mutation history and hourly accounting cursor remain untouched.
+type ResetPass struct {
+	MacAddr string
+	Point   OperatingPoint
+}
+
+func (ResetPass) isOptimizerTransition() {}
+
+// AdmitTrial consumes a previously unseen candidate and persists its pending hardware intent, entry
+// attempt, fallback incumbent, and trial phase in one transaction. The row insertion is the
+// eligibility decision: a duplicate candidate cannot be admitted again in the same pass. It does not
+// open the trial's evidence epoch: the candidate is not yet the confirmed running configuration, and
+// an epoch's point must equal durable current. CompleteResume opens it once two healthy polls at the
+// candidate prove the mutation took effect.
+type AdmitTrial struct {
+	MacAddr       string
+	Candidate     OperatingPoint
+	Incumbent     OperatingPoint
+	Phase         OptimizerPhase
+	ReferenceHash float64
+}
+
+func (AdmitTrial) isOptimizerTransition() {}
+
+// FinalizeTrial writes terminal evidence for an entered candidate, closes its evidence epoch in the
+// same transaction, and atomically either reserves its incumbent return, promotes the candidate, or
+// blocks the pass. Epoch is the trial epoch being closed, supplied by the caller for staleness
+// verification; it does not open a successor. TrialPromote and an immediate TrialReturn both need a
+// fresh baseline epoch, but the caller issues that as a separate OpenEpoch once this transaction's
+// result confirms which point durable current became.
+type FinalizeTrial struct {
+	State    MinerState
+	Record   OperatingPointRecord
+	Decision TrialDecision
+	Epoch    EvidenceEpoch
+}
+
+func (FinalizeTrial) isOptimizerTransition() {}
+
+// FinalizeBaseline atomically closes the pass bootstrap row, closes the baseline evidence epoch that
+// produced it, and updates the incumbent state. A rejected baseline enters blocked HOLD; it never
+// creates a speculative exploration fallback. Like FinalizeTrial it closes but does not reopen: the
+// caller opens the next epoch (hold validation or the next trial) once it decides what follows.
+type FinalizeBaseline struct {
+	State  MinerState
+	Record OperatingPointRecord
+	Block  bool
+	Epoch  EvidenceEpoch
+}
+
+func (FinalizeBaseline) isOptimizerTransition() {}
+
+// AdoptManualPoint records a confirmed external complete pair, starts a fresh hold-validation epoch,
+// and starts a fresh baseline window without authorizing hardware or deleting history.
+type AdoptManualPoint struct {
+	MacAddr string
+	Point   OperatingPoint
+}
+
+func (AdoptManualPoint) isOptimizerTransition() {}
+
+// AdoptExternalPoint atomically resolves a pre-PATCH operating-point attempt after two safe
+// observations of an externally changed pair, opening a hold-validation epoch for it. The observed
+// pair becomes manual HOLD state; it never becomes a normal automation target.
+type AdoptExternalPoint struct {
+	State     MinerState
+	Point     OperatingPoint
+	AttemptID int64
+}
+
+func (AdoptExternalPoint) isOptimizerTransition() {}
+
+// SaveState replaces SaveMiner. It persists the supplied durable state exactly as given and never
+// touches evidence epochs: it is the generic escape hatch used where no epoch boundary is crossed.
+type SaveState struct {
+	State MinerState
+}
+
+func (SaveState) isOptimizerTransition() {}
+
+// CompleteResume replaces CompleteMiningResume. It atomically closes the healthy-mining gate and
+// opens the epoch appropriate to whatever phase and hold reason the completed mutation already left
+// durable (EpochShapeForPhase), except for a mining-only completion, which touches no operating
+// point and therefore leaves any already-open epoch untouched. The attempt and miner row become
+// visible together so a crash cannot report resumed mining without the corresponding epoch.
+type CompleteResume struct {
+	MacAddr   string
+	AttemptID int64
+}
+
+func (CompleteResume) isOptimizerTransition() {}
+
+// SafetyTransition replaces PersistSafetyTransition. It atomically records an instantaneous safety
+// result, closes any normal or mining attempt that it superseded, closes any open evidence epoch
+// (contradicted, unless Record finalizes the epoch's own entered candidate with a real measurement,
+// in which case the epoch closes rejected), and saves the replacement safety state. Record is nil
+// when the transition records no measurement; it is supplied only when the live point was an entered
+// frontier candidate.
+type SafetyTransition struct {
+	Expected MinerState
+	State    MinerState
+	Record   *OperatingPointRecord // nil when the transition records no measurement
+}
+
+func (SafetyTransition) isOptimizerTransition() {}
+
+// FailMutation replaces FailMutationAndSave. It atomically closes an unfinished mutation, closes any
+// open evidence epoch as contradicted, and persists the terminal non-trial state that owns the
+// remaining safety or mining obligation.
+type FailMutation struct {
+	State     MinerState
+	AttemptID int64
+	Stage     MutationFailureStage
+}
+
+func (FailMutation) isOptimizerTransition() {}
+
+// FailMutationFinalizeTrial replaces FailMutationAndFinalizeTrial. It atomically closes a failed
+// operating-point attempt, finalizes its candidate evidence, closes the trial epoch that produced it,
+// and applies the reserved return or blocked state. It is the terminal boundary for entry and resume
+// failure.
+type FailMutationFinalizeTrial struct {
+	State     MinerState
+	Record    OperatingPointRecord
+	Decision  TrialDecision
+	AttemptID int64
+	Stage     MutationFailureStage
+	Epoch     EvidenceEpoch
+}
+
+func (FailMutationFinalizeTrial) isOptimizerTransition() {}
+
+// QuarantineMutation atomically closes a post-request mutation whose device state is unavailable or
+// ambiguous. An operating-point candidate is made unobservable, any open evidence epoch closes
+// contradicted, all actuatable authority is cleared, and the miner enters the durable
+// mutation-uncertain emergency block without claiming containment.
+type QuarantineMutation struct {
+	State     MinerState
+	AttemptID int64
+	Stage     MutationFailureStage
+}
+
+func (QuarantineMutation) isOptimizerTransition() {}
+
+// SupersedeMutation closes a normal or mining mutation that safety arbitration replaced, finalizing
+// an entered candidate as unobservable when necessary, closing any open evidence epoch as
+// contradicted, and saving the replacing durable state in the same transaction.
+type SupersedeMutation struct {
+	Expected  MinerState
+	State     MinerState
+	AttemptID int64
+}
+
+func (SupersedeMutation) isOptimizerTransition() {}
+
+// CompleteMutation replaces CompleteMutationAttempt. It atomically saves the verified device state,
+// records that the mutation lifecycle completed, and closes any open evidence epoch as contradicted
+// (defensive: safety transitions already close the epoch that was open before a safety-driven
+// mutation, so this is normally a no-op, but a mutation completion is still, by definition, a device
+// identity/point change underneath any epoch a caller failed to close).
+type CompleteMutation struct {
+	MacAddr   string
+	IP        string
+	AttemptID int64
+}
+
+func (CompleteMutation) isOptimizerTransition() {}
+
+// OpenEpoch opens an epoch for a miner that currently has none. Enforced by evidence_epochs_one_open.
+// State is the complete durable state to save in the same transaction (already phase-transitioned by
+// the caller); Point is the operating point the epoch evaluates, which must equal State's current
+// point.
+type OpenEpoch struct {
+	State           MinerState
+	Purpose         EpochPurpose
+	Point           OperatingPoint
+	RequiredWindows int
+}
+
+func (OpenEpoch) isOptimizerTransition() {}
+
+// AdvanceEpoch persists accumulated progress. This is the per-poll transition: at most one is applied
+// per miner per poll, and it never closes the epoch or changes the miner's phase.
+type AdvanceEpoch struct {
+	Epoch    EvidenceEpoch
+	Progress EpochProgress
+}
+
+func (AdvanceEpoch) isOptimizerTransition() {}
+
+// CloseEpoch ends an epoch with no accompanying operating-points record. Contradiction uses it;
+// decisions that produce a measurement use FinalizeBaseline, FinalizeTrial, or
+// FailMutationFinalizeTrial instead. Successor, when non-nil, opens the next epoch in the same
+// transaction.
+type CloseEpoch struct {
+	State     MinerState
+	Epoch     EvidenceEpoch
+	Outcome   EpochOutcome
+	Successor *OpenEpoch
+}
+
+func (CloseEpoch) isOptimizerTransition() {}
+
+// Apply commits one transition. It is the only write path for optimizer state: the only BeginTx,
+// the only validation pass, and the only place two rows are made to change together.
+func (store *OptimizerStore) Apply(transition Transition, at time.Time) (TransitionResult, error) {
+	if at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("apply transition: timestamp is required")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if err := store.ready("bootstrap miner"); err != nil {
-		return MinerState{}, false, err
+	if err := store.ready("apply transition"); err != nil {
+		return TransitionResult{}, err
 	}
 	tx, err := store.conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: begin transaction: %w", err)
+		return TransitionResult{}, fmt.Errorf("apply transition: begin transaction: %w", err)
 	}
 	rollback := true
 	defer func() {
@@ -459,6 +936,431 @@ func (store *OptimizerStore) BootstrapMiner(
 			_ = tx.Rollback()
 		}
 	}()
+
+	var result TransitionResult
+	switch value := transition.(type) {
+	case Bootstrap:
+		result, err = applyBootstrap(tx, value, at)
+	case ResetPass:
+		result, err = applyResetPass(tx, value, at)
+	case AdmitTrial:
+		result, err = applyAdmitTrial(tx, value, at)
+	case FinalizeTrial:
+		result, err = applyFinalizeTrial(tx, value, at)
+	case FinalizeBaseline:
+		result, err = applyFinalizeBaseline(tx, value, at)
+	case AdoptManualPoint:
+		result, err = applyAdoptManualPoint(tx, value, at)
+	case AdoptExternalPoint:
+		result, err = applyAdoptExternalPoint(tx, value, at)
+	case SaveState:
+		result, err = applySaveState(tx, value, at)
+	case CompleteResume:
+		result, err = applyCompleteResume(tx, value, at)
+	case SafetyTransition:
+		result, err = applySafetyTransition(tx, value, at)
+	case FailMutation:
+		result, err = applyFailMutation(tx, value, at)
+	case FailMutationFinalizeTrial:
+		result, err = applyFailMutationFinalizeTrial(tx, value, at)
+	case QuarantineMutation:
+		result, err = applyQuarantineMutation(tx, value, at)
+	case SupersedeMutation:
+		result, err = applySupersedeMutation(tx, value, at)
+	case CompleteMutation:
+		result, err = applyCompleteMutation(tx, value, at)
+	case OpenEpoch:
+		result, err = applyOpenEpoch(tx, value, at)
+	case AdvanceEpoch:
+		result, err = applyAdvanceEpoch(tx, value, at)
+	case CloseEpoch:
+		result, err = applyCloseEpoch(tx, value, at)
+	default:
+		return TransitionResult{}, fmt.Errorf("apply transition: unhandled %T", transition)
+	}
+	if err != nil {
+		return TransitionResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TransitionResult{}, fmt.Errorf("apply transition: commit: %w", err)
+	}
+	rollback = false
+	return result, nil
+}
+
+// applyBootstrap is the canonical new-miner load path. Creation of the
+// optimizer row and its baseline entered row is one transaction with a fixed
+// evidence deadline; a process reopen cannot observe a miner without its pass
+// authority.
+// --- Evidence epoch storage and helpers -----------------------------------------------------
+
+const evidenceEpochSelect = `SELECT
+	id, mac_addr, frequency, core_voltage, purpose, required_windows, opened_at,
+	settled_sample_count, closed_windows, rejected_windows, missed_polls,
+	window_sample_count, window_span_nanos, window_median_hash, window_expected_hash,
+	window_attainment, window_mean_temp, window_p95_temp, window_p95_vr_temp, window_p95_power,
+	window_error_percent, window_accepted_delta, window_rejected_delta, closed_at, outcome
+	FROM evidence_epochs`
+
+func scanEvidenceEpoch(row rowScanner) (EvidenceEpoch, error) {
+	var epoch EvidenceEpoch
+	var purpose, outcome string
+	var openedAt, closedAt int64
+	var settled, closedWindows, rejectedWindows, missedPolls int
+	var windowSampleCount, windowAcceptedDelta, windowRejectedDelta int
+	var windowSpanNanos int64
+	var windowMedianHash, windowExpectedHash, windowAttainment float64
+	var windowMeanTemp, windowP95Temp, windowP95VRTemp, windowP95Power float64
+	var windowErrorPercent sql.NullFloat64
+	if err := row.Scan(
+		&epoch.ID, &epoch.MacAddr, &epoch.Point.Frequency, &epoch.Point.CoreVoltage,
+		&purpose, &epoch.RequiredWindows, &openedAt,
+		&settled, &closedWindows, &rejectedWindows, &missedPolls,
+		&windowSampleCount, &windowSpanNanos, &windowMedianHash, &windowExpectedHash,
+		&windowAttainment, &windowMeanTemp, &windowP95Temp, &windowP95VRTemp, &windowP95Power,
+		&windowErrorPercent, &windowAcceptedDelta, &windowRejectedDelta, &closedAt, &outcome,
+	); err != nil {
+		return EvidenceEpoch{}, err
+	}
+	epoch.Purpose = EpochPurpose(purpose)
+	epoch.OpenedAt = storedTime(openedAt)
+	epoch.ClosedAt = storedTime(closedAt)
+	epoch.Outcome = EpochOutcome(outcome)
+	var window *WindowAggregate
+	if closedWindows > 0 {
+		var errorPercent *float64
+		if windowErrorPercent.Valid {
+			value := windowErrorPercent.Float64
+			errorPercent = &value
+		}
+		aggregate, err := NewWindowAggregate(
+			windowSampleCount, time.Duration(windowSpanNanos), windowMedianHash, windowExpectedHash,
+			windowAttainment, windowMeanTemp, windowP95Temp, windowP95VRTemp, windowP95Power,
+			errorPercent, windowAcceptedDelta, windowRejectedDelta,
+		)
+		if err != nil {
+			return EvidenceEpoch{}, fmt.Errorf("decode stored window: %w", err)
+		}
+		window = &aggregate
+	}
+	progress, err := newEpochProgress(settled, closedWindows, rejectedWindows, missedPolls, window)
+	if err != nil {
+		return EvidenceEpoch{}, fmt.Errorf("decode epoch progress: %w", err)
+	}
+	epoch.Progress = progress
+	return epoch, nil
+}
+
+func queryOpenEpoch(queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, macAddr string) (EvidenceEpoch, error) {
+	return scanEvidenceEpoch(queryer.QueryRowContext(context.Background(),
+		evidenceEpochSelect+" WHERE mac_addr = ? AND closed_at = 0", macAddr))
+}
+
+func insertEpoch(
+	tx *sql.Tx,
+	macAddr string,
+	point OperatingPoint,
+	purpose EpochPurpose,
+	requiredWindows int,
+	openedAt time.Time,
+) (int64, error) {
+	result, err := tx.ExecContext(context.Background(), `INSERT INTO evidence_epochs (
+		mac_addr, frequency, core_voltage, purpose, required_windows, opened_at,
+		settled_sample_count, closed_windows, rejected_windows, missed_polls,
+		window_sample_count, window_span_nanos, window_median_hash, window_expected_hash,
+		window_attainment, window_mean_temp, window_p95_temp, window_p95_vr_temp, window_p95_power,
+		window_error_percent, window_accepted_delta, window_rejected_delta, closed_at, outcome
+	) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, '')`,
+		macAddr, point.Frequency, point.CoreVoltage, purpose, requiredWindows, timeValue(openedAt))
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func updateEpochProgress(tx *sql.Tx, epochID int64, progress EpochProgress) error {
+	window, hasWindow := progress.ClosedWindow()
+	var sampleCount, acceptedDelta, rejectedDelta int
+	var spanNanos int64
+	var medianHash, expectedHash, attainment, meanTemp, p95Temp, p95VRTemp, p95Power float64
+	var errorPercent any
+	if hasWindow {
+		sampleCount = window.SampleCount()
+		spanNanos = window.Span().Nanoseconds()
+		medianHash, expectedHash, attainment = window.MedianHash(), window.ExpectedHash(), window.Attainment()
+		meanTemp, p95Temp, p95VRTemp, p95Power = window.MeanTemp(), window.P95Temp(), window.P95VRTemp(), window.P95Power()
+		acceptedDelta, rejectedDelta = window.AcceptedDelta(), window.RejectedDelta()
+		errorPercent = nullableFloat(window.ErrorPercent())
+	}
+	_, err := tx.ExecContext(context.Background(), `UPDATE evidence_epochs SET
+		settled_sample_count = ?, closed_windows = ?, rejected_windows = ?, missed_polls = ?,
+		window_sample_count = ?, window_span_nanos = ?, window_median_hash = ?, window_expected_hash = ?,
+		window_attainment = ?, window_mean_temp = ?, window_p95_temp = ?, window_p95_vr_temp = ?,
+		window_p95_power = ?, window_error_percent = ?, window_accepted_delta = ?, window_rejected_delta = ?
+		WHERE id = ? AND closed_at = 0`,
+		progress.SettledSamples(), progress.ClosedWindows(), progress.RejectedWindows(), progress.MissedPolls(),
+		sampleCount, spanNanos, medianHash, expectedHash, attainment, meanTemp, p95Temp, p95VRTemp, p95Power,
+		errorPercent, acceptedDelta, rejectedDelta, epochID)
+	return err
+}
+
+func closeEpochRow(tx *sql.Tx, epochID int64, outcome EpochOutcome, at time.Time) error {
+	_, err := tx.ExecContext(context.Background(),
+		`UPDATE evidence_epochs SET closed_at = ?, outcome = ? WHERE id = ? AND closed_at = 0`,
+		timeValue(at), outcome, epochID)
+	return err
+}
+
+// closeOpenEpochIfAny closes whatever evidence epoch is open for macAddr, if any, with the given
+// outcome. Used by the transitions that take safety or mutation ownership of a miner: their epoch,
+// if any, describes evidence about a subject (point, phase, or device state) that changed underneath
+// it, which is exactly the "contradicted" case, per the RFC's contradiction list.
+func closeOpenEpochIfAny(tx *sql.Tx, macAddr string, outcome EpochOutcome, at time.Time) error {
+	epoch, err := queryOpenEpoch(tx, macAddr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return closeEpochRow(tx, epoch.ID, outcome, at)
+}
+
+// closeCandidateEpoch closes the open epoch for macAddr, if any. When record is a real measurement
+// (not PointUnobservable, which by construction carries none) at the open epoch's own point, the
+// epoch closes "rejected" — a hard safety limit is a definitive verdict about the candidate, not a
+// change of subject — and the epoch's ID is returned so the caller can bind it to the point record.
+// Otherwise (no record, an unobservable record, or a record at a different point) any open epoch
+// closes "contradicted" and zero is returned.
+func closeCandidateEpoch(tx *sql.Tx, macAddr string, record *OperatingPointRecord, at time.Time) (int64, error) {
+	epoch, err := queryOpenEpoch(tx, macAddr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if record != nil && record.Status != PointUnobservable && epoch.Point == record.Point() {
+		if err := closeEpochRow(tx, epoch.ID, EpochRejected, at); err != nil {
+			return 0, err
+		}
+		return epoch.ID, nil
+	}
+	if err := closeEpochRow(tx, epoch.ID, EpochContradicted, at); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+// EpochShapeForPhase derives the evidence-epoch purpose and required-window count for the phase and
+// hold reason that bootstrap, a pass reset, or a completed mutation already left durable. It replaces
+// the windowCount derivation that used to live in mutation.go. The bool result is false when the
+// phase and reason combination warrants no epoch (OVERHEAT, or a HOLD reason that is not settling).
+func EpochShapeForPhase(phase OptimizerPhase, reason HoldReason) (EpochPurpose, int, bool) {
+	switch phase {
+	case PhaseBaseline:
+		return EpochBaseline, 2, true
+	case PhaseUndervolt, PhaseFrequencyTest, PhaseVoltageTest:
+		return EpochTrial, 2, true
+	case PhaseCooldown:
+		return EpochSafetyValidation, 1, true
+	case PhaseHold:
+		if reason == HoldOptimized || reason == HoldManual {
+			return EpochHoldValidation, 1, true
+		}
+		return "", 0, false
+	default:
+		return "", 0, false
+	}
+}
+
+func validEpochPurpose(purpose EpochPurpose) bool {
+	switch purpose {
+	case EpochBaseline, EpochTrial, EpochHoldValidation, EpochSafetyValidation, EpochProbation:
+		return true
+	default:
+		return false
+	}
+}
+
+func validEpochOutcome(outcome EpochOutcome) bool {
+	switch outcome {
+	case EpochOpen, EpochValidated, EpochRejected, EpochStarved, EpochContradicted:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateEvidenceEpoch is modeled on validateMutationAttempt: an exhaustiveness and shape check
+// applied at every decode and durable-load path, not only on write.
+func validateEvidenceEpoch(epoch EvidenceEpoch, requireID bool) error {
+	normalizedMAC, macErr := normalizeMAC(epoch.MacAddr)
+	switch {
+	case requireID && epoch.ID <= 0:
+		return fmt.Errorf("ID must be positive")
+	case !requireID && epoch.ID != 0:
+		return fmt.Errorf("ID must be zero before insertion")
+	case macErr != nil || normalizedMAC != epoch.MacAddr:
+		return fmt.Errorf("MAC address is invalid or non-canonical")
+	case !validStoredPoint(epoch.Point) || !validCanonicalPoint(epoch.Point):
+		return fmt.Errorf("epoch operating point is invalid")
+	case !validEpochPurpose(epoch.Purpose):
+		return fmt.Errorf("epoch purpose %q is invalid", epoch.Purpose)
+	case epoch.RequiredWindows != 1 && epoch.RequiredWindows != 2:
+		return fmt.Errorf("epoch required-window count %d is invalid", epoch.RequiredWindows)
+	case epoch.OpenedAt.IsZero():
+		return fmt.Errorf("epoch has no open timestamp")
+	case epoch.Progress.ClosedWindows() > epoch.RequiredWindows:
+		return fmt.Errorf("epoch closed-window count exceeds its requirement")
+	case !validEpochOutcome(epoch.Outcome):
+		return fmt.Errorf("epoch outcome %q is invalid", epoch.Outcome)
+	case epoch.ClosedAt.IsZero() != (epoch.Outcome == EpochOpen):
+		return fmt.Errorf("epoch close timestamp does not match outcome")
+	case !epoch.ClosedAt.IsZero() && epoch.ClosedAt.Before(epoch.OpenedAt):
+		return fmt.Errorf("epoch close timestamp precedes open timestamp")
+	default:
+		return nil
+	}
+}
+
+// OpenEvidenceEpochFor returns the single open evidence epoch for a miner, if one exists. The open
+// epoch has one representation: a row in evidence_epochs with closed_at = 0, enforced by the
+// evidence_epochs_one_open partial unique index. There is no mirroring optimizer_miners column.
+func (store *OptimizerStore) OpenEvidenceEpochFor(macAddr string) (EvidenceEpoch, bool, error) {
+	if strings.TrimSpace(macAddr) == "" {
+		return EvidenceEpoch{}, false, fmt.Errorf("open evidence epoch: MAC address is empty")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.ready("open evidence epoch"); err != nil {
+		return EvidenceEpoch{}, false, err
+	}
+	epoch, err := queryOpenEpoch(store.conn, macAddr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EvidenceEpoch{}, false, nil
+	}
+	if err != nil {
+		return EvidenceEpoch{}, false, fmt.Errorf("open evidence epoch: %w", err)
+	}
+	if err := validateEvidenceEpoch(epoch, true); err != nil {
+		return EvidenceEpoch{}, false, fmt.Errorf("open evidence epoch: %w", err)
+	}
+	return epoch, true, nil
+}
+
+func applyOpenEpoch(tx *sql.Tx, value OpenEpoch, at time.Time) (TransitionResult, error) {
+	state := value.State
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("open epoch: %w", err)
+	}
+	if state.CurrentPoint() != value.Point {
+		return TransitionResult{}, fmt.Errorf("open epoch: point does not match durable current")
+	}
+	if !validEpochPurpose(value.Purpose) || (value.RequiredWindows != 1 && value.RequiredWindows != 2) {
+		return TransitionResult{}, fmt.Errorf("open epoch: invalid purpose or required-window count")
+	}
+	if _, err := queryOpenEpoch(tx, state.MacAddr); err == nil {
+		return TransitionResult{}, fmt.Errorf("open epoch: miner already has an open epoch")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return TransitionResult{}, fmt.Errorf("open epoch: check existing epoch: %w", err)
+	}
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("open epoch: save miner: %w", err)
+	}
+	if _, err := insertEpoch(tx, state.MacAddr, value.Point, value.Purpose, value.RequiredWindows, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("open epoch: insert: %w", err)
+	}
+	return TransitionResult{State: state}, nil
+}
+
+func applyAdvanceEpoch(tx *sql.Tx, value AdvanceEpoch, at time.Time) (TransitionResult, error) {
+	epoch := value.Epoch
+	progress := value.Progress
+	if epoch.ID <= 0 {
+		return TransitionResult{}, fmt.Errorf("advance epoch: epoch ID must be positive")
+	}
+	current, err := scanEvidenceEpoch(tx.QueryRowContext(context.Background(), evidenceEpochSelect+" WHERE id = ?", epoch.ID))
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("advance epoch: load epoch: %w", err)
+	}
+	if current.MacAddr != epoch.MacAddr || current.Point != epoch.Point || !current.ClosedAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("advance epoch: stale or closed epoch")
+	}
+	if progress.SettledSamples() < current.Progress.SettledSamples() ||
+		progress.ClosedWindows() < current.Progress.ClosedWindows() ||
+		progress.RejectedWindows() < current.Progress.RejectedWindows() ||
+		progress.MissedPolls() < current.Progress.MissedPolls() {
+		return TransitionResult{}, fmt.Errorf("advance epoch: progress is not monotone")
+	}
+	if progress.ClosedWindows() > current.RequiredWindows {
+		return TransitionResult{}, fmt.Errorf("advance epoch: closed-window count exceeds requirement")
+	}
+	if err := updateEpochProgress(tx, epoch.ID, progress); err != nil {
+		return TransitionResult{}, fmt.Errorf("advance epoch: %w", err)
+	}
+	durable, err := queryMiner(tx, epoch.MacAddr)
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("advance epoch: load miner: %w", err)
+	}
+	return TransitionResult{State: durable}, nil
+}
+
+func applyCloseEpoch(tx *sql.Tx, value CloseEpoch, at time.Time) (TransitionResult, error) {
+	state := value.State
+	epoch := value.Epoch
+	if value.Outcome == EpochOpen || !validEpochOutcome(value.Outcome) {
+		return TransitionResult{}, fmt.Errorf("close epoch: invalid outcome %q", value.Outcome)
+	}
+	if epoch.ID <= 0 {
+		return TransitionResult{}, fmt.Errorf("close epoch: epoch ID must be positive")
+	}
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("close epoch: %w", err)
+	}
+	current, err := scanEvidenceEpoch(tx.QueryRowContext(context.Background(), evidenceEpochSelect+" WHERE id = ?", epoch.ID))
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("close epoch: load epoch: %w", err)
+	}
+	if current.MacAddr != state.MacAddr || !current.ClosedAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("close epoch: stale or already-closed epoch")
+	}
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("close epoch: save miner: %w", err)
+	}
+	if err := closeEpochRow(tx, epoch.ID, value.Outcome, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("close epoch: %w", err)
+	}
+	if value.Successor != nil {
+		successor := *value.Successor
+		if successor.State.MacAddr != state.MacAddr || successor.State.CurrentPoint() != successor.Point {
+			return TransitionResult{}, fmt.Errorf("close epoch: successor does not match closed state")
+		}
+		if !validEpochPurpose(successor.Purpose) || (successor.RequiredWindows != 1 && successor.RequiredWindows != 2) {
+			return TransitionResult{}, fmt.Errorf("close epoch: invalid successor purpose or required-window count")
+		}
+		if _, err := insertEpoch(tx, state.MacAddr, successor.Point, successor.Purpose, successor.RequiredWindows, at); err != nil {
+			return TransitionResult{}, fmt.Errorf("close epoch: insert successor: %w", err)
+		}
+	}
+	return TransitionResult{State: state}, nil
+}
+
+// --- End evidence epoch storage and helpers -------------------------------------------------
+
+func applyBootstrap(tx *sql.Tx, value Bootstrap, at time.Time) (TransitionResult, error) {
+	info := value.Info
+	ip := value.IP
+	now := at
+	pairAdvertised := value.PairAdvertised
+	if strings.TrimSpace(info.Hostname) == "" || strings.TrimSpace(info.MacAddr) == "" {
+		return TransitionResult{}, fmt.Errorf("bootstrap miner: hostname and MAC address are required")
+	}
+	if net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil || now.IsZero() {
+		return TransitionResult{}, fmt.Errorf("bootstrap miner: invalid identity, timing, or IP")
+	}
 	state, err := queryMiner(tx, info.MacAddr)
 	if err == nil {
 		changed := state.Hostname != info.Hostname || state.IP != ip
@@ -466,17 +1368,13 @@ func (store *OptimizerStore) BootstrapMiner(
 		state.IP = ip
 		if changed {
 			if err := saveMiner(tx, &state); err != nil {
-				return MinerState{}, false, fmt.Errorf("bootstrap miner: update route: %w", err)
+				return TransitionResult{}, fmt.Errorf("bootstrap miner: update route: %w", err)
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			return MinerState{}, false, fmt.Errorf("bootstrap miner: commit existing miner: %w", err)
-		}
-		rollback = false
-		return state, false, nil
+		return TransitionResult{State: state, Created: false}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: load existing miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("bootstrap miner: load existing miner: %w", err)
 	}
 	passStartedAt := now.UTC()
 	state = MinerState{
@@ -487,8 +1385,6 @@ func (store *OptimizerStore) BootstrapMiner(
 		PhaseStartedAt:     passStartedAt,
 		PassStartedAt:      passStartedAt,
 		PassTrigger:        PassInitial,
-		RampUntil:          passStartedAt.Add(rampUp),
-		EvidenceDeadlineAt: passStartedAt.Add(rampUp + 4*evaluationWindow),
 		AccountedThroughAt: passStartedAt,
 	}
 	point := pointFromInfo(info)
@@ -497,22 +1393,26 @@ func (store *OptimizerStore) BootstrapMiner(
 		state.Phase = PhaseOverheat
 		state.OverheatCount = 1
 		state.SafetyReason = SafetyReasonFirmwareOverheat
-		state.EvidenceDeadlineAt = time.Time{}
 	} else if pairAdvertised && validCanonicalPoint(point) {
 		state.SetCurrentPoint(point)
 		state.SetBestPoint(OperatingPoint{})
 	} else if validStoredPoint(point) {
+		// The device is running a valid but off-grid or unadvertised pair: the controller can see
+		// it, it just cannot ever automate it (AGENTS.md: "off-grid manual points may be observed,
+		// but must never become automated request targets"). That is a real, terminal conclusion
+		// about this hardware, not an environment failure — HoldRejected, not HoldStarved.
 		state.SetCurrentPoint(point)
 		state.Phase = PhaseHold
-		state.HoldReason = HoldBlocked
-		state.EvidenceDeadlineAt = time.Time{}
+		state.HoldReason = HoldRejected
 	} else {
+		// Not even a plausible stored point: there is nothing to classify or automate here either,
+		// and no evidence epoch was ever opened for it. Terminal until an operator retune, same as
+		// the off-grid case above.
 		state.Phase = PhaseHold
-		state.HoldReason = HoldBlocked
-		state.EvidenceDeadlineAt = time.Time{}
+		state.HoldReason = HoldRejected
 	}
 	if err := saveMiner(tx, &state); err != nil {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: save state: %w", err)
+		return TransitionResult{}, fmt.Errorf("bootstrap miner: save state: %w", err)
 	}
 	if !emergency && state.Phase == PhaseBaseline && validCanonicalPoint(point) {
 		if err := insertPoint(tx, OperatingPointRecord{
@@ -522,81 +1422,38 @@ func (store *OptimizerStore) BootstrapMiner(
 			Status:      PointEntered,
 			EnteredAt:   passStartedAt,
 		}); err != nil {
-			return MinerState{}, false, fmt.Errorf("bootstrap miner: insert baseline: %w", err)
+			return TransitionResult{}, fmt.Errorf("bootstrap miner: insert baseline: %w", err)
+		}
+		if _, err := insertEpoch(tx, state.MacAddr, point, EpochBaseline, 2, passStartedAt); err != nil {
+			return TransitionResult{}, fmt.Errorf("bootstrap miner: open baseline epoch: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return MinerState{}, false, fmt.Errorf("bootstrap miner: commit new miner: %w", err)
-	}
-	rollback = false
-	return state, true, nil
+	return TransitionResult{State: state, Created: true}, nil
 }
 
-// ResetOptimizationPass atomically deletes the selected miner's prior point
-// summaries and starts the one explicitly authorized operator pass. The
-// mutation coordinator's lock is the qualification boundary: it holds the
-// validated live observation while this serialized store transaction
-// rechecks durable HOLD/current/attempt state. The mutation history and hourly
-// accounting cursor remain untouched.
-func (store *OptimizerStore) ResetOptimizationPass(
-	macAddr string,
-	point OperatingPoint,
-	startedAt time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	return store.resetOptimizationPass(
-		macAddr,
-		point,
-		PassOperator,
-		startedAt,
-		rampUntil,
-		evidenceDeadlineAt,
-	)
-}
-
-func (store *OptimizerStore) resetOptimizationPass(
-	macAddr string,
-	point OperatingPoint,
-	trigger PassTrigger,
-	startedAt time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
+func applyResetPass(tx *sql.Tx, value ResetPass, at time.Time) (TransitionResult, error) {
+	macAddr := value.MacAddr
+	point := value.Point
+	trigger := PassOperator
+	startedAt := at
 	if strings.TrimSpace(macAddr) == "" || !validCanonicalPoint(point) {
-		return fmt.Errorf("start optimization pass: invalid miner or operating point")
+		return TransitionResult{}, fmt.Errorf("start optimization pass: invalid miner or operating point")
 	}
-	if !validPassTrigger(trigger) || startedAt.IsZero() || rampUntil.IsZero() ||
-		evidenceDeadlineAt.IsZero() || evidenceDeadlineAt.Before(rampUntil) {
-		return fmt.Errorf("start optimization pass: invalid pass timing or reference")
+	if !validPassTrigger(trigger) || startedAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("start optimization pass: invalid pass timing or reference")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("start optimization pass"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("start optimization pass: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	state, err := queryMiner(tx, macAddr)
 	if err != nil {
-		return fmt.Errorf("start optimization pass: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("start optimization pass: load miner: %w", err)
 	}
 	if state.PendingKind != "" || state.MiningPending {
-		return fmt.Errorf("start optimization pass: miner has pending mutation work")
+		return TransitionResult{}, fmt.Errorf("start optimization pass: miner has pending mutation work")
 	}
-	if state.Phase != PhaseHold || state.HoldReason == HoldBlocked || state.SettledAt.IsZero() {
-		return fmt.Errorf("start optimization pass: miner is not settled in HOLD")
+	if state.Phase != PhaseHold || state.HoldReason == HoldRejected || state.SettledAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("start optimization pass: miner is not settled in HOLD")
 	}
 	if state.CurrentPoint() != point {
-		return fmt.Errorf("start optimization pass: current point changed")
+		return TransitionResult{}, fmt.Errorf("start optimization pass: current point changed")
 	}
 	passReferenceHash := 0.0
 	passReferencePoint := OperatingPoint{}
@@ -605,10 +1462,10 @@ func (store *OptimizerStore) resetOptimizationPass(
 	if err := tx.QueryRowContext(context.Background(),
 		`SELECT COUNT(*) FROM mutation_attempts
 		 WHERE mac_addr = ? AND failed_at = 0 AND mining_resumed_at = 0`, macAddr).Scan(&unfinished); err != nil {
-		return fmt.Errorf("start optimization pass: check mutation attempts: %w", err)
+		return TransitionResult{}, fmt.Errorf("start optimization pass: check mutation attempts: %w", err)
 	}
 	if unfinished != 0 {
-		return fmt.Errorf("start optimization pass: unfinished mutation attempt exists")
+		return TransitionResult{}, fmt.Errorf("start optimization pass: unfinished mutation attempt exists")
 	}
 	if state.HoldReason == HoldOptimized {
 		var status string
@@ -617,13 +1474,13 @@ func (store *OptimizerStore) resetOptimizationPass(
 			FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
 			macAddr, point.Frequency, point.CoreVoltage).Scan(&status, &medianHash)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("start optimization pass: optimized hold has no selected point")
+			return TransitionResult{}, fmt.Errorf("start optimization pass: optimized hold has no selected point")
 		}
 		if err != nil {
-			return fmt.Errorf("start optimization pass: load selected point: %w", err)
+			return TransitionResult{}, fmt.Errorf("start optimization pass: load selected point: %w", err)
 		}
-		if status != PointValidated || !finite(medianHash) || medianHash <= 0 {
-			return fmt.Errorf("start optimization pass: optimized hold has no validated current selection")
+		if PointStatus(status) != PointValidated || !finite(medianHash) || medianHash <= 0 {
+			return TransitionResult{}, fmt.Errorf("start optimization pass: optimized hold has no validated current selection")
 		}
 		passReferenceHash = medianHash
 		passReferencePoint = point
@@ -631,7 +1488,7 @@ func (store *OptimizerStore) resetOptimizationPass(
 	}
 	if _, err := tx.ExecContext(context.Background(),
 		"DELETE FROM operating_points WHERE mac_addr = ?", macAddr); err != nil {
-		return fmt.Errorf("start optimization pass: delete point history: %w", err)
+		return TransitionResult{}, fmt.Errorf("start optimization pass: delete point history: %w", err)
 	}
 	state.SetCurrentPoint(point)
 	state.SetBestPoint(OperatingPoint{})
@@ -641,7 +1498,6 @@ func (store *OptimizerStore) resetOptimizationPass(
 	state.ObservedFrequency = 0
 	state.ObservedCoreVoltage = 0
 	state.ObservedCount = 0
-	state.ConsecutiveBadWindows = 0
 	state.PassStartedAt = startedAt
 	state.PassTrigger = trigger
 	state.PassReferenceHash = passReferenceHash
@@ -651,12 +1507,10 @@ func (store *OptimizerStore) resetOptimizationPass(
 	state.SafetyReason = ""
 	state.HoldReason = ""
 	state.SettledAt = time.Time{}
-	state.EvidenceDeadlineAt = evidenceDeadlineAt
 	state.Phase = PhaseBaseline
 	state.PhaseStartedAt = startedAt
-	state.RampUntil = rampUntil
 	if err := saveMinerForPassReset(tx, &state); err != nil {
-		return fmt.Errorf("start optimization pass: save miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("start optimization pass: save miner: %w", err)
 	}
 	baseline := OperatingPointRecord{
 		MacAddr:     macAddr,
@@ -666,13 +1520,12 @@ func (store *OptimizerStore) resetOptimizationPass(
 		EnteredAt:   startedAt,
 	}
 	if err := insertPoint(tx, baseline); err != nil {
-		return fmt.Errorf("start optimization pass: insert baseline: %w", err)
+		return TransitionResult{}, fmt.Errorf("start optimization pass: insert baseline: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("start optimization pass: commit: %w", err)
+	if _, err := insertEpoch(tx, macAddr, point, EpochBaseline, 2, startedAt); err != nil {
+		return TransitionResult{}, fmt.Errorf("start optimization pass: open baseline epoch: %w", err)
 	}
-	rollback = false
-	return nil
+	return TransitionResult{State: state}, nil
 }
 
 // TrialDecision is the one atomic state transition after a candidate window.
@@ -684,7 +1537,7 @@ const (
 	TrialBlock   TrialDecision = "block"
 )
 
-func validateTrialDecision(status string, decision TrialDecision) error {
+func validateTrialDecision(status PointStatus, decision TrialDecision) error {
 	switch decision {
 	case TrialPromote:
 		if status != PointValidated {
@@ -700,68 +1553,52 @@ func validateTrialDecision(status string, decision TrialDecision) error {
 	return nil
 }
 
-// AdmitTrial consumes a previously unseen candidate and persists its pending
-// hardware intent, entry attempt, fallback incumbent, and trial phase in one
-// transaction. The row insertion is the eligibility decision: a duplicate
-// candidate cannot be admitted again in the same pass.
-func (store *OptimizerStore) AdmitTrial(
-	state *MinerState,
-	candidate OperatingPoint,
-	incumbent OperatingPoint,
-	phase OptimizerPhase,
-	referenceHash float64,
-	enteredAt time.Time,
-	evidenceDeadlineAt time.Time,
-) (int64, error) {
-	if state == nil {
-		return 0, fmt.Errorf("admit trial: state is nil")
+func applyAdmitTrial(tx *sql.Tx, value AdmitTrial, at time.Time) (TransitionResult, error) {
+	macAddr := value.MacAddr
+	candidate := value.Candidate
+	incumbent := value.Incumbent
+	phase := value.Phase
+	referenceHash := value.ReferenceHash
+	enteredAt := at
+	if strings.TrimSpace(macAddr) == "" {
+		return TransitionResult{}, fmt.Errorf("admit trial: MAC address is required")
 	}
 	if !validCanonicalPoint(candidate) || !validCanonicalPoint(incumbent) || candidate == incumbent ||
 		(phase != PhaseUndervolt && phase != PhaseFrequencyTest && phase != PhaseVoltageTest) ||
-		!finite(referenceHash) || referenceHash <= 0 || enteredAt.IsZero() || evidenceDeadlineAt.IsZero() {
-		return 0, fmt.Errorf("admit trial: invalid candidate, incumbent, phase, or evidence timing")
+		!finite(referenceHash) || referenceHash <= 0 || enteredAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("admit trial: invalid candidate, incumbent, phase, or evidence timing")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("admit trial"); err != nil {
-		return 0, err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
+	durable, err := queryMiner(tx, macAddr)
 	if err != nil {
-		return 0, fmt.Errorf("admit trial: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
-	durable, err := queryMiner(tx, state.MacAddr)
-	if err != nil {
-		return 0, fmt.Errorf("admit trial: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: load miner: %w", err)
 	}
 	if count, countErr := unfinishedMutationCount(tx, durable.MacAddr); countErr != nil {
-		return 0, fmt.Errorf("admit trial: check mutation authority: %w", countErr)
+		return TransitionResult{}, fmt.Errorf("admit trial: check mutation authority: %w", countErr)
 	} else if count != 0 {
-		return 0, fmt.Errorf("admit trial: unfinished mutation attempt exists")
+		return TransitionResult{}, fmt.Errorf("admit trial: unfinished mutation attempt exists")
 	}
 	if durable.CurrentPoint() != incumbent || durable.FallbackPoint() != (OperatingPoint{}) ||
 		durable.PendingKind != "" || durable.Phase == PhaseOverheat ||
 		durable.Phase == PhaseCooldown || durable.HoldReason != "" {
-		return 0, fmt.Errorf("admit trial: durable incumbent is not established")
+		return TransitionResult{}, fmt.Errorf("admit trial: durable incumbent is not established")
+	}
+	if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
+		return TransitionResult{}, fmt.Errorf("admit trial: an evidence epoch is still open")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return TransitionResult{}, fmt.Errorf("admit trial: check open epoch: %w", err)
 	}
 	if !finite(durable.BestHashRate) || durable.BestHashRate <= 0 || referenceHash != durable.BestHashRate {
-		return 0, fmt.Errorf("admit trial: frozen reference does not match durable pass maximum")
+		return TransitionResult{}, fmt.Errorf("admit trial: frozen reference does not match durable pass maximum")
 	}
 	var exists int
 	err = tx.QueryRowContext(context.Background(),
 		`SELECT 1 FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
 		durable.MacAddr, candidate.Frequency, candidate.CoreVoltage).Scan(&exists)
 	if err == nil {
-		return 0, fmt.Errorf("admit trial: candidate was already entered")
+		return TransitionResult{}, fmt.Errorf("admit trial: candidate was already entered")
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("admit trial: check candidate: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: check candidate: %w", err)
 	}
 	entry := OperatingPointRecord{
 		MacAddr:       durable.MacAddr,
@@ -772,7 +1609,7 @@ func (store *OptimizerStore) AdmitTrial(
 		ReferenceHash: referenceHash,
 	}
 	if err := insertPoint(tx, entry); err != nil {
-		return 0, fmt.Errorf("admit trial: insert candidate: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: insert candidate: %w", err)
 	}
 	attempt := MutationAttempt{
 		MacAddr:                         durable.MacAddr,
@@ -786,7 +1623,7 @@ func (store *OptimizerStore) AdmitTrial(
 		ConfiguredVerifiedUptimeSeconds: -1,
 	}
 	if err := validateMutationAttempt(attempt, false); err != nil {
-		return 0, fmt.Errorf("admit trial: validate attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: validate attempt: %w", err)
 	}
 	result, err := tx.ExecContext(context.Background(),
 		`INSERT INTO mutation_attempts (
@@ -802,156 +1639,134 @@ func (store *OptimizerStore) AdmitTrial(
 		timeValue(attempt.IntentCreatedAt), timeValue(attempt.StartedAt),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("admit trial: insert entry attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: insert entry attempt: %w", err)
 	}
 	attemptID, err := result.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("admit trial: read entry attempt ID: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: read entry attempt ID: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(),
 		`UPDATE operating_points SET entry_attempt_id = ?
 		 WHERE mac_addr = ? AND frequency = ? AND core_voltage = ? AND entry_attempt_id = 0`,
 		attemptID, durable.MacAddr, candidate.Frequency, candidate.CoreVoltage); err != nil {
-		return 0, fmt.Errorf("admit trial: bind entry attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: bind entry attempt: %w", err)
 	}
 	durable.SetFallbackPoint(incumbent)
 	durable.SetPendingMutation(MutationOperatingPoint, candidate, enteredAt)
 	durable.Phase = phase
 	durable.PhaseStartedAt = enteredAt
-	durable.RampUntil = time.Time{}
-	// A pending hardware mutation has no evidence deadline. The supplied
-	// deadline is applied atomically when verified mining resumes.
-	durable.EvidenceDeadlineAt = time.Time{}
+	// A pending hardware mutation has no evidence epoch. CompleteResume opens
+	// one once two healthy polls prove the candidate is the running configuration.
 	durable.SettledAt = time.Time{}
 	durable.HoldReason = ""
 	durable.ObservedFrequency = 0
 	durable.ObservedCoreVoltage = 0
 	durable.ObservedCount = 0
-	durable.ConsecutiveBadWindows = 0
 	if err := saveMiner(tx, &durable); err != nil {
-		return 0, fmt.Errorf("admit trial: save miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("admit trial: save miner: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("admit trial: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return attemptID, nil
+	return TransitionResult{State: durable, AttemptID: attemptID}, nil
 }
 
-// FinalizeTrial writes terminal evidence for an entered candidate and
-// atomically either reserves its incumbent return, promotes the candidate, or
-// blocks the pass.
-func (store *OptimizerStore) FinalizeTrial(
-	state *MinerState,
-	record OperatingPointRecord,
-	decision TrialDecision,
-	now time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	if state == nil || record.Status == PointEntered || record.EntryAttemptID <= 0 || now.IsZero() {
-		return fmt.Errorf("finalize trial: invalid state or terminal record")
+func applyFinalizeTrial(tx *sql.Tx, value FinalizeTrial, at time.Time) (TransitionResult, error) {
+	state := value.State
+	record := value.Record
+	decision := value.Decision
+	now := at
+	if record.Status == PointEntered || record.EntryAttemptID <= 0 || now.IsZero() {
+		return TransitionResult{}, fmt.Errorf("finalize trial: invalid state or terminal record")
 	}
 	if decision != TrialPromote && decision != TrialReturn && decision != TrialBlock {
-		return fmt.Errorf("finalize trial: invalid decision %q", decision)
+		return TransitionResult{}, fmt.Errorf("finalize trial: invalid decision %q", decision)
 	}
 	if err := validateTrialDecision(record.Status, decision); err != nil {
-		return fmt.Errorf("finalize trial: %w", err)
+		return TransitionResult{}, fmt.Errorf("finalize trial: %w", err)
 	}
-	if err := validatePointRecord(record); err != nil {
-		return fmt.Errorf("finalize trial: %w", err)
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("finalize trial"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("finalize trial: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
+	// record.EvidenceEpochID is not yet assigned here (finalizeTrialTx assigns it from the closing
+	// epoch before writing), so full validatePointRecord validation happens there instead of here.
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("finalize trial: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("finalize trial: load miner: %w", err)
 	}
 	attempt, err := queryMutationAttempt(tx, record.EntryAttemptID)
 	if err != nil {
-		return fmt.Errorf("finalize trial: load entry attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("finalize trial: load entry attempt: %w", err)
 	}
 	if attempt.MacAddr != durable.MacAddr || attempt.Kind != MutationOperatingPoint ||
 		attempt.TargetPoint() != record.Point() || !attempt.FailedAt.IsZero() || attempt.MiningResumedAt.IsZero() {
-		return fmt.Errorf("finalize trial: candidate has not completed healthy mutation resumption")
+		return TransitionResult{}, fmt.Errorf("finalize trial: candidate has not completed healthy mutation resumption")
 	}
 	if durable.CurrentPoint() != state.CurrentPoint() ||
 		durable.FallbackPoint() != state.FallbackPoint() {
-		return fmt.Errorf("finalize trial: stale miner state")
+		return TransitionResult{}, fmt.Errorf("finalize trial: stale miner state")
 	}
-	if err := finalizeTrialTx(tx, &durable, record, decision, now, rampUntil, evidenceDeadlineAt); err != nil {
-		return fmt.Errorf("finalize trial: %w", err)
+	if err := finalizeTrialTx(tx, &durable, record, decision, now, value.Epoch); err != nil {
+		return TransitionResult{}, fmt.Errorf("finalize trial: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("finalize trial: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
+// finalizeTrialTx writes the terminal measurement over the reserved entered row, closes the trial
+// epoch that produced it in the same transaction (validated when the point was promoted, rejected
+// otherwise), and applies the promote/return/block consequence. It is shared by applyFinalizeTrial
+// and applyFailMutationFinalizeTrial, the two paths that can end a trial.
 func finalizeTrialTx(
 	tx *sql.Tx,
 	durable *MinerState,
 	record OperatingPointRecord,
 	decision TrialDecision,
 	now time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
+	epoch EvidenceEpoch,
 ) error {
 	if record.MacAddr != durable.MacAddr ||
 		(durable.PendingKind == MutationOperatingPoint && durable.PendingPoint() != record.Point()) {
 		return fmt.Errorf("record is not the durable trial target")
 	}
-	var current OperatingPointRecord
-	var errorPercent sql.NullFloat64
-	var measuredAt, enteredAt int64
-	if err := tx.QueryRowContext(context.Background(), `SELECT
-		mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
-		attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
-		accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id,
-		reference_hash FROM operating_points WHERE mac_addr = ? AND frequency = ?
-		AND core_voltage = ?`, record.MacAddr, record.Frequency, record.CoreVoltage).Scan(
-		&current.MacAddr, &current.Frequency, &current.CoreVoltage, &current.Status,
-		&current.MedianHash, &current.ExpectedHash, &current.Attainment,
-		&current.MeanTemp, &current.P95Temp, &current.P95VRTemp, &current.P95Power,
-		&errorPercent, &current.AcceptedDelta, &current.RejectedDelta,
-		&measuredAt, &enteredAt, &current.EntryAttemptID, &current.ReferenceHash,
-	); err != nil {
+	current, err := loadOperatingPoint(tx, record.MacAddr, record.Point())
+	if err != nil {
 		return fmt.Errorf("load point: %w", err)
 	}
-	current.MeasuredAt = storedTime(measuredAt)
-	current.EnteredAt = storedTime(enteredAt)
 	if current.Status != PointEntered || current.EntryAttemptID != record.EntryAttemptID ||
 		!current.EnteredAt.Equal(record.EnteredAt) ||
 		current.ReferenceHash != record.ReferenceHash {
 		return fmt.Errorf("point is not the reserved entered row")
 	}
-	if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-		status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
-		p95_temp = ?, p95_vr_temp = ?, p95_power = ?, error_percent = ?,
-		accepted_delta = ?, rejected_delta = ?, measured_at = ?
-		WHERE mac_addr = ? AND frequency = ? AND core_voltage = ? AND status = ?`,
-		record.Status, record.MedianHash, record.ExpectedHash, record.Attainment,
-		record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power,
-		nullableFloat(record.ErrorPercent), record.AcceptedDelta, record.RejectedDelta,
-		timeValue(record.MeasuredAt), record.MacAddr, record.Frequency,
-		record.CoreVoltage, PointEntered); err != nil {
+	// epoch.ID == 0 means the candidate's trial epoch was never opened: CompleteResume opens it only
+	// once two healthy polls confirm the candidate is the running configuration, so a mining-resume
+	// failure can reach here first. In that case there is nothing to close; the record is still
+	// written, with no evidence_epoch_id (see validatePointRecord's candidate-row exemption).
+	if epoch.ID > 0 {
+		if epoch.MacAddr != record.MacAddr || epoch.Point != record.Point() {
+			return fmt.Errorf("epoch does not match the trial target")
+		}
+		storedEpoch, err := scanEvidenceEpoch(tx.QueryRowContext(context.Background(), evidenceEpochSelect+" WHERE id = ?", epoch.ID))
+		if err != nil {
+			return fmt.Errorf("load epoch: %w", err)
+		}
+		if storedEpoch.MacAddr != record.MacAddr || storedEpoch.Point != record.Point() || !storedEpoch.ClosedAt.IsZero() {
+			return fmt.Errorf("epoch is stale or already closed")
+		}
+		record.EvidenceEpochID = epoch.ID
+		if record.Status == PointUnobservable || record.Status == PointStarved {
+			record.EvidenceEpochID = 0
+		}
+	} else {
+		record.EvidenceEpochID = 0
+	}
+	if err := updateOperatingPoint(tx, record); err != nil {
 		return fmt.Errorf("update point: %w", err)
+	}
+	if epoch.ID > 0 {
+		epochOutcome := EpochRejected
+		switch record.Status {
+		case PointValidated:
+			epochOutcome = EpochValidated
+		case PointStarved:
+			epochOutcome = EpochStarved
+		}
+		if err := closeEpochRow(tx, epoch.ID, epochOutcome, now); err != nil {
+			return fmt.Errorf("close epoch: %w", err)
+		}
 	}
 	switch decision {
 	case TrialPromote:
@@ -964,8 +1779,6 @@ func finalizeTrialTx(
 		durable.ClearPendingMutation()
 		durable.Phase = PhaseBaseline
 		durable.PhaseStartedAt = now
-		durable.RampUntil = rampUntil
-		durable.EvidenceDeadlineAt = evidenceDeadlineAt
 		durable.HoldReason = ""
 		durable.SettledAt = time.Time{}
 	case TrialReturn:
@@ -979,192 +1792,159 @@ func finalizeTrialTx(
 			durable.SetFallbackPoint(OperatingPoint{})
 			durable.Phase = PhaseBaseline
 			durable.PhaseStartedAt = now
-			durable.RampUntil = rampUntil
-			durable.EvidenceDeadlineAt = evidenceDeadlineAt
 			durable.SettledAt = time.Time{}
 		} else {
 			durable.SetPendingMutation(MutationOperatingPoint, returnPoint, now)
-			durable.EvidenceDeadlineAt = time.Time{}
 			durable.SettledAt = time.Time{}
 		}
 	case TrialBlock:
+		// No current caller constructs TrialBlock (every real trial failure uses TrialReturn), but
+		// the decision is measured-and-terminal by construction (validateTrialDecision rejects a
+		// PointValidated record here), so it takes the same terminal reason as every other
+		// measured trial or baseline conclusion.
 		durable.ClearPendingMutation()
 		durable.SetFallbackPoint(OperatingPoint{})
 		durable.Phase = PhaseHold
-		durable.HoldReason = HoldBlocked
+		durable.HoldReason = HoldRejected
 		durable.SettledAt = time.Time{}
-		durable.EvidenceDeadlineAt = time.Time{}
 	default:
 		return fmt.Errorf("invalid trial decision %q", decision)
 	}
 	return saveMiner(tx, durable)
 }
 
-// FailMutationAndFinalizeTrial atomically closes a failed operating-point
-// attempt, finalizes its candidate evidence, and applies the reserved return
-// or blocked state. It is the terminal boundary for entry and resume failure.
-func (store *OptimizerStore) FailMutationAndFinalizeTrial(
-	state *MinerState,
-	record OperatingPointRecord,
-	decision TrialDecision,
-	id int64,
-	stage MutationFailureStage,
-	now time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	if state == nil || id <= 0 || now.IsZero() || stage == "" {
-		return fmt.Errorf("fail mutation and finalize trial: invalid state or timing")
+func applyFailMutationFinalizeTrial(tx *sql.Tx, value FailMutationFinalizeTrial, at time.Time) (TransitionResult, error) {
+	state := value.State
+	record := value.Record
+	decision := value.Decision
+	id := value.AttemptID
+	stage := value.Stage
+	now := at
+	if id <= 0 || now.IsZero() || stage == "" {
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: invalid state or timing")
 	}
 	if err := validateTrialDecision(record.Status, decision); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: %w", err)
 	}
-	if err := validatePointRecord(record); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: %w", err)
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("fail mutation and finalize trial"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
+	// record.EvidenceEpochID is assigned inside finalizeTrialTx before it is validated and written.
 	attempt, err := queryMutationAttempt(tx, id)
 	if err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: load attempt: %w", err)
 	}
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: load miner: %w", err)
 	}
 	if attempt.MacAddr != durable.MacAddr || attempt.Kind != MutationOperatingPoint {
-		return fmt.Errorf("fail mutation and finalize trial: attempt does not belong to operating-point trial")
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: attempt does not belong to operating-point trial")
 	}
 	if record.EntryAttemptID != id || record.Point() != attempt.TargetPoint() {
-		return fmt.Errorf("fail mutation and finalize trial: record does not belong to attempt")
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: record does not belong to attempt")
 	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage != stage {
-			return fmt.Errorf("fail mutation and finalize trial: attempt already failed at %q", attempt.FailureStage)
+			return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: attempt already failed at %q", attempt.FailureStage)
 		}
 		if !attempt.FailedAt.Equal(now) {
-			return fmt.Errorf("fail mutation and finalize trial: failure timestamp conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: failure timestamp conflicts with stored value")
 		}
-		*state = durable
-		return nil
+		return TransitionResult{State: durable}, nil
 	}
 	if durable.CurrentPoint() != state.CurrentPoint() || durable.FallbackPoint() != state.FallbackPoint() ||
 		durable.AccountedThroughAt != state.AccountedThroughAt {
-		return fmt.Errorf("fail mutation and finalize trial: stale miner state")
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: stale miner state")
 	}
-	if err := finalizeTrialTx(tx, &durable, record, decision, now, rampUntil, evidenceDeadlineAt); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: %w", err)
+	if err := finalizeTrialTx(tx, &durable, record, decision, now, value.Epoch); err != nil {
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: %w", err)
 	}
 	attempt.FailedAt = now
 	attempt.FailureStage = stage
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
 		SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
 		timeValue(now), stage, id); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: close attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and finalize trial: close attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("fail mutation and finalize trial: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
-// FinalizeBaseline atomically closes the pass bootstrap row and updates the
-// incumbent state. A rejected baseline enters blocked HOLD; it never creates a
-// speculative exploration fallback.
-func (store *OptimizerStore) FinalizeBaseline(
-	state *MinerState,
-	record OperatingPointRecord,
-	block bool,
-	now time.Time,
-) error {
-	if state == nil || record.Status == PointEntered || record.EntryAttemptID != 0 || now.IsZero() {
-		return fmt.Errorf("finalize baseline: invalid state or record")
+func applyFinalizeBaseline(tx *sql.Tx, value FinalizeBaseline, at time.Time) (TransitionResult, error) {
+	state := value.State
+	record := value.Record
+	block := value.Block
+	now := at
+	if record.Status == PointEntered || record.EntryAttemptID != 0 || now.IsZero() {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: invalid state or record")
 	}
-	if err := validatePointRecord(record); err != nil {
-		return fmt.Errorf("finalize baseline: %w", err)
+	// A starved baseline outcome has one path: starveBaseline closes the epoch directly (no
+	// record) and opens the required probation successor in the same transaction. This transition
+	// has no successor-opening step, so accepting PointStarved here would produce a starved HOLD
+	// with no open probation epoch — a state validateCrossTableState correctly rejects. Refuse it
+	// explicitly rather than silently producing an invalid state.
+	if record.Status == PointStarved {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: starved outcome must go through starveBaseline, not a record")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("finalize baseline"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("finalize baseline: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
+	// record.EvidenceEpochID is not yet assigned here; it is set below from the closing epoch and
+	// validated (via updateOperatingPoint's internal validatePointRecord call) at that point.
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("finalize baseline: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("finalize baseline: load miner: %w", err)
 	}
 	if count, countErr := unfinishedMutationCount(tx, durable.MacAddr); countErr != nil {
-		return fmt.Errorf("finalize baseline: check mutation authority: %w", countErr)
+		return TransitionResult{}, fmt.Errorf("finalize baseline: check mutation authority: %w", countErr)
 	} else if count != 0 {
-		return fmt.Errorf("finalize baseline: unfinished mutation attempt exists")
+		return TransitionResult{}, fmt.Errorf("finalize baseline: unfinished mutation attempt exists")
 	}
 	if durable.CurrentPoint() != state.CurrentPoint() || durable.PendingKind != "" {
-		return fmt.Errorf("finalize baseline: stale or pending miner state")
+		return TransitionResult{}, fmt.Errorf("finalize baseline: stale or pending miner state")
 	}
 	if record.MacAddr != durable.MacAddr || record.Point() != durable.CurrentPoint() {
-		return fmt.Errorf("finalize baseline: record is not the durable incumbent")
+		return TransitionResult{}, fmt.Errorf("finalize baseline: record is not the durable incumbent")
 	}
-	var status string
-	var storedEnteredAt, storedEntryAttemptID int64
-	var storedReferenceHash float64
-	if err := tx.QueryRowContext(context.Background(),
-		`SELECT status, entered_at, entry_attempt_id, reference_hash
-		FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-		record.MacAddr, record.Frequency, record.CoreVoltage).Scan(
-		&status, &storedEnteredAt, &storedEntryAttemptID, &storedReferenceHash); err != nil {
-		return fmt.Errorf("finalize baseline: load point: %w", err)
+	current, err := loadOperatingPoint(tx, record.MacAddr, record.Point())
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: load point: %w", err)
 	}
-	if status != PointEntered || storedEntryAttemptID != 0 || storedReferenceHash != 0 ||
-		storedEnteredAt != timeValue(durable.PassStartedAt) ||
+	if current.Status != PointEntered || current.EntryAttemptID != 0 || current.ReferenceHash != 0 ||
+		!current.EnteredAt.Equal(durable.PassStartedAt) ||
 		!record.EnteredAt.Equal(durable.PassStartedAt) {
-		return fmt.Errorf("finalize baseline: baseline row does not match the current pass")
+		return TransitionResult{}, fmt.Errorf("finalize baseline: baseline row does not match the current pass")
 	}
-	if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-		status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
-		p95_temp = ?, p95_vr_temp = ?, p95_power = ?, error_percent = ?,
-		accepted_delta = ?, rejected_delta = ?, measured_at = ?
-		WHERE mac_addr = ? AND frequency = ? AND core_voltage = ? AND status = ?`,
-		record.Status, record.MedianHash, record.ExpectedHash, record.Attainment,
-		record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power,
-		nullableFloat(record.ErrorPercent), record.AcceptedDelta, record.RejectedDelta,
-		timeValue(record.MeasuredAt), record.MacAddr, record.Frequency,
-		record.CoreVoltage, PointEntered); err != nil {
-		return fmt.Errorf("finalize baseline: update point: %w", err)
+	epoch := value.Epoch
+	if epoch.ID <= 0 || epoch.MacAddr != record.MacAddr || epoch.Point != record.Point() {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: epoch does not match the baseline target")
+	}
+	storedEpoch, err := scanEvidenceEpoch(tx.QueryRowContext(context.Background(), evidenceEpochSelect+" WHERE id = ?", epoch.ID))
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: load epoch: %w", err)
+	}
+	if storedEpoch.MacAddr != record.MacAddr || storedEpoch.Point != record.Point() || !storedEpoch.ClosedAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: epoch is stale or already closed")
+	}
+	record.EvidenceEpochID = epoch.ID
+	if record.Status == PointUnobservable || record.Status == PointStarved {
+		record.EvidenceEpochID = 0
+	}
+	if err := updateOperatingPoint(tx, record); err != nil {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: update point: %w", err)
+	}
+	// record.Status is never PointStarved here (rejected above), so this stays the two-way choice
+	// FinalizeBaseline has always made: a real measurement either passed quality or it didn't.
+	epochOutcome := EpochRejected
+	if record.Status == PointValidated {
+		epochOutcome = EpochValidated
+	}
+	if err := closeEpochRow(tx, epoch.ID, epochOutcome, now); err != nil {
+		return TransitionResult{}, fmt.Errorf("finalize baseline: close epoch: %w", err)
 	}
 	if block {
 		durable.SetBestPoint(OperatingPoint{})
 		durable.BestHashRate = 0
 		durable.Phase = PhaseHold
-		durable.HoldReason = HoldBlocked
+		durable.HoldReason = HoldRejected
 		durable.SettledAt = time.Time{}
-		durable.EvidenceDeadlineAt = time.Time{}
 	} else {
 		if durable.PassTrigger == PassInitial && durable.PassReferenceHash == 0 && record.MedianHash > 0 {
 			durable.PassReferenceHash = record.MedianHash
@@ -1175,7 +1955,6 @@ func (store *OptimizerStore) FinalizeBaseline(
 		}
 		if durable.Phase == PhaseHold && durable.HoldReason == HoldManual {
 			durable.SettledAt = now
-			durable.EvidenceDeadlineAt = time.Time{}
 		} else {
 			durable.Phase = PhaseBaseline
 			durable.HoldReason = ""
@@ -1183,56 +1962,35 @@ func (store *OptimizerStore) FinalizeBaseline(
 		}
 	}
 	if err := saveMiner(tx, &durable); err != nil {
-		return fmt.Errorf("finalize baseline: save miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("finalize baseline: save miner: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("finalize baseline: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
-// AdoptManualPoint records a confirmed external complete pair and starts a
-// fresh baseline window without authorizing hardware or deleting history.
-func (store *OptimizerStore) AdoptManualPoint(
-	state *MinerState,
-	point OperatingPoint,
-	enteredAt time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	if state == nil || !validStoredPoint(point) || point.Frequency == 50 || enteredAt.IsZero() ||
-		rampUntil.IsZero() || evidenceDeadlineAt.IsZero() || evidenceDeadlineAt.Before(rampUntil) {
-		return fmt.Errorf("adopt manual point: invalid point or timing")
+func applyAdoptManualPoint(tx *sql.Tx, value AdoptManualPoint, at time.Time) (TransitionResult, error) {
+	macAddr := value.MacAddr
+	point := value.Point
+	enteredAt := at
+	if !validStoredPoint(point) || point.Frequency == 50 || enteredAt.IsZero() {
+		return TransitionResult{}, fmt.Errorf("adopt manual point: invalid point or timing")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("adopt manual point"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
+	durable, err := queryMiner(tx, macAddr)
 	if err != nil {
-		return fmt.Errorf("adopt manual point: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
-	durable, err := queryMiner(tx, state.MacAddr)
-	if err != nil {
-		return fmt.Errorf("adopt manual point: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt manual point: load miner: %w", err)
 	}
 	if count, countErr := unfinishedMutationCount(tx, durable.MacAddr); countErr != nil {
-		return fmt.Errorf("adopt manual point: check mutation authority: %w", countErr)
+		return TransitionResult{}, fmt.Errorf("adopt manual point: check mutation authority: %w", countErr)
 	} else if count != 0 {
-		return fmt.Errorf("adopt manual point: unfinished mutation attempt exists")
+		return TransitionResult{}, fmt.Errorf("adopt manual point: unfinished mutation attempt exists")
 	}
 	if durable.PendingKind != "" || durable.MiningPending || durable.Phase == PhaseOverheat ||
 		durable.Phase == PhaseCooldown || durable.HoldReason == HoldSafety || durable.SafetyReason != "" {
-		return fmt.Errorf("adopt manual point: miner is not in a clean manual-adoption state")
+		return TransitionResult{}, fmt.Errorf("adopt manual point: miner is not in a clean manual-adoption state")
+	}
+	if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
+		return TransitionResult{}, fmt.Errorf("adopt manual point: an evidence epoch is still open")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return TransitionResult{}, fmt.Errorf("adopt manual point: check open epoch: %w", err)
 	}
 	durable.SetCurrentPoint(point)
 	durable.SetFallbackPoint(OperatingPoint{})
@@ -1242,119 +2000,74 @@ func (store *OptimizerStore) AdoptManualPoint(
 	durable.SafetyReason = ""
 	durable.SettledAt = time.Time{}
 	durable.PhaseStartedAt = enteredAt
-	durable.RampUntil = rampUntil
-	durable.EvidenceDeadlineAt = evidenceDeadlineAt
 	durable.ObservedFrequency = 0
 	durable.ObservedCoreVoltage = 0
 	durable.ObservedCount = 0
 	if err := saveMiner(tx, &durable); err != nil {
-		return fmt.Errorf("adopt manual point: save miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt manual point: save miner: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("adopt manual point: commit: %w", err)
+	if _, err := insertEpoch(tx, macAddr, point, EpochHoldValidation, 1, enteredAt); err != nil {
+		return TransitionResult{}, fmt.Errorf("adopt manual point: open hold-validation epoch: %w", err)
 	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
-// AdoptExternalPoint atomically resolves a pre-PATCH operating-point attempt
-// after two safe observations of an externally changed pair. The observed
-// pair becomes manual HOLD state; it never becomes a normal automation target.
-func (store *OptimizerStore) AdoptExternalPoint(
-	state *MinerState,
-	point OperatingPoint,
-	attemptID int64,
-	at time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	if state == nil || !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 ||
-		at.IsZero() || rampUntil.IsZero() || evidenceDeadlineAt.IsZero() || evidenceDeadlineAt.Before(rampUntil) {
-		return fmt.Errorf("adopt external point: invalid state, point, attempt, or timing")
+func applyAdoptExternalPoint(tx *sql.Tx, value AdoptExternalPoint, at time.Time) (TransitionResult, error) {
+	state := value.State
+	point := value.Point
+	attemptID := value.AttemptID
+	if !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("adopt external point: invalid state, point, attempt, or timing")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("adopt external point"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("adopt external point: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("adopt external point: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: load miner: %w", err)
 	}
 	attempt, err := queryMutationAttempt(tx, attemptID)
 	if err != nil {
-		return fmt.Errorf("adopt external point: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: load attempt: %w", err)
 	}
 	if attempt.Kind != MutationOperatingPoint || attempt.MacAddr != durable.MacAddr {
-		return fmt.Errorf("adopt external point: attempt is not an operating-point attempt for this miner")
+		return TransitionResult{}, fmt.Errorf("adopt external point: attempt is not an operating-point attempt for this miner")
 	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage == MutationFailurePreflight && durable.Phase == PhaseHold && durable.HoldReason == HoldManual &&
 			durable.CurrentPoint() == point {
-			*state = durable
-			return nil
+			return TransitionResult{State: durable}, nil
 		}
-		return fmt.Errorf("adopt external point: attempt %d is already closed", attemptID)
+		return TransitionResult{}, fmt.Errorf("adopt external point: attempt %d is already closed", attemptID)
 	}
 	if durable.CurrentPoint() != state.CurrentPoint() || durable.FallbackPoint() != state.FallbackPoint() ||
 		durable.PendingKind != MutationOperatingPoint || durable.PendingPoint() != attempt.TargetPoint() {
-		return fmt.Errorf("adopt external point: stale or changed durable intent")
+		return TransitionResult{}, fmt.Errorf("adopt external point: stale or changed durable intent")
 	}
-	var record OperatingPointRecord
-	var errorPercent sql.NullFloat64
-	var measuredAt, enteredAt int64
-	err = tx.QueryRowContext(context.Background(), `SELECT
-		mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
-		attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
-		accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id,
-		reference_hash FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-		attempt.MacAddr, attempt.TargetFrequency, attempt.TargetCoreVoltage).Scan(
-		&record.MacAddr, &record.Frequency, &record.CoreVoltage, &record.Status,
-		&record.MedianHash, &record.ExpectedHash, &record.Attainment,
-		&record.MeanTemp, &record.P95Temp, &record.P95VRTemp, &record.P95Power,
-		&errorPercent, &record.AcceptedDelta, &record.RejectedDelta,
-		&measuredAt, &enteredAt, &record.EntryAttemptID, &record.ReferenceHash,
-	)
+	record, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
 	if err != nil {
-		return fmt.Errorf("adopt external point: load target row: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: load target row: %w", err)
 	}
-	if errorPercent.Valid {
-		value := errorPercent.Float64
-		record.ErrorPercent = &value
-	}
-	record.MeasuredAt = storedTime(measuredAt)
-	record.EnteredAt = storedTime(enteredAt)
 	if record.Status == PointEntered && record.EntryAttemptID == attemptID {
 		record.Status = PointUnobservable
 		record.MeasuredAt = at
 		if record.MeasuredAt.Before(record.EnteredAt) {
 			record.MeasuredAt = record.EnteredAt
 		}
-		if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-			status = ?, median_hash = 0, expected_hash = 0, attainment = 0,
-			mean_temp = 0, p95_temp = 0, p95_vr_temp = 0, p95_power = 0,
-			error_percent = NULL, accepted_delta = 0, rejected_delta = 0,
-			measured_at = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?
-			AND status = ? AND entry_attempt_id = ?`,
-			record.Status, timeValue(record.MeasuredAt), record.MacAddr,
-			record.Frequency, record.CoreVoltage, PointEntered, attemptID); err != nil {
-			return fmt.Errorf("adopt external point: finalize target row: %w", err)
+		record.MedianHash, record.ExpectedHash, record.Attainment = 0, 0, 0
+		record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power = 0, 0, 0, 0
+		record.ErrorPercent = nil
+		record.AcceptedDelta, record.RejectedDelta = 0, 0
+		record.EvidenceEpochID = 0
+		if err := updateOperatingPoint(tx, record); err != nil {
+			return TransitionResult{}, fmt.Errorf("adopt external point: finalize target row: %w", err)
 		}
 	} else if record.Status == PointEntered && record.EntryAttemptID != 0 {
-		return fmt.Errorf("adopt external point: target row is bound to another unfinished entry")
+		return TransitionResult{}, fmt.Errorf("adopt external point: target row is bound to another unfinished entry")
 	} else if record.Status != PointEntered && (record.MeasuredAt.IsZero() || record.MeasuredAt.Before(record.EnteredAt)) {
-		return fmt.Errorf("adopt external point: terminal target row has invalid evidence")
+		return TransitionResult{}, fmt.Errorf("adopt external point: terminal target row has invalid evidence")
+	}
+	if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
+		return TransitionResult{}, fmt.Errorf("adopt external point: an evidence epoch is still open")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return TransitionResult{}, fmt.Errorf("adopt external point: check open epoch: %w", err)
 	}
 	durable.SetCurrentPoint(point)
 	durable.SetFallbackPoint(OperatingPoint{})
@@ -1364,45 +2077,37 @@ func (store *OptimizerStore) AdoptExternalPoint(
 	durable.SafetyReason = ""
 	durable.SettledAt = time.Time{}
 	durable.PhaseStartedAt = at
-	durable.RampUntil = rampUntil
-	durable.EvidenceDeadlineAt = evidenceDeadlineAt
 	durable.ObservedFrequency = 0
 	durable.ObservedCoreVoltage = 0
 	durable.ObservedCount = 0
 	attempt.FailedAt = at
 	attempt.FailureStage = MutationFailurePreflight
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("adopt external point: validate attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: validate attempt: %w", err)
 	}
 	if err := validateMinerState(durable); err != nil {
-		return fmt.Errorf("adopt external point: validate state: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: validate state: %w", err)
 	}
 	if err := saveMiner(tx, &durable); err != nil {
-		return fmt.Errorf("adopt external point: save state: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: save state: %w", err)
+	}
+	if _, err := insertEpoch(tx, durable.MacAddr, point, EpochHoldValidation, 1, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("adopt external point: open hold-validation epoch: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
 		SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
 		timeValue(attempt.FailedAt), attempt.FailureStage, attemptID); err != nil {
-		return fmt.Errorf("adopt external point: close attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("adopt external point: close attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("adopt external point: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
-func (store *OptimizerStore) SaveMiner(state *MinerState) error {
-	if state == nil {
-		return fmt.Errorf("save miner state: state is nil")
+func applySaveState(tx *sql.Tx, value SaveState, at time.Time) (TransitionResult, error) {
+	state := value.State
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("save miner state: %w", err)
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("save miner state"); err != nil {
-		return err
-	}
-	return saveMiner(store.conn, state)
+	return TransitionResult{State: state}, nil
 }
 
 // LoadMiner returns the current durable state for a known MAC address.
@@ -1483,12 +2188,12 @@ func insertPoint(executor interface {
 			mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
 			attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
 			accepted_delta, rejected_delta, measured_at, entered_at,
-			entry_attempt_id, reference_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			entry_attempt_id, reference_hash, evidence_epoch_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.MacAddr,
 		record.Frequency,
 		record.CoreVoltage,
-		record.Status,
+		string(record.Status),
 		record.MedianHash,
 		record.ExpectedHash,
 		record.Attainment,
@@ -1503,7 +2208,67 @@ func insertPoint(executor interface {
 		timeValue(record.EnteredAt),
 		record.EntryAttemptID,
 		record.ReferenceHash,
+		record.EvidenceEpochID,
 	)
+	return err
+}
+
+const pointRowSelect = `SELECT
+	mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
+	attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
+	accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id,
+	reference_hash, evidence_epoch_id FROM operating_points`
+
+// loadOperatingPoint reads the single canonical row shape shared by every applyX function that
+// finalizes a point in place, so the eighteen-column positional list exists exactly once.
+func loadOperatingPoint(
+	tx *sql.Tx,
+	macAddr string,
+	point OperatingPoint,
+) (OperatingPointRecord, error) {
+	var record OperatingPointRecord
+	var status string
+	var errorPercent sql.NullFloat64
+	var measuredAt, enteredAt int64
+	if err := tx.QueryRowContext(context.Background(),
+		pointRowSelect+" WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?",
+		macAddr, point.Frequency, point.CoreVoltage).Scan(
+		&record.MacAddr, &record.Frequency, &record.CoreVoltage, &status,
+		&record.MedianHash, &record.ExpectedHash, &record.Attainment,
+		&record.MeanTemp, &record.P95Temp, &record.P95VRTemp, &record.P95Power,
+		&errorPercent, &record.AcceptedDelta, &record.RejectedDelta,
+		&measuredAt, &enteredAt, &record.EntryAttemptID, &record.ReferenceHash,
+		&record.EvidenceEpochID,
+	); err != nil {
+		return OperatingPointRecord{}, err
+	}
+	record.Status = PointStatus(status)
+	record.MeasuredAt = storedTime(measuredAt)
+	record.EnteredAt = storedTime(enteredAt)
+	if errorPercent.Valid {
+		value := errorPercent.Float64
+		record.ErrorPercent = &value
+	}
+	return record, nil
+}
+
+// updateOperatingPoint writes a terminal measurement over an existing "entered" row, binding the
+// closed evidence epoch that produced it. It is the one write path finalizeTrialTx and
+// applyFinalizeBaseline share.
+func updateOperatingPoint(tx *sql.Tx, record OperatingPointRecord) error {
+	if err := validatePointRecord(record); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
+		status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
+		p95_temp = ?, p95_vr_temp = ?, p95_power = ?, error_percent = ?,
+		accepted_delta = ?, rejected_delta = ?, measured_at = ?, evidence_epoch_id = ?
+		WHERE mac_addr = ? AND frequency = ? AND core_voltage = ? AND status = ?`,
+		string(record.Status), record.MedianHash, record.ExpectedHash, record.Attainment,
+		record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power,
+		nullableFloat(record.ErrorPercent), record.AcceptedDelta, record.RejectedDelta,
+		timeValue(record.MeasuredAt), record.EvidenceEpochID, record.MacAddr, record.Frequency,
+		record.CoreVoltage, string(PointEntered))
 	return err
 }
 
@@ -1522,7 +2287,7 @@ func (store *OptimizerStore) ListPoints(macAddr string) ([]OperatingPointRecord,
 		`SELECT mac_addr, frequency, core_voltage, status, median_hash,
 			expected_hash, attainment, mean_temp, p95_temp, p95_vr_temp,
 			p95_power, error_percent, accepted_delta, rejected_delta,
-			measured_at, entered_at, entry_attempt_id, reference_hash
+			measured_at, entered_at, entry_attempt_id, reference_hash, evidence_epoch_id
 		FROM operating_points
 		WHERE mac_addr = ?
 		ORDER BY frequency ASC, core_voltage ASC`,
@@ -1536,6 +2301,11 @@ func (store *OptimizerStore) ListPoints(macAddr string) ([]OperatingPointRecord,
 	records, err := scanPointRows(rows)
 	if err != nil {
 		return nil, fmt.Errorf("list operating points: %w", err)
+	}
+	for _, record := range records {
+		if err := validatePointRecord(record); err != nil {
+			return nil, fmt.Errorf("list operating points: %s/%d/%d: %w", record.MacAddr, record.Frequency, record.CoreVoltage, err)
+		}
 	}
 	return records, nil
 }
@@ -1824,508 +2594,358 @@ func (store *OptimizerStore) RecordFirstPositive(id int64, at time.Time) error {
 	return nil
 }
 
-// CompleteMiningResume atomically closes the healthy-mining gate and starts
-// the next phase window. The attempt and miner row become visible together so
-// a crash cannot report resumed mining without the corresponding deadline.
-func (store *OptimizerStore) CompleteMiningResume(
-	state *MinerState,
-	id int64,
-	at time.Time,
-	rampUntil time.Time,
-	evidenceDeadlineAt time.Time,
-) error {
-	if state == nil || id <= 0 || at.IsZero() || rampUntil.IsZero() || evidenceDeadlineAt.IsZero() ||
-		evidenceDeadlineAt.Before(rampUntil) {
-		return fmt.Errorf("complete mining resume: invalid state or timing")
+func applyCompleteResume(tx *sql.Tx, value CompleteResume, at time.Time) (TransitionResult, error) {
+	macAddr := value.MacAddr
+	id := value.AttemptID
+	if id <= 0 || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("complete mining resume: invalid state or timing")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("complete mining resume"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("complete mining resume: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	attempt, err := queryMutationAttempt(tx, id)
 	if err != nil {
-		return fmt.Errorf("complete mining resume: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: load attempt: %w", err)
 	}
 	durable, err := queryMiner(tx, attempt.MacAddr)
 	if err != nil {
-		return fmt.Errorf("complete mining resume: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: load miner: %w", err)
 	}
-	if durable.MacAddr != state.MacAddr || attempt.MacAddr != state.MacAddr {
-		return fmt.Errorf("complete mining resume: miner does not match attempt")
+	if durable.MacAddr != macAddr || attempt.MacAddr != macAddr {
+		return TransitionResult{}, fmt.Errorf("complete mining resume: miner does not match attempt")
 	}
 	if !attempt.MiningResumedAt.IsZero() {
 		if !attempt.MiningResumedAt.Equal(at) {
-			return fmt.Errorf("complete mining resume: resumption timestamp conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("complete mining resume: resumption timestamp conflicts with stored value")
 		}
 		if err := validateMinerState(durable); err != nil {
-			return fmt.Errorf("complete mining resume: stored state is invalid: %w", err)
+			return TransitionResult{}, fmt.Errorf("complete mining resume: stored state is invalid: %w", err)
 		}
-		*state = durable
-		return nil
+		return TransitionResult{State: durable}, nil
 	}
 	if attempt.FailedAt.IsZero() == false || attempt.CompletedAt.IsZero() || attempt.FirstPositiveAt.IsZero() {
-		return fmt.Errorf("complete mining resume: attempt is not ready")
+		return TransitionResult{}, fmt.Errorf("complete mining resume: attempt is not ready")
 	}
 	if attempt.Kind == MutationMiningConfiguration {
 		if durable.MiningPending {
-			return fmt.Errorf("complete mining resume: mining obligation remains pending")
+			return TransitionResult{}, fmt.Errorf("complete mining resume: mining obligation remains pending")
 		}
 	} else if durable.PendingKind != "" || durable.CurrentPoint() != attempt.TargetPoint() {
-		return fmt.Errorf("complete mining resume: operating-point state is not complete")
+		return TransitionResult{}, fmt.Errorf("complete mining resume: operating-point state is not complete")
 	}
 	attempt.MiningResumedAt = at
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("complete mining resume: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: %w", err)
 	}
-	durable.RampUntil = rampUntil
-	durable.EvidenceDeadlineAt = evidenceDeadlineAt
 	durable.ObservedFrequency = 0
 	durable.ObservedCoreVoltage = 0
 	durable.ObservedCount = 0
 	if err := validateMinerState(durable); err != nil {
-		return fmt.Errorf("complete mining resume: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: %w", err)
 	}
 	if err := saveMiner(tx, &durable); err != nil {
-		return fmt.Errorf("complete mining resume: save miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: save miner: %w", err)
+	}
+	// A mining-only completion touches no operating point, so whatever epoch was already open (if
+	// any) is untouched. Every other kind opens the epoch its now-durable phase and hold reason
+	// warrant (EpochShapeForPhase): trial re-entry, a return to baseline, final placement's hold
+	// validation, or safety validation after a rollback/recovery mutation.
+	if attempt.Kind != MutationMiningConfiguration {
+		if purpose, requiredWindows, open := EpochShapeForPhase(durable.Phase, durable.HoldReason); open {
+			if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
+				return TransitionResult{}, fmt.Errorf("complete mining resume: an evidence epoch is still open")
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return TransitionResult{}, fmt.Errorf("complete mining resume: check open epoch: %w", err)
+			}
+			if _, err := insertEpoch(tx, durable.MacAddr, durable.CurrentPoint(), purpose, requiredWindows, at); err != nil {
+				return TransitionResult{}, fmt.Errorf("complete mining resume: open epoch: %w", err)
+			}
+		}
 	}
 	if _, err := tx.ExecContext(context.Background(),
 		"UPDATE mutation_attempts SET mining_resumed_at = ? WHERE id = ?",
 		timeValue(attempt.MiningResumedAt), id); err != nil {
-		return fmt.Errorf("complete mining resume: update attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mining resume: update attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("complete mining resume: commit: %w", err)
-	}
-	rollback = false
-	*state = durable
-	return nil
+	return TransitionResult{State: durable}, nil
 }
 
-// FailMutationAndSave atomically closes an unfinished mutation and persists
-// the terminal non-trial state that owns the remaining safety or mining
-// obligation.
-func (store *OptimizerStore) FailMutationAndSave(
-	state *MinerState,
-	id int64,
-	stage MutationFailureStage,
-	at time.Time,
-) error {
-	if state == nil || id <= 0 || stage == "" || at.IsZero() {
-		return fmt.Errorf("fail mutation and save: invalid state or timing")
+func applyFailMutation(tx *sql.Tx, value FailMutation, at time.Time) (TransitionResult, error) {
+	state := value.State
+	id := value.AttemptID
+	stage := value.Stage
+	if id <= 0 || stage == "" || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: invalid state or timing")
 	}
-	if err := validateMinerState(*state); err != nil {
-		return fmt.Errorf("fail mutation and save: %w", err)
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: %w", err)
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("fail mutation and save"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("fail mutation and save: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	attempt, err := queryMutationAttempt(tx, id)
 	if err != nil {
-		return fmt.Errorf("fail mutation and save: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: load attempt: %w", err)
 	}
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("fail mutation and save: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: load miner: %w", err)
 	}
 	if attempt.MacAddr != durable.MacAddr {
-		return fmt.Errorf("fail mutation and save: attempt does not belong to miner")
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: attempt does not belong to miner")
 	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage != stage {
-			return fmt.Errorf("fail mutation and save: attempt already failed at %q", attempt.FailureStage)
+			return TransitionResult{}, fmt.Errorf("fail mutation and save: attempt already failed at %q", attempt.FailureStage)
 		}
 		if !attempt.FailedAt.Equal(at) {
-			return fmt.Errorf("fail mutation and save: failure timestamp conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("fail mutation and save: failure timestamp conflicts with stored value")
 		}
-		*state = durable
-		return nil
+		return TransitionResult{State: durable}, nil
 	}
 	if durable.AccountedThroughAt != state.AccountedThroughAt {
-		return fmt.Errorf("fail mutation and save: stale accounting cursor")
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: stale accounting cursor")
 	}
-	if durable.CurrentPoint() != state.CurrentPoint() || durable.FallbackPoint() != state.FallbackPoint() ||
-		durable.PendingKind != state.PendingKind || durable.PendingPoint() != state.PendingPoint() ||
-		durable.MiningPending != state.MiningPending {
-		return fmt.Errorf("fail mutation and save: stale mutation authority")
+	// Only CurrentPoint and the accounting cursor are checked against the unchanged durable value.
+	// FailMutation's whole purpose is to persist the caller's post-failure authority — a cleared
+	// PendingKind/PendingPoint/FallbackPoint/MiningPending, exactly like QuarantineMutation's
+	// narrower pattern below. The real "is this genuinely the attempt's own pending authority"
+	// invariant is enforced immediately below, against durable and attempt.Kind/TargetPoint, not
+	// against the caller's state; checking it again here against the caller's (already-cleared)
+	// state made every caller that clears pending authority before calling — the normal, intended
+	// shape — fail with "stale mutation authority" even though nothing was actually stale.
+	if durable.CurrentPoint() != state.CurrentPoint() {
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: stale mutation authority")
 	}
 	if attempt.Kind == MutationMiningConfiguration {
 		if !durable.MiningPending || durable.PendingKind != "" {
-			return fmt.Errorf("fail mutation and save: mining obligation is no longer pending")
+			return TransitionResult{}, fmt.Errorf("fail mutation and save: mining obligation is no longer pending")
 		}
 	} else if durable.PendingKind != attempt.Kind || durable.PendingPoint() != attempt.TargetPoint() {
 		// Completed-but-unresumed attempts have already cleared their pending
 		// authority. They are handled by the resumption failure path using the
 		// same durable current point.
 		if attempt.CompletedAt.IsZero() || durable.CurrentPoint() != attempt.TargetPoint() {
-			return fmt.Errorf("fail mutation and save: mutation obligation is no longer pending")
+			return TransitionResult{}, fmt.Errorf("fail mutation and save: mutation obligation is no longer pending")
 		}
 	}
 	attempt.FailedAt = at
 	attempt.FailureStage = stage
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("fail mutation and save: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: %w", err)
 	}
-	if err := saveMiner(tx, state); err != nil {
-		return fmt.Errorf("fail mutation and save: save miner: %w", err)
+	if err := closeOpenEpochIfAny(tx, state.MacAddr, EpochContradicted, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: close open epoch: %w", err)
+	}
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: save miner: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
 		SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
 		timeValue(at), stage, id); err != nil {
-		return fmt.Errorf("fail mutation and save: close attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("fail mutation and save: close attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("fail mutation and save: commit: %w", err)
-	}
-	rollback = false
-	return nil
+	return TransitionResult{State: state}, nil
 }
 
-// QuarantineMutation atomically closes a post-request mutation whose device
-// state is unavailable or ambiguous. An operating-point candidate is made
-// unobservable, all actuatable authority is cleared, and the miner enters the
-// durable mutation-uncertain emergency block without claiming containment.
-func (store *OptimizerStore) QuarantineMutation(
-	state *MinerState,
-	id int64,
-	stage MutationFailureStage,
-	at time.Time,
-) error {
-	if state == nil || id <= 0 || stage == "" || at.IsZero() {
-		return fmt.Errorf("quarantine mutation: invalid state or timing")
+func applyQuarantineMutation(tx *sql.Tx, value QuarantineMutation, at time.Time) (TransitionResult, error) {
+	state := value.State
+	id := value.AttemptID
+	stage := value.Stage
+	if id <= 0 || stage == "" || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: invalid state or timing")
 	}
-	if err := validateMinerState(*state); err != nil {
-		return fmt.Errorf("quarantine mutation: %w", err)
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: %w", err)
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("quarantine mutation"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("quarantine mutation: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	attempt, err := queryMutationAttempt(tx, id)
 	if err != nil {
-		return fmt.Errorf("quarantine mutation: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: load attempt: %w", err)
 	}
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("quarantine mutation: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: load miner: %w", err)
 	}
 	if attempt.MacAddr != durable.MacAddr || durable.CurrentPoint() != state.CurrentPoint() ||
 		durable.AccountedThroughAt != state.AccountedThroughAt {
-		return fmt.Errorf("quarantine mutation: stale miner state")
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: stale miner state")
 	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage != stage || !attempt.FailedAt.Equal(at) {
-			return fmt.Errorf("quarantine mutation: failure milestone conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("quarantine mutation: failure milestone conflicts with stored value")
 		}
-		*state = durable
-		return nil
+		return TransitionResult{State: durable}, nil
 	}
 	if attempt.Kind == MutationOperatingPoint {
-		var status string
-		var enteredAt int64
-		var entryAttemptID int64
-		err := tx.QueryRowContext(context.Background(), `SELECT status, entered_at, entry_attempt_id
-			FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-			attempt.MacAddr, attempt.TargetFrequency, attempt.TargetCoreVoltage).Scan(
-			&status, &enteredAt, &entryAttemptID)
+		candidate, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("quarantine mutation: load candidate: %w", err)
+			return TransitionResult{}, fmt.Errorf("quarantine mutation: load candidate: %w", err)
 		}
-		if err == nil && status == PointEntered && entryAttemptID == attempt.ID {
+		if err == nil && candidate.Status == PointEntered && candidate.EntryAttemptID == attempt.ID {
 			measuredAt := at
-			entered := storedTime(enteredAt)
-			if measuredAt.Before(entered) {
-				measuredAt = entered
+			if measuredAt.Before(candidate.EnteredAt) {
+				measuredAt = candidate.EnteredAt
 			}
-			if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-				status = ?, median_hash = 0, expected_hash = 0, attainment = 0,
-				mean_temp = 0, p95_temp = 0, p95_vr_temp = 0, p95_power = 0,
-				error_percent = NULL, accepted_delta = 0, rejected_delta = 0,
-				measured_at = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?
-				AND status = ? AND entry_attempt_id = ?`,
-				PointUnobservable, timeValue(measuredAt), attempt.MacAddr,
-				attempt.TargetFrequency, attempt.TargetCoreVoltage, PointEntered, attempt.ID); err != nil {
-				return fmt.Errorf("quarantine mutation: finalize candidate: %w", err)
+			candidate.Status = PointUnobservable
+			candidate.MedianHash, candidate.ExpectedHash, candidate.Attainment = 0, 0, 0
+			candidate.MeanTemp, candidate.P95Temp, candidate.P95VRTemp, candidate.P95Power = 0, 0, 0, 0
+			candidate.ErrorPercent = nil
+			candidate.AcceptedDelta, candidate.RejectedDelta = 0, 0
+			candidate.MeasuredAt = measuredAt
+			candidate.EvidenceEpochID = 0
+			if err := updateOperatingPoint(tx, candidate); err != nil {
+				return TransitionResult{}, fmt.Errorf("quarantine mutation: finalize candidate: %w", err)
 			}
 		}
+	}
+	if err := closeOpenEpochIfAny(tx, state.MacAddr, EpochContradicted, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: close open epoch: %w", err)
 	}
 	attempt.FailedAt = at
 	attempt.FailureStage = stage
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("quarantine mutation: %w", err)
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: %w", err)
 	}
-	if err := saveMiner(tx, state); err != nil {
-		return fmt.Errorf("quarantine mutation: save state: %w", err)
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: save state: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
 		SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
 		timeValue(attempt.FailedAt), attempt.FailureStage, id); err != nil {
-		return fmt.Errorf("quarantine mutation: close attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("quarantine mutation: close attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("quarantine mutation: commit: %w", err)
-	}
-	rollback = false
-	return nil
+	return TransitionResult{State: state}, nil
 }
 
-// SupersedeMutation closes a normal or mining mutation that safety arbitration
-// replaced, finalizing an entered candidate as unobservable when necessary and
-// saving the replacing durable state in the same transaction.
-func (store *OptimizerStore) SupersedeMutation(
-	expected *MinerState,
-	state *MinerState,
-	id int64,
-	at time.Time,
-) error {
-	if expected == nil || state == nil || expected.MacAddr != state.MacAddr || id <= 0 || at.IsZero() {
-		return fmt.Errorf("supersede mutation: invalid state or attempt")
+func applySupersedeMutation(tx *sql.Tx, value SupersedeMutation, at time.Time) (TransitionResult, error) {
+	expected := value.Expected
+	state := value.State
+	id := value.AttemptID
+	if expected.MacAddr != state.MacAddr || id <= 0 || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: invalid state or attempt")
 	}
-	if err := validateMinerState(*expected); err != nil {
-		return fmt.Errorf("supersede mutation: expected state: %w", err)
+	if err := validateMinerState(expected); err != nil {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: expected state: %w", err)
 	}
-	if err := validateMinerState(*state); err != nil {
-		return fmt.Errorf("supersede mutation: %w", err)
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: %w", err)
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("supersede mutation"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("supersede mutation: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
 	attempt, err := queryMutationAttempt(tx, id)
 	if err != nil {
-		return fmt.Errorf("supersede mutation: load attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("supersede mutation: load attempt: %w", err)
 	}
 	if attempt.MacAddr != state.MacAddr {
-		return fmt.Errorf("supersede mutation: miner does not match attempt")
+		return TransitionResult{}, fmt.Errorf("supersede mutation: miner does not match attempt")
 	}
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("supersede mutation: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("supersede mutation: load miner: %w", err)
 	}
-	if durable != *expected {
-		return fmt.Errorf("supersede mutation: stale miner state")
+	if durable != expected {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: stale miner state")
 	}
 	if !attempt.FailedAt.IsZero() {
 		if attempt.FailureStage != MutationFailureSafetySuperseded || !attempt.FailedAt.Equal(at) {
-			return fmt.Errorf("supersede mutation: failure milestone conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("supersede mutation: failure milestone conflicts with stored value")
 		}
 	} else if attempt.MiningResumedAt.IsZero() {
 		attempt.FailedAt = at
 		attempt.FailureStage = MutationFailureSafetySuperseded
 	}
 	if attempt.FailureStage != MutationFailureSafetySuperseded {
-		return fmt.Errorf("supersede mutation: attempt %d has failure stage %q", id, attempt.FailureStage)
+		return TransitionResult{}, fmt.Errorf("supersede mutation: attempt %d has failure stage %q", id, attempt.FailureStage)
 	}
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("supersede mutation: %w", err)
+		return TransitionResult{}, fmt.Errorf("supersede mutation: %w", err)
 	}
 	if attempt.Kind == MutationOperatingPoint {
-		var record OperatingPointRecord
-		var errorPercent sql.NullFloat64
-		var measuredAt, enteredAt int64
-		err := tx.QueryRowContext(context.Background(), `SELECT
-			mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
-			attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
-			accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id,
-			reference_hash FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-			attempt.MacAddr, attempt.TargetFrequency, attempt.TargetCoreVoltage).Scan(
-			&record.MacAddr, &record.Frequency, &record.CoreVoltage, &record.Status,
-			&record.MedianHash, &record.ExpectedHash, &record.Attainment,
-			&record.MeanTemp, &record.P95Temp, &record.P95VRTemp, &record.P95Power,
-			&errorPercent, &record.AcceptedDelta, &record.RejectedDelta,
-			&measuredAt, &enteredAt, &record.EntryAttemptID, &record.ReferenceHash,
-		)
+		record, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("supersede mutation: load target point: %w", err)
+			return TransitionResult{}, fmt.Errorf("supersede mutation: load target point: %w", err)
 		}
 		if err == nil && record.Status == PointEntered && record.EntryAttemptID == id {
-			if errorPercent.Valid {
-				value := errorPercent.Float64
-				record.ErrorPercent = &value
-			}
-			record.MeasuredAt = storedTime(measuredAt)
-			record.EnteredAt = storedTime(enteredAt)
 			record.Status = PointUnobservable
-			record.MedianHash = 0
-			record.ExpectedHash = 0
-			record.Attainment = 0
-			record.MeanTemp = 0
-			record.P95Temp = 0
-			record.P95VRTemp = 0
-			record.P95Power = 0
+			record.MedianHash, record.ExpectedHash, record.Attainment = 0, 0, 0
+			record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power = 0, 0, 0, 0
 			record.ErrorPercent = nil
-			record.AcceptedDelta = 0
-			record.RejectedDelta = 0
+			record.AcceptedDelta, record.RejectedDelta = 0, 0
+			record.EvidenceEpochID = 0
 			record.MeasuredAt = at
 			if record.MeasuredAt.Before(record.EnteredAt) {
 				record.MeasuredAt = record.EnteredAt
 			}
-			if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-				status = ?, median_hash = 0, expected_hash = 0, attainment = 0,
-				mean_temp = 0, p95_temp = 0, p95_vr_temp = 0, p95_power = 0,
-				error_percent = NULL, accepted_delta = 0, rejected_delta = 0,
-				measured_at = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?
-				AND status = ? AND entry_attempt_id = ?`,
-				record.Status, timeValue(record.MeasuredAt), record.MacAddr,
-				record.Frequency, record.CoreVoltage, PointEntered, id); err != nil {
-				return fmt.Errorf("supersede mutation: finalize target point: %w", err)
+			if err := updateOperatingPoint(tx, record); err != nil {
+				return TransitionResult{}, fmt.Errorf("supersede mutation: finalize target point: %w", err)
 			}
 		}
 	}
-	if err := saveMiner(tx, state); err != nil {
-		return fmt.Errorf("supersede mutation: save state: %w", err)
+	if err := closeOpenEpochIfAny(tx, state.MacAddr, EpochContradicted, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: close open epoch: %w", err)
+	}
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("supersede mutation: save state: %w", err)
 	}
 	if _, err := tx.ExecContext(context.Background(),
 		`UPDATE mutation_attempts SET failed_at = ?, failure_stage = ?
 		 WHERE id = ? AND failed_at = 0 AND mining_resumed_at = 0`,
 		timeValue(attempt.FailedAt), attempt.FailureStage, id); err != nil {
-		return fmt.Errorf("supersede mutation: close attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("supersede mutation: close attempt: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("supersede mutation: commit: %w", err)
-	}
-	rollback = false
-	return nil
+	return TransitionResult{State: state}, nil
 }
 
-// PersistSafetyTransition atomically records an instantaneous safety result,
-// closes any normal or mining attempt that it superseded, and saves the
-// replacement safety state. The caller supplies a terminal point record only
-// when the live point was an entered frontier candidate.
-func (store *OptimizerStore) PersistSafetyTransition(
-	expected *MinerState,
-	state *MinerState,
-	record *OperatingPointRecord,
-	at time.Time,
-) error {
-	if expected == nil || state == nil || expected.MacAddr != state.MacAddr || at.IsZero() {
-		return fmt.Errorf("persist safety transition: invalid state or timestamp")
+func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (TransitionResult, error) {
+	expected := value.Expected
+	state := value.State
+	record := value.Record
+	if expected.MacAddr != state.MacAddr || at.IsZero() {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: invalid state or timestamp")
 	}
-	if err := validateMinerState(*expected); err != nil {
-		return fmt.Errorf("persist safety transition: expected state: %w", err)
+	if err := validateMinerState(expected); err != nil {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: expected state: %w", err)
 	}
-	if err := validateMinerState(*state); err != nil {
-		return fmt.Errorf("persist safety transition: %w", err)
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: %w", err)
 	}
-	if record != nil {
-		if record.MacAddr != state.MacAddr || record.Status == PointEntered {
-			return fmt.Errorf("persist safety transition: invalid point record")
-		}
-		if err := validatePointRecord(*record); err != nil {
-			return fmt.Errorf("persist safety transition: %w", err)
-		}
+	if record != nil && (record.MacAddr != state.MacAddr || record.Status == PointEntered) {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: invalid point record")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("persist safety transition"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("persist safety transition: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
+	// record.EvidenceEpochID (when record != nil) is not yet assigned here; closeCandidateEpoch
+	// below determines it, and updateOperatingPoint validates the complete record when it writes it.
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
-		return fmt.Errorf("persist safety transition: load miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("persist safety transition: load miner: %w", err)
 	}
-	if durable != *expected {
-		return fmt.Errorf("persist safety transition: stale miner state")
+	if durable != expected {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: stale miner state")
+	}
+	// A safety transition always takes ownership of whatever evidence epoch is open: it is one of
+	// the RFC's contradiction triggers. When Record measures the open epoch's own point, the epoch
+	// closes "rejected" (a hard safety limit is a verdict, not a change of subject) and the point
+	// record binds to it; otherwise any open epoch closes "contradicted".
+	candidateEpochID, err := closeCandidateEpoch(tx, state.MacAddr, record, at)
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: close open epoch: %w", err)
 	}
 	if record != nil {
-		var current OperatingPointRecord
-		var errorPercent sql.NullFloat64
-		var measuredAt, enteredAt int64
-		if err := tx.QueryRowContext(context.Background(), `SELECT
-			mac_addr, frequency, core_voltage, status, median_hash, expected_hash,
-			attainment, mean_temp, p95_temp, p95_vr_temp, p95_power, error_percent,
-			accepted_delta, rejected_delta, measured_at, entered_at, entry_attempt_id,
-			reference_hash FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-			record.MacAddr, record.Frequency, record.CoreVoltage).Scan(
-			&current.MacAddr, &current.Frequency, &current.CoreVoltage, &current.Status,
-			&current.MedianHash, &current.ExpectedHash, &current.Attainment,
-			&current.MeanTemp, &current.P95Temp, &current.P95VRTemp, &current.P95Power,
-			&errorPercent, &current.AcceptedDelta, &current.RejectedDelta,
-			&measuredAt, &enteredAt, &current.EntryAttemptID, &current.ReferenceHash,
-		); err != nil {
-			return fmt.Errorf("persist safety transition: load point: %w", err)
+		current, err := loadOperatingPoint(tx, record.MacAddr, record.Point())
+		if err != nil {
+			return TransitionResult{}, fmt.Errorf("persist safety transition: load point: %w", err)
 		}
-		current.MeasuredAt = storedTime(measuredAt)
-		current.EnteredAt = storedTime(enteredAt)
 		if current.EntryAttemptID != record.EntryAttemptID {
-			return fmt.Errorf("persist safety transition: point entry authority changed")
+			return TransitionResult{}, fmt.Errorf("persist safety transition: point entry authority changed")
 		}
 		if current.Status == PointEntered {
-			if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-				status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
-				p95_temp = ?, p95_vr_temp = ?, p95_power = ?, error_percent = ?,
-				accepted_delta = ?, rejected_delta = ?, measured_at = ?
-				WHERE mac_addr = ? AND frequency = ? AND core_voltage = ? AND status = ?`,
-				record.Status, record.MedianHash, record.ExpectedHash, record.Attainment,
-				record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power,
-				nullableFloat(record.ErrorPercent), record.AcceptedDelta, record.RejectedDelta,
-				timeValue(record.MeasuredAt), record.MacAddr, record.Frequency,
-				record.CoreVoltage, PointEntered); err != nil {
-				return fmt.Errorf("persist safety transition: finalize point: %w", err)
+			record.EvidenceEpochID = candidateEpochID
+			if record.Status == PointUnobservable || record.Status == PointStarved {
+				record.EvidenceEpochID = 0
+			}
+			if err := updateOperatingPoint(tx, *record); err != nil {
+				return TransitionResult{}, fmt.Errorf("persist safety transition: finalize point: %w", err)
 			}
 		} else if current.Status != record.Status || !current.MeasuredAt.Equal(record.MeasuredAt) {
-			return fmt.Errorf("persist safety transition: point is already finalized differently")
+			return TransitionResult{}, fmt.Errorf("persist safety transition: point is already finalized differently")
 		}
 	}
 	var attempt MutationAttempt
 	attempt, err = scanMutationAttempt(tx.QueryRowContext(context.Background(), mutationAttemptSelect+
 		` WHERE mac_addr = ? AND failed_at = 0 AND mining_resumed_at = 0 ORDER BY id DESC LIMIT 1`, state.MacAddr))
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("persist safety transition: load unfinished attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("persist safety transition: load unfinished attempt: %w", err)
 	}
 	if err == nil {
 		closeAttempt := attempt.Kind == MutationOperatingPoint || attempt.Kind == MutationMiningConfiguration
@@ -2334,28 +2954,23 @@ func (store *OptimizerStore) PersistSafetyTransition(
 				state.SafetyReason != attempt.Reason
 		}
 		if closeAttempt && attempt.Kind == MutationOperatingPoint && record == nil {
-			var status string
-			var enteredAt int64
-			var entryAttemptID int64
-			if err := tx.QueryRowContext(context.Background(), `SELECT status, entered_at, entry_attempt_id
-				FROM operating_points WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?`,
-				attempt.MacAddr, attempt.TargetFrequency, attempt.TargetCoreVoltage).Scan(
-				&status, &enteredAt, &entryAttemptID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("persist safety transition: load superseded candidate: %w", err)
-			} else if err == nil && status == PointEntered && entryAttemptID == attempt.ID {
+			candidate, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return TransitionResult{}, fmt.Errorf("persist safety transition: load superseded candidate: %w", err)
+			} else if err == nil && candidate.Status == PointEntered && candidate.EntryAttemptID == attempt.ID {
 				measuredAt := at
-				if measuredAt.Before(storedTime(enteredAt)) {
-					measuredAt = storedTime(enteredAt)
+				if measuredAt.Before(candidate.EnteredAt) {
+					measuredAt = candidate.EnteredAt
 				}
-				if _, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
-					status = ?, median_hash = 0, expected_hash = 0, attainment = 0,
-					mean_temp = 0, p95_temp = 0, p95_vr_temp = 0, p95_power = 0,
-					error_percent = NULL, accepted_delta = 0, rejected_delta = 0,
-					measured_at = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?
-					AND status = ? AND entry_attempt_id = ?`,
-					PointUnobservable, timeValue(measuredAt), attempt.MacAddr,
-					attempt.TargetFrequency, attempt.TargetCoreVoltage, PointEntered, attempt.ID); err != nil {
-					return fmt.Errorf("persist safety transition: finalize superseded candidate: %w", err)
+				candidate.Status = PointUnobservable
+				candidate.MedianHash, candidate.ExpectedHash, candidate.Attainment = 0, 0, 0
+				candidate.MeanTemp, candidate.P95Temp, candidate.P95VRTemp, candidate.P95Power = 0, 0, 0, 0
+				candidate.ErrorPercent = nil
+				candidate.AcceptedDelta, candidate.RejectedDelta = 0, 0
+				candidate.EvidenceEpochID = 0
+				candidate.MeasuredAt = measuredAt
+				if err := updateOperatingPoint(tx, candidate); err != nil {
+					return TransitionResult{}, fmt.Errorf("persist safety transition: finalize superseded candidate: %w", err)
 				}
 			}
 		}
@@ -2363,99 +2978,74 @@ func (store *OptimizerStore) PersistSafetyTransition(
 			attempt.FailedAt = at
 			attempt.FailureStage = MutationFailureSafetySuperseded
 			if err := validateMutationAttempt(attempt, true); err != nil {
-				return fmt.Errorf("persist safety transition: close attempt: %w", err)
+				return TransitionResult{}, fmt.Errorf("persist safety transition: close attempt: %w", err)
 			}
 			if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
 				SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
 				timeValue(attempt.FailedAt), attempt.FailureStage, attempt.ID); err != nil {
-				return fmt.Errorf("persist safety transition: close attempt: %w", err)
+				return TransitionResult{}, fmt.Errorf("persist safety transition: close attempt: %w", err)
 			}
 		}
 	}
-	if err := saveMiner(tx, state); err != nil {
-		return fmt.Errorf("persist safety transition: save state: %w", err)
+	if err := saveMiner(tx, &state); err != nil {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: save state: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("persist safety transition: commit: %w", err)
-	}
-	rollback = false
-	return nil
+	return TransitionResult{State: state}, nil
 }
 
-// CompleteMutationAttempt atomically saves the verified device state and
-// records that the mutation lifecycle completed.
-func (store *OptimizerStore) CompleteMutationAttempt(
-	state *MinerState,
-	id int64,
-	at time.Time,
-) error {
-	if state == nil {
-		return fmt.Errorf("complete mutation attempt: state is nil")
-	}
+func applyCompleteMutation(tx *sql.Tx, value CompleteMutation, at time.Time) (TransitionResult, error) {
+	macAddr := value.MacAddr
+	ip := value.IP
+	id := value.AttemptID
 	if id <= 0 {
-		return fmt.Errorf("complete mutation attempt: ID must be positive")
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: ID must be positive")
 	}
-	if at.IsZero() {
-		return fmt.Errorf("complete mutation attempt: timestamp is required")
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if err := store.ready("complete mutation attempt"); err != nil {
-		return err
-	}
-	tx, err := store.conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("complete mutation attempt: begin transaction: %w", err)
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
+	// at is validated non-zero by Apply before any applyX is dispatched.
 	attempt, err := queryMutationAttempt(tx, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("complete mutation attempt: attempt %d does not exist", id)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: attempt %d does not exist", id)
 	}
 	if err != nil {
-		return fmt.Errorf("complete mutation attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: %w", err)
 	}
-	if attempt.MacAddr != state.MacAddr {
-		return fmt.Errorf("complete mutation attempt: miner does not match attempt")
+	if attempt.MacAddr != macAddr {
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: miner does not match attempt")
 	}
 	durable, err := queryMiner(tx, attempt.MacAddr)
 	if err != nil {
-		return fmt.Errorf("complete mutation attempt: load durable miner: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: load durable miner: %w", err)
 	}
 	if !attempt.CompletedAt.IsZero() {
 		if !attempt.CompletedAt.Equal(at) {
-			return fmt.Errorf("complete mutation attempt: completion timestamp conflicts with stored value")
+			return TransitionResult{}, fmt.Errorf("complete mutation attempt: completion timestamp conflicts with stored value")
 		}
 		if err := validateCompletedMutationShape(durable, attempt); err != nil {
-			return fmt.Errorf("complete mutation attempt: stored completion is invalid: %w", err)
+			return TransitionResult{}, fmt.Errorf("complete mutation attempt: stored completion is invalid: %w", err)
 		}
-		*state = durable
-		return nil
+		return TransitionResult{State: durable}, nil
 	}
 	if !attempt.FailedAt.IsZero() {
-		return fmt.Errorf("complete mutation attempt: attempt already failed")
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: attempt already failed")
 	}
-	if state.IP == "" || net.ParseIP(state.IP) == nil || net.ParseIP(state.IP).To4() == nil {
-		return fmt.Errorf("complete mutation attempt: caller has no valid rediscovered IP")
+	if ip == "" || net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil {
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: caller has no valid rediscovered IP")
 	}
-	if state.RampUntil.IsZero() || state.RampUntil.Before(at) {
-		return fmt.Errorf("complete mutation attempt: caller has no post-mutation ramp")
-	}
-	next, err := deriveCompletedMutationState(durable, attempt, state.IP, state.RampUntil, at)
+	next, err := deriveCompletedMutationState(durable, attempt, ip, at)
 	if err != nil {
-		return fmt.Errorf("complete mutation attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: %w", err)
 	}
 	attempt.CompletedAt = at
 	if err := validateMutationAttempt(attempt, true); err != nil {
-		return fmt.Errorf("complete mutation attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: %w", err)
+	}
+	// A mutation completion is a device-identity/point change underneath any epoch a caller failed
+	// to close (defensive: safety transitions already close the epoch open before a safety-driven
+	// mutation, so this is normally a no-op).
+	if err := closeOpenEpochIfAny(tx, macAddr, EpochContradicted, at); err != nil {
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: close open epoch: %w", err)
 	}
 	if err := saveMinerAfterMutationCompletion(tx, &next); err != nil {
-		return fmt.Errorf("complete mutation attempt: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: %w", err)
 	}
 	if _, err := tx.ExecContext(
 		context.Background(),
@@ -2463,28 +3053,20 @@ func (store *OptimizerStore) CompleteMutationAttempt(
 		timeValue(attempt.CompletedAt),
 		id,
 	); err != nil {
-		return fmt.Errorf("complete mutation attempt: update history: %w", err)
+		return TransitionResult{}, fmt.Errorf("complete mutation attempt: update history: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("complete mutation attempt: commit: %w", err)
-	}
-	rollback = false
-	*state = next
-	return nil
+	return TransitionResult{State: next}, nil
 }
 
 func deriveCompletedMutationState(
 	durable MinerState,
 	attempt MutationAttempt,
 	ip string,
-	rampUntil time.Time,
 	completedAt time.Time,
 ) (MinerState, error) {
 	next := durable
 	next.IP = ip
-	next.EvidenceDeadlineAt = time.Time{}
 	next.SettledAt = time.Time{}
-	next.RampUntil = rampUntil
 	next.ObservedFrequency = 0
 	next.ObservedCoreVoltage = 0
 	next.ObservedCount = 0
@@ -2538,13 +3120,10 @@ func deriveCompletedMutationState(
 }
 
 func validateCompletedMutationShape(state MinerState, attempt MutationAttempt) error {
-	if state.PendingKind != "" || !state.EvidenceDeadlineAt.IsZero() ||
+	if state.PendingKind != "" ||
 		(state.MiningPending && attempt.Kind != MutationMiningConfiguration &&
 			attempt.Kind != MutationSafetyRollback && attempt.Kind != MutationOverheatRecovery) {
 		return fmt.Errorf("completed state retains pending authority")
-	}
-	if state.RampUntil.IsZero() || state.RampUntil.Before(attempt.CompletedAt) {
-		return fmt.Errorf("completed state has no post-mutation ramp")
 	}
 	if attempt.Kind == MutationMiningConfiguration {
 		if state.MiningPending {
@@ -2946,6 +3525,7 @@ func scanPointRows(rows *sql.Rows) ([]OperatingPointRecord, error) {
 			&enteredAt,
 			&record.EntryAttemptID,
 			&record.ReferenceHash,
+			&record.EvidenceEpochID,
 		); err != nil {
 			return nil, err
 		}
@@ -3154,29 +3734,28 @@ func saveMinerWithValidation(
 	_, err := executor.ExecContext(
 		context.Background(),
 		`INSERT INTO optimizer_miners (
-			mac_addr, hostname, ip, phase, phase_started_at, ramp_until,
+			mac_addr, hostname, ip, phase, phase_started_at,
 			current_frequency, current_core_voltage, best_frequency,
 			best_core_voltage, best_hash_rate, fallback_frequency,
 			fallback_core_voltage, pending_kind, pending_frequency,
 			pending_core_voltage, pending_since, mining_pending,
 			observed_frequency, observed_core_voltage, observed_count,
-			consecutive_bad_windows, overheat_count, cooldown_until,
+			overheat_count, recovery_healthy_count, unreadable_poll_count,
 			pass_started_at, pass_trigger, pass_reference_hash,
 			pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
 			safety_reason,
-			hold_reason, settled_at, evidence_deadline_at, accounted_through_at
+			hold_reason, settled_at, accounted_through_at
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?
+			?, ?, ?
 		)
 		ON CONFLICT(mac_addr) DO UPDATE SET
 			hostname = excluded.hostname,
 			ip = excluded.ip,
 			phase = excluded.phase,
 			phase_started_at = excluded.phase_started_at,
-			ramp_until = excluded.ramp_until,
 			current_frequency = excluded.current_frequency,
 			current_core_voltage = excluded.current_core_voltage,
 			best_frequency = excluded.best_frequency,
@@ -3192,9 +3771,9 @@ func saveMinerWithValidation(
 			observed_frequency = excluded.observed_frequency,
 			observed_core_voltage = excluded.observed_core_voltage,
 			observed_count = excluded.observed_count,
-			consecutive_bad_windows = excluded.consecutive_bad_windows,
 			overheat_count = excluded.overheat_count,
-			cooldown_until = excluded.cooldown_until,
+			recovery_healthy_count = excluded.recovery_healthy_count,
+			unreadable_poll_count = excluded.unreadable_poll_count,
 			pass_started_at = excluded.pass_started_at,
 			pass_trigger = excluded.pass_trigger,
 			pass_reference_hash = CASE WHEN optimizer_miners.pass_reference_hash > 0 AND ?
@@ -3207,14 +3786,12 @@ func saveMinerWithValidation(
 				THEN optimizer_miners.pass_reference_settled_at ELSE excluded.pass_reference_settled_at END,
 			safety_reason = excluded.safety_reason,
 		hold_reason = excluded.hold_reason,
-		settled_at = excluded.settled_at,
-		evidence_deadline_at = excluded.evidence_deadline_at`,
+		settled_at = excluded.settled_at`,
 		state.MacAddr,
 		state.Hostname,
 		state.IP,
 		state.Phase,
 		timeValue(state.PhaseStartedAt),
-		timeValue(state.RampUntil),
 		state.CurrentFrequency,
 		state.CurrentCoreVoltage,
 		state.BestFrequency,
@@ -3230,9 +3807,9 @@ func saveMinerWithValidation(
 		state.ObservedFrequency,
 		state.ObservedCoreVoltage,
 		state.ObservedCount,
-		state.ConsecutiveBadWindows,
 		state.OverheatCount,
-		timeValue(state.CooldownUntil),
+		state.RecoveryHealthyCount,
+		state.UnreadablePollCount,
 		timeValue(state.PassStartedAt),
 		state.PassTrigger,
 		state.PassReferenceHash,
@@ -3242,7 +3819,6 @@ func saveMinerWithValidation(
 		state.SafetyReason,
 		state.HoldReason,
 		timeValue(state.SettledAt),
-		timeValue(state.EvidenceDeadlineAt),
 		timeValue(state.AccountedThroughAt),
 		preservePassReference,
 		preservePassReference,
@@ -3256,17 +3832,17 @@ func saveMinerWithValidation(
 }
 
 const minerSelect = `SELECT
-	mac_addr, hostname, ip, phase, phase_started_at, ramp_until,
+	mac_addr, hostname, ip, phase, phase_started_at,
 	current_frequency, current_core_voltage, best_frequency,
 	best_core_voltage, best_hash_rate, fallback_frequency,
 	fallback_core_voltage, pending_kind, pending_frequency,
 	pending_core_voltage, pending_since, mining_pending,
 		observed_frequency, observed_core_voltage, observed_count,
-		consecutive_bad_windows, overheat_count, cooldown_until,
+		overheat_count, recovery_healthy_count, unreadable_poll_count,
 		pass_started_at, pass_trigger, pass_reference_hash,
 		pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
 		safety_reason,
-		hold_reason, settled_at, evidence_deadline_at, accounted_through_at
+		hold_reason, settled_at, accounted_through_at
 	FROM optimizer_miners WHERE mac_addr = ?`
 
 func queryMiner(queryer interface {
@@ -3276,16 +3852,13 @@ func queryMiner(queryer interface {
 	var phase string
 	var pendingKind string
 	var phaseStartedAt int64
-	var rampUntil int64
 	var pendingSince int64
-	var cooldownUntil int64
 	var passStartedAt int64
 	var passTrigger string
 	var passReferenceSettledAt int64
 	var safetyReason string
 	var holdReason string
 	var settledAt int64
-	var evidenceDeadlineAt int64
 	var accountedThroughAt int64
 	err := queryer.QueryRowContext(context.Background(), minerSelect, macAddr).Scan(
 		&state.MacAddr,
@@ -3293,7 +3866,6 @@ func queryMiner(queryer interface {
 		&state.IP,
 		&phase,
 		&phaseStartedAt,
-		&rampUntil,
 		&state.CurrentFrequency,
 		&state.CurrentCoreVoltage,
 		&state.BestFrequency,
@@ -3309,9 +3881,9 @@ func queryMiner(queryer interface {
 		&state.ObservedFrequency,
 		&state.ObservedCoreVoltage,
 		&state.ObservedCount,
-		&state.ConsecutiveBadWindows,
 		&state.OverheatCount,
-		&cooldownUntil,
+		&state.RecoveryHealthyCount,
+		&state.UnreadablePollCount,
 		&passStartedAt,
 		&passTrigger,
 		&state.PassReferenceHash,
@@ -3321,7 +3893,6 @@ func queryMiner(queryer interface {
 		&safetyReason,
 		&holdReason,
 		&settledAt,
-		&evidenceDeadlineAt,
 		&accountedThroughAt,
 	)
 	if err != nil {
@@ -3330,16 +3901,13 @@ func queryMiner(queryer interface {
 	state.Phase = OptimizerPhase(phase)
 	state.PendingKind = MutationKind(pendingKind)
 	state.PhaseStartedAt = storedTime(phaseStartedAt)
-	state.RampUntil = storedTime(rampUntil)
 	state.PendingSince = storedTime(pendingSince)
-	state.CooldownUntil = storedTime(cooldownUntil)
 	state.PassStartedAt = storedTime(passStartedAt)
 	state.PassTrigger = PassTrigger(passTrigger)
 	state.PassReferenceSettledAt = storedTime(passReferenceSettledAt)
 	state.SafetyReason = SafetyReason(safetyReason)
 	state.HoldReason = HoldReason(holdReason)
 	state.SettledAt = storedTime(settledAt)
-	state.EvidenceDeadlineAt = storedTime(evidenceDeadlineAt)
 	state.AccountedThroughAt = storedTime(accountedThroughAt)
 	return state, nil
 }
@@ -3380,7 +3948,6 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "ip", sqlType: "TEXT", notNull: 1},
 		{name: "phase", sqlType: "TEXT", notNull: 1},
 		{name: "phase_started_at", sqlType: "INTEGER", notNull: 1},
-		{name: "ramp_until", sqlType: "INTEGER", notNull: 1},
 		{name: "current_frequency", sqlType: "INTEGER", notNull: 1},
 		{name: "current_core_voltage", sqlType: "INTEGER", notNull: 1},
 		{name: "best_frequency", sqlType: "INTEGER", notNull: 1},
@@ -3396,9 +3963,9 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "observed_frequency", sqlType: "INTEGER", notNull: 1},
 		{name: "observed_core_voltage", sqlType: "INTEGER", notNull: 1},
 		{name: "observed_count", sqlType: "INTEGER", notNull: 1},
-		{name: "consecutive_bad_windows", sqlType: "INTEGER", notNull: 1},
 		{name: "overheat_count", sqlType: "INTEGER", notNull: 1},
-		{name: "cooldown_until", sqlType: "INTEGER", notNull: 1},
+		{name: "recovery_healthy_count", sqlType: "INTEGER", notNull: 1},
+		{name: "unreadable_poll_count", sqlType: "INTEGER", notNull: 1},
 		{name: "pass_started_at", sqlType: "INTEGER", notNull: 1},
 		{name: "pass_trigger", sqlType: "TEXT", notNull: 1},
 		{name: "pass_reference_hash", sqlType: "REAL", notNull: 1},
@@ -3408,7 +3975,6 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "safety_reason", sqlType: "TEXT", notNull: 1},
 		{name: "hold_reason", sqlType: "TEXT", notNull: 1},
 		{name: "settled_at", sqlType: "INTEGER", notNull: 1},
-		{name: "evidence_deadline_at", sqlType: "INTEGER", notNull: 1},
 		{name: "accounted_through_at", sqlType: "INTEGER", notNull: 1},
 	},
 	"operating_points": {
@@ -3430,6 +3996,7 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "entered_at", sqlType: "INTEGER", notNull: 1},
 		{name: "entry_attempt_id", sqlType: "INTEGER", notNull: 1},
 		{name: "reference_hash", sqlType: "REAL", notNull: 1},
+		{name: "evidence_epoch_id", sqlType: "INTEGER", notNull: 1},
 	},
 	"optimizer_hourly": {
 		{name: "mac_addr", sqlType: "TEXT", notNull: 1, pk: 1},
@@ -3441,6 +4008,33 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "incumbent_counterfactual_hash_seconds", sqlType: "REAL", notNull: 1},
 		{name: "settled_duration_nanos", sqlType: "INTEGER", notNull: 1},
 		{name: "trial_duration_nanos", sqlType: "INTEGER", notNull: 1},
+	},
+	"evidence_epochs": {
+		{name: "id", sqlType: "INTEGER", notNull: 1, pk: 1},
+		{name: "mac_addr", sqlType: "TEXT", notNull: 1},
+		{name: "frequency", sqlType: "INTEGER", notNull: 1},
+		{name: "core_voltage", sqlType: "INTEGER", notNull: 1},
+		{name: "purpose", sqlType: "TEXT", notNull: 1},
+		{name: "required_windows", sqlType: "INTEGER", notNull: 1},
+		{name: "opened_at", sqlType: "INTEGER", notNull: 1},
+		{name: "settled_sample_count", sqlType: "INTEGER", notNull: 1},
+		{name: "closed_windows", sqlType: "INTEGER", notNull: 1},
+		{name: "rejected_windows", sqlType: "INTEGER", notNull: 1},
+		{name: "missed_polls", sqlType: "INTEGER", notNull: 1},
+		{name: "window_sample_count", sqlType: "INTEGER", notNull: 1},
+		{name: "window_span_nanos", sqlType: "INTEGER", notNull: 1},
+		{name: "window_median_hash", sqlType: "REAL", notNull: 1},
+		{name: "window_expected_hash", sqlType: "REAL", notNull: 1},
+		{name: "window_attainment", sqlType: "REAL", notNull: 1},
+		{name: "window_mean_temp", sqlType: "REAL", notNull: 1},
+		{name: "window_p95_temp", sqlType: "REAL", notNull: 1},
+		{name: "window_p95_vr_temp", sqlType: "REAL", notNull: 1},
+		{name: "window_p95_power", sqlType: "REAL", notNull: 1},
+		{name: "window_error_percent", sqlType: "REAL"},
+		{name: "window_accepted_delta", sqlType: "INTEGER", notNull: 1},
+		{name: "window_rejected_delta", sqlType: "INTEGER", notNull: 1},
+		{name: "closed_at", sqlType: "INTEGER", notNull: 1},
+		{name: "outcome", sqlType: "TEXT", notNull: 1},
 	},
 }
 
@@ -3478,7 +4072,6 @@ CREATE TABLE optimizer_miners (
 	ip TEXT NOT NULL,
 	phase TEXT NOT NULL,
 	phase_started_at INTEGER NOT NULL,
-	ramp_until INTEGER NOT NULL,
 	current_frequency INTEGER NOT NULL,
 	current_core_voltage INTEGER NOT NULL,
 	best_frequency INTEGER NOT NULL,
@@ -3494,9 +4087,9 @@ CREATE TABLE optimizer_miners (
 	observed_frequency INTEGER NOT NULL,
 	observed_core_voltage INTEGER NOT NULL,
 	observed_count INTEGER NOT NULL,
-	consecutive_bad_windows INTEGER NOT NULL,
 	overheat_count INTEGER NOT NULL,
-	cooldown_until INTEGER NOT NULL,
+	recovery_healthy_count INTEGER NOT NULL,
+	unreadable_poll_count INTEGER NOT NULL,
 	pass_started_at INTEGER NOT NULL,
 	pass_trigger TEXT NOT NULL,
 	pass_reference_hash REAL NOT NULL,
@@ -3506,7 +4099,6 @@ CREATE TABLE optimizer_miners (
 	safety_reason TEXT NOT NULL,
 	hold_reason TEXT NOT NULL,
 	settled_at INTEGER NOT NULL,
-	evidence_deadline_at INTEGER NOT NULL,
 	accounted_through_at INTEGER NOT NULL
 );
 CREATE TABLE operating_points (
@@ -3528,6 +4120,7 @@ CREATE TABLE operating_points (
 	entered_at INTEGER NOT NULL,
 	entry_attempt_id INTEGER NOT NULL,
 	reference_hash REAL NOT NULL,
+	evidence_epoch_id INTEGER NOT NULL,
 	PRIMARY KEY (mac_addr, frequency, core_voltage)
 );
 CREATE UNIQUE INDEX operating_points_one_entry_attempt
@@ -3545,7 +4138,43 @@ CREATE TABLE optimizer_hourly (
 	trial_duration_nanos INTEGER NOT NULL,
 	PRIMARY KEY (mac_addr, hour_started_at)
 );
-PRAGMA user_version = 6;
+CREATE TABLE evidence_epochs (
+	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+	mac_addr TEXT NOT NULL,
+	frequency INTEGER NOT NULL,
+	core_voltage INTEGER NOT NULL,
+	purpose TEXT NOT NULL
+		CHECK (purpose IN ('baseline', 'trial', 'hold_validation', 'safety_validation', 'probation')),
+	required_windows INTEGER NOT NULL CHECK (required_windows IN (1, 2)),
+	opened_at INTEGER NOT NULL,
+	settled_sample_count INTEGER NOT NULL,
+	closed_windows INTEGER NOT NULL,
+	rejected_windows INTEGER NOT NULL,
+	missed_polls INTEGER NOT NULL,
+	window_sample_count INTEGER NOT NULL,
+	window_span_nanos INTEGER NOT NULL,
+	window_median_hash REAL NOT NULL,
+	window_expected_hash REAL NOT NULL,
+	window_attainment REAL NOT NULL,
+	window_mean_temp REAL NOT NULL,
+	window_p95_temp REAL NOT NULL,
+	window_p95_vr_temp REAL NOT NULL,
+	window_p95_power REAL NOT NULL,
+	window_error_percent REAL,
+	window_accepted_delta INTEGER NOT NULL,
+	window_rejected_delta INTEGER NOT NULL,
+	closed_at INTEGER NOT NULL,
+	outcome TEXT NOT NULL
+		CHECK (outcome IN ('', 'validated', 'rejected', 'starved', 'contradicted')),
+	CHECK ((closed_at = 0) = (outcome = '')),
+	CHECK ((closed_windows = 0) = (window_sample_count = 0))
+);
+CREATE UNIQUE INDEX evidence_epochs_one_open
+	ON evidence_epochs(mac_addr)
+	WHERE closed_at = 0;
+CREATE INDEX evidence_epochs_mac_opened
+	ON evidence_epochs (mac_addr, opened_at);
+PRAGMA user_version = 7;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -3721,6 +4350,14 @@ func validateOptimizerIndexes(ctx context.Context, conn *sql.Conn) error {
 			table: "operating_points",
 			sql:   "CREATE UNIQUE INDEX operating_points_one_entry_attempt ON operating_points(entry_attempt_id) WHERE entry_attempt_id > 0",
 		},
+		"evidence_epochs_one_open": {
+			table: "evidence_epochs",
+			sql:   "CREATE UNIQUE INDEX evidence_epochs_one_open ON evidence_epochs(mac_addr) WHERE closed_at = 0",
+		},
+		"evidence_epochs_mac_opened": {
+			table: "evidence_epochs",
+			sql:   "CREATE INDEX evidence_epochs_mac_opened ON evidence_epochs (mac_addr, opened_at)",
+		},
 	}
 	if len(actual) != len(expected) {
 		return fmt.Errorf("application index set is incomplete or unexpected")
@@ -3780,7 +4417,7 @@ func validateStoredOptimizerData(ctx context.Context, conn *sql.Conn) error {
 		`SELECT mac_addr, frequency, core_voltage, status, median_hash,
 			expected_hash, attainment, mean_temp, p95_temp, p95_vr_temp,
 			p95_power, error_percent, accepted_delta, rejected_delta,
-			measured_at, entered_at, entry_attempt_id, reference_hash
+			measured_at, entered_at, entry_attempt_id, reference_hash, evidence_epoch_id
 		FROM operating_points
 		ORDER BY mac_addr, frequency, core_voltage`,
 	)
@@ -3827,7 +4464,34 @@ func validateStoredOptimizerData(ctx context.Context, conn *sql.Conn) error {
 			return fmt.Errorf("mutation attempt %d: %w", attempt.ID, err)
 		}
 	}
-	if err := validateCrossTableState(ctx, conn, states, records, attempts); err != nil {
+
+	rows, err = conn.QueryContext(ctx, evidenceEpochSelect+" ORDER BY id")
+	if err != nil {
+		return err
+	}
+	var epochs []EvidenceEpoch
+	for rows.Next() {
+		epoch, err := scanEvidenceEpoch(rows)
+		if err != nil {
+			_ = rows.Close()
+			return err
+		}
+		epochs = append(epochs, epoch)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, epoch := range epochs {
+		if err := validateEvidenceEpoch(epoch, true); err != nil {
+			return fmt.Errorf("evidence epoch %d: %w", epoch.ID, err)
+		}
+	}
+
+	if err := validateCrossTableState(ctx, conn, states, records, attempts, epochs); err != nil {
 		return err
 	}
 	rows, err = conn.QueryContext(ctx, `SELECT
@@ -3869,7 +4533,98 @@ func validateCrossTableState(
 	states map[string]MinerState,
 	records []OperatingPointRecord,
 	attempts []MutationAttempt,
+	epochs []EvidenceEpoch,
 ) error {
+	epochsByID := make(map[int64]EvidenceEpoch, len(epochs))
+	openEpochByMac := make(map[string]EvidenceEpoch)
+	starvedByMac := make(map[string]bool)
+	for _, epoch := range epochs {
+		if _, known := states[epoch.MacAddr]; !known {
+			return fmt.Errorf("evidence epoch %d belongs to unknown miner %s", epoch.ID, epoch.MacAddr)
+		}
+		epochsByID[epoch.ID] = epoch
+		if epoch.ClosedAt.IsZero() {
+			if _, exists := openEpochByMac[epoch.MacAddr]; exists {
+				return fmt.Errorf("miner %s has more than one open evidence epoch", epoch.MacAddr)
+			}
+			openEpochByMac[epoch.MacAddr] = epoch
+		} else if epoch.Outcome == EpochStarved {
+			starvedByMac[epoch.MacAddr] = true
+		}
+	}
+	// Every terminal, non-entered, non-starved, non-unobservable operating_points row that carries a
+	// positive evidence_epoch_id resolves it to a closed epoch. Its outcome is "validated" or
+	// "rejected" for the normal window-evaluation paths; a safety-interrupted candidate
+	// (thermal/power/vr_hot) resolves to a "contradicted" epoch instead, because a safety transition
+	// takes ownership before any window predicate is evaluated (see closeCandidateEpoch). A baseline
+	// row always carries one (validatePointRecord requires it); a candidate row may legitimately
+	// carry none, per the resume-failure gap documented there.
+	for _, record := range records {
+		if record.Status == PointEntered || record.Status == PointUnobservable || record.Status == PointStarved {
+			if record.EvidenceEpochID != 0 {
+				return fmt.Errorf("point %s/%d/%d has an evidence epoch for status %q, which must carry none",
+					record.MacAddr, record.Frequency, record.CoreVoltage, record.Status)
+			}
+			continue
+		}
+		if record.EvidenceEpochID <= 0 {
+			continue
+		}
+		epoch, ok := epochsByID[record.EvidenceEpochID]
+		if !ok {
+			return fmt.Errorf("point %s/%d/%d references a missing evidence epoch", record.MacAddr, record.Frequency, record.CoreVoltage)
+		}
+		if epoch.ClosedAt.IsZero() {
+			return fmt.Errorf("point %s/%d/%d resolves to an open evidence epoch", record.MacAddr, record.Frequency, record.CoreVoltage)
+		}
+		validOutcome := epoch.Outcome == EpochValidated || epoch.Outcome == EpochRejected
+		safetyInterrupted := record.Status == PointThermal || record.Status == PointPower || record.Status == PointVRHot
+		if !validOutcome && safetyInterrupted && epoch.Outcome == EpochContradicted {
+			validOutcome = true
+		}
+		if !validOutcome {
+			return fmt.Errorf("point %s/%d/%d resolves to an evidence epoch with outcome %q",
+				record.MacAddr, record.Frequency, record.CoreVoltage, epoch.Outcome)
+		}
+	}
+	for macAddr, state := range states {
+		open, hasOpen := openEpochByMac[macAddr]
+		// A starved HOLD is the one HOLD reason that requires an open evidence epoch: starveBaseline
+		// always opens a probation successor in the same transaction it closes the starved epoch in,
+		// so the miner is never durably starved without one (see "Terminal States Get Exit
+		// Predicates"'s starvation-exit successor). The RFC states this literally as "a starved HOLD
+		// has a closed epoch whose outcome is starved" — the open probation epoch alone is not that
+		// evidence; the closed starved epoch that opened it, still present in the ledger, is.
+		if state.Phase == PhaseHold && state.HoldReason == HoldStarved {
+			if !hasOpen {
+				return fmt.Errorf("miner %s is starved HOLD with no open evidence epoch", macAddr)
+			}
+			if !starvedByMac[macAddr] {
+				return fmt.Errorf("miner %s is starved HOLD with no closed starved evidence epoch in its ledger", macAddr)
+			}
+		}
+		if !hasOpen {
+			continue
+		}
+		if open.Point != state.CurrentPoint() {
+			return fmt.Errorf("miner %s has an open evidence epoch whose point does not match durable current", macAddr)
+		}
+		if state.Phase == PhaseOverheat {
+			return fmt.Errorf("miner %s is OVERHEAT with an open evidence epoch", macAddr)
+		}
+		if state.PendingKind != "" {
+			return fmt.Errorf("miner %s has a pending mutation with an open evidence epoch", macAddr)
+		}
+		if !state.SettledAt.IsZero() {
+			return fmt.Errorf("miner %s is settled with an open evidence epoch", macAddr)
+		}
+		if state.Phase == PhaseHold && state.HoldReason == HoldRejected {
+			return fmt.Errorf("miner %s is rejected HOLD with an open evidence epoch", macAddr)
+		}
+		if state.Phase == PhaseHold && state.HoldReason == HoldStarved && open.Purpose != EpochProbation {
+			return fmt.Errorf("miner %s is starved HOLD with a non-probation open evidence epoch", macAddr)
+		}
+	}
 	attemptsByID := make(map[int64]MutationAttempt, len(attempts))
 	pointsByAttempt := make(map[int64]OperatingPointRecord)
 	for _, record := range records {
@@ -3969,12 +4724,16 @@ func validateCrossTableState(
 			return fmt.Errorf("miner %s has point history without exactly one pass baseline", macAddr)
 		}
 		if baselineCount == 0 && state.Phase != PhaseOverheat &&
-			!(state.Phase == PhaseHold && state.HoldReason == HoldBlocked) {
+			!(state.Phase == PhaseHold && state.HoldReason == HoldRejected) {
 			return fmt.Errorf("miner %s has no pass baseline", macAddr)
 		}
-		if baselineCount == 1 && baseline.Status == PointEntered && state.Phase == PhaseHold && state.HoldReason != HoldManual {
-			// An entered baseline is only valid while the pass is still collecting
-			// evidence, or while a pending lifecycle is reconciling it.
+		if baselineCount == 1 && baseline.Status == PointEntered && state.Phase == PhaseHold &&
+			state.HoldReason != HoldManual && state.HoldReason != HoldStarved {
+			// An entered baseline is only valid while the pass is still collecting evidence, while a
+			// pending lifecycle is reconciling it, or while a starved baseline epoch's probation
+			// successor is waiting for the environment to prove it can deliver samples again — the
+			// entered row is untouched through starvation and probation by design (starveBaseline
+			// writes no operating_points record; see its doc comment).
 			if state.Phase != PhaseBaseline && state.PendingKind == "" {
 				return fmt.Errorf("miner %s retains an entered baseline outside active collection", macAddr)
 			}
@@ -4084,47 +4843,8 @@ func validateStoredPhaseShape(
 	records []OperatingPointRecord,
 	attempts map[int64]MutationAttempt,
 ) error {
-	completedUnresumed := false
-	for _, attempt := range attempts {
-		if attempt.MacAddr == state.MacAddr && !attempt.CompletedAt.IsZero() &&
-			attempt.MiningResumedAt.IsZero() && attempt.FailedAt.IsZero() {
-			completedUnresumed = true
-			break
-		}
-	}
-	if state.PendingKind != "" && state.EvidenceDeadlineAt.IsZero() == false {
-		return fmt.Errorf("pending mutation retains an evidence deadline")
-	}
-	if !state.EvidenceDeadlineAt.IsZero() {
-		if state.RampUntil.IsZero() {
-			return fmt.Errorf("evidence deadline exists without a ramp")
-		}
-		if state.EvidenceDeadlineAt.Before(state.RampUntil) {
-			return fmt.Errorf("evidence deadline precedes ramp")
-		}
-	}
 	if state.MiningPending && state.PendingKind == MutationOperatingPoint {
 		return fmt.Errorf("mining and operating-point obligations overlap")
-	}
-	if state.Phase == PhaseOverheat && !state.EvidenceDeadlineAt.IsZero() {
-		return fmt.Errorf("overheat phase retains an evidence deadline")
-	}
-	if state.Phase == PhaseHold && state.HoldReason == HoldBlocked && !state.EvidenceDeadlineAt.IsZero() {
-		return fmt.Errorf("blocked hold retains an evidence deadline")
-	}
-	if state.Phase == PhaseHold && state.HoldReason == HoldOptimized &&
-		state.SettledAt.IsZero() && state.PendingKind == "" && state.EvidenceDeadlineAt.IsZero() && !completedUnresumed {
-		return fmt.Errorf("active hold validation has no evidence deadline")
-	}
-	if (state.Phase == PhaseBaseline || state.Phase == PhaseUndervolt ||
-		state.Phase == PhaseFrequencyTest || state.Phase == PhaseVoltageTest) &&
-		state.PendingKind == "" && state.EvidenceDeadlineAt.IsZero() && !completedUnresumed {
-		return fmt.Errorf("active optimization phase has no evidence deadline")
-	}
-	if state.Phase == PhaseCooldown && state.PendingKind == "" &&
-		state.EvidenceDeadlineAt.IsZero() && !completedUnresumed &&
-		state.SafetyReason == "" {
-		return fmt.Errorf("active cooldown validation has no evidence deadline")
 	}
 	if state.Phase == PhaseHold && state.HoldReason == HoldOptimized && state.PendingKind != "" &&
 		(state.FallbackPoint() != (OperatingPoint{}) || state.PendingKind != MutationOperatingPoint) {
@@ -4177,9 +4897,6 @@ func validateStoredPhaseShape(
 		}
 		if state.PendingKind != "" || state.CurrentPoint() != attempt.TargetPoint() {
 			return fmt.Errorf("completed mutation has not-resumed state shape")
-		}
-		if !state.EvidenceDeadlineAt.IsZero() {
-			return fmt.Errorf("completed mutation has an evidence deadline before healthy resume")
 		}
 	}
 	return nil
@@ -4295,14 +5012,6 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		state.PendingKind != MutationSafetyRollback &&
 		state.PendingKind != MutationOverheatRecovery:
 		return fmt.Errorf("overheat phase has invalid pending mutation kind %q", state.PendingKind)
-	case state.PendingKind != "" && state.EvidenceDeadlineAt.IsZero() == false:
-		return fmt.Errorf("pending mutation retains an evidence deadline")
-	case !state.EvidenceDeadlineAt.IsZero() && state.RampUntil.IsZero():
-		return fmt.Errorf("evidence deadline exists without a ramp")
-	case !state.EvidenceDeadlineAt.IsZero() && state.EvidenceDeadlineAt.Before(state.RampUntil):
-		return fmt.Errorf("evidence deadline precedes ramp")
-	case state.Phase == PhaseOverheat && !state.EvidenceDeadlineAt.IsZero():
-		return fmt.Errorf("overheat phase retains an evidence deadline")
 	case state.ObservedCount == 0 &&
 		(state.ObservedFrequency != 0 || state.ObservedCoreVoltage != 0):
 		return fmt.Errorf("observed operating point exists without confirmations")
@@ -4313,10 +5022,25 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("observed operating point is invalid")
 	case state.ObservedCount < 0:
 		return fmt.Errorf("observed count %d is invalid", state.ObservedCount)
-	case state.ConsecutiveBadWindows < 0:
-		return fmt.Errorf("bad-window count %d is invalid", state.ConsecutiveBadWindows)
 	case state.OverheatCount < 0:
 		return fmt.Errorf("overheat count %d is invalid", state.OverheatCount)
+	// recovery_healthy_count is bounded by recoveryHealthyPolls, but that bound is settings-derived
+	// and this package has no settings at load time; the bound is enforced by construction in the
+	// control-flow that increments it (it always exits COOLDOWN and resets to zero at the limit, so
+	// a value at or above the limit can never be produced), not by this validator. Only
+	// non-negative, and only nonzero inside COOLDOWN/OVERHEAT, are structural facts this validator
+	// can state.
+	case state.RecoveryHealthyCount < 0:
+		return fmt.Errorf("recovery healthy count %d is invalid", state.RecoveryHealthyCount)
+	case state.RecoveryHealthyCount != 0 && state.Phase != PhaseCooldown && state.Phase != PhaseOverheat:
+		return fmt.Errorf("recovery healthy count must be zero outside COOLDOWN/OVERHEAT")
+	// unreadable_poll_count is bounded by unreadablePollLimit, but that bound is settings-derived
+	// and this package has no settings at load time; the bound is enforced by construction in the
+	// control-flow that increments it (it always escalates and resets to zero at the limit, so a
+	// value at or above the limit can never be produced), not by this validator. Only non-negative
+	// is a structural fact this validator can state.
+	case state.UnreadablePollCount < 0:
+		return fmt.Errorf("unreadable poll count %d is invalid", state.UnreadablePollCount)
 	case !finite(state.BestHashRate) || state.BestHashRate < 0:
 		return fmt.Errorf("best hash rate %.2f is invalid", state.BestHashRate)
 	case state.PassStartedAt.IsZero():
@@ -4334,20 +5058,12 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("hold reason %q is invalid", state.HoldReason)
 	case state.Phase != PhaseHold && state.HoldReason != "":
 		return fmt.Errorf("hold reason exists outside HOLD")
-	case state.Phase == PhaseHold && state.HoldReason == HoldBlocked && !state.SettledAt.IsZero():
-		return fmt.Errorf("blocked hold is settled")
+	case state.Phase == PhaseHold &&
+		(state.HoldReason == HoldRejected || state.HoldReason == HoldStarved) &&
+		!state.SettledAt.IsZero():
+		return fmt.Errorf("rejected or starved hold is settled")
 	case state.Phase != PhaseHold && !state.SettledAt.IsZero():
 		return fmt.Errorf("settlement exists outside HOLD")
-	case state.Phase == PhaseHold &&
-		(state.HoldReason == HoldOptimized || state.HoldReason == HoldSafety || state.HoldReason == HoldManual) &&
-		!state.SettledAt.IsZero() && state.EvidenceDeadlineAt.IsZero() == false:
-		return fmt.Errorf("settled HOLD retains an evidence deadline")
-	case state.Phase == PhaseHold && state.HoldReason == HoldBlocked && !state.EvidenceDeadlineAt.IsZero():
-		return fmt.Errorf("blocked HOLD retains an evidence deadline")
-	case state.Phase == PhaseHold && state.HoldReason == HoldOptimized &&
-		state.SettledAt.IsZero() && state.PendingKind == "" && state.EvidenceDeadlineAt.IsZero() &&
-		!allowUnsettledHold:
-		return fmt.Errorf("active HOLD validation has no evidence deadline")
 	case state.Phase == PhaseHold && state.HoldReason == HoldOptimized && state.PendingKind != "" &&
 		(state.PendingKind != MutationOperatingPoint || state.FallbackPoint() != (OperatingPoint{})):
 		return fmt.Errorf("final placement has an invalid mutation shape")
@@ -4405,10 +5121,35 @@ func validatePointRecord(record OperatingPointRecord) error {
 		return fmt.Errorf("operating point is invalid")
 	case !validCanonicalPoint(record.Point()):
 		return fmt.Errorf("operating point is not on the supported automation grid")
-	case strings.TrimSpace(record.Status) == "":
+	case strings.TrimSpace(string(record.Status)) == "":
 		return fmt.Errorf("status is empty")
 	case !validPointStatus(record.Status):
 		return fmt.Errorf("status %q is invalid", record.Status)
+	case record.EvidenceEpochID < 0:
+		return fmt.Errorf("evidence epoch ID is negative")
+	case (record.Status == PointEntered || record.Status == PointUnobservable || record.Status == PointStarved) &&
+		record.EvidenceEpochID != 0:
+		return fmt.Errorf("status %q must carry no evidence epoch", record.Status)
+	// A baseline row (EntryAttemptID == 0) always passes through FinalizeBaseline, which always has
+	// an epoch to close, so it always carries a positive evidence_epoch_id.
+	case record.Status != PointEntered && record.Status != PointUnobservable && record.Status != PointStarved &&
+		record.EntryAttemptID == 0 && record.EvidenceEpochID <= 0:
+		return fmt.Errorf("status %q requires a positive evidence epoch", record.Status)
+	// A candidate row (EntryAttemptID > 0) normally carries a positive evidence_epoch_id too. The
+	// one exception: a mining-resume failure can finalize a candidate as PointUnstable, with every
+	// measurement field zeroed, before CompleteResume ever opens its trial epoch (the epoch's point
+	// must equal durable current, which only becomes true once two healthy polls confirm the
+	// mutation took effect) — see mutation.go's FailMutationFinalizeTrial call sites. The exemption
+	// is scoped to exactly that shape so a bug that produces a measured PointValidated/PointNoGain/
+	// PointThermal/etc. candidate row with no epoch is still rejected here, not silently accepted.
+	case record.EntryAttemptID > 0 && record.Status != PointEntered && record.Status != PointUnobservable &&
+		record.Status != PointStarved && record.EvidenceEpochID <= 0 &&
+		!(record.Status == PointUnstable &&
+			record.MedianHash == 0 && record.ExpectedHash == 0 && record.Attainment == 0 &&
+			record.MeanTemp == 0 && record.P95Temp == 0 && record.P95VRTemp == 0 &&
+			record.P95Power == 0 && record.ErrorPercent == nil &&
+			record.AcceptedDelta == 0 && record.RejectedDelta == 0):
+		return fmt.Errorf("status %q requires a positive evidence epoch", record.Status)
 	case !finite(record.MedianHash) || record.MedianHash < 0:
 		return fmt.Errorf("median hash rate %.2f is invalid", record.MedianHash)
 	case !finite(record.ExpectedHash) || record.ExpectedHash < 0:
@@ -4450,6 +5191,12 @@ func validatePointRecord(record OperatingPointRecord) error {
 			record.P95Power != 0 || record.ErrorPercent != nil ||
 			record.AcceptedDelta != 0 || record.RejectedDelta != 0):
 		return fmt.Errorf("unobservable point has terminal evidence")
+	case record.Status == PointStarved &&
+		(record.MedianHash != 0 || record.ExpectedHash != 0 || record.Attainment != 0 ||
+			record.MeanTemp != 0 || record.P95Temp != 0 || record.P95VRTemp != 0 ||
+			record.P95Power != 0 || record.ErrorPercent != nil ||
+			record.AcceptedDelta != 0 || record.RejectedDelta != 0):
+		return fmt.Errorf("starved point has terminal evidence")
 	case record.Status == PointValidated &&
 		(!finite(record.MedianHash) || record.MedianHash <= 0 ||
 			!finite(record.MeanTemp) || record.MeanTemp <= 0 ||
@@ -4653,12 +5400,13 @@ func validOptimizerPhase(phase OptimizerPhase) bool {
 	}
 }
 
-func validPointStatus(status string) bool {
+func validPointStatus(status PointStatus) bool {
 	switch status {
 	case PointEntered,
 		PointValidated,
 		PointUnstable,
 		PointNoGain,
+		PointStarved,
 		PointUnobservable,
 		PointThermal,
 		PointPower,
@@ -4675,7 +5423,7 @@ func validPassTrigger(trigger PassTrigger) bool {
 
 func validHoldReason(reason HoldReason) bool {
 	switch reason {
-	case HoldOptimized, HoldSafety, HoldManual, HoldBlocked:
+	case HoldOptimized, HoldSafety, HoldManual, HoldStarved, HoldRejected:
 		return true
 	default:
 		return false
@@ -4761,4 +5509,12 @@ func nullableFloat(value *float64) any {
 		return nil
 	}
 	return *value
+}
+
+func cloneFloat(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }

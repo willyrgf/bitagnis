@@ -131,8 +131,9 @@ blocker. If verification was intentionally omitted, say so explicitly.
 
 - `main.go` owns process startup, network discovery orchestration, polling, and terminal rendering.
   Keep it thin; domain decisions belong in the optimizer or `lib`.
-- `optimizer.go` owns thermal-frontier search, telemetry windows, safety evaluation, rollback,
-  cooldown, overheat policy, and operating-point target selection.
+- `optimizer.go` owns thermal-frontier search, the per-poll evidence-epoch lifecycle (ramp,
+  window admission, starvation/probation recovery), safety evaluation, rollback, cooldown, overheat
+  policy, and operating-point target selection.
 - `mutation.go` owns mutation priority, durable-intent coordination, preflight checks, PATCH/restart
   ordering, durable mutation-attempt milestones, same-MAC rediscovery, reboot proof, readback,
   healthy-mining resumption, startup mining reconciliation, and the optimization gate.
@@ -140,8 +141,11 @@ blocker. If verification was intentionally omitted, say so explicitly.
   network discovery primitives.
 - `lib/settings.go` owns strict YAML decoding, defaults, hostname overrides, and safety-setting
   validation.
-- `lib/state.go` owns durable optimizer and pending-mutation state, evaluated operating-point
-  records, mutation-attempt history, exclusive SQLite ownership, and exact schema validation.
+- `lib/state.go` owns durable optimizer and pending-mutation state, the evidence-epoch ledger, the
+  durable `WindowAggregate` measurement type, evaluated operating-point records, mutation-attempt
+  history, exclusive SQLite ownership, and exact schema validation. `Apply` over a closed
+  `Transition` set is the one write path for optimizer state; `optimizer.go` and `mutation.go`
+  construct transitions, they never write SQL directly.
 - `*_test.go` files own executable behavior contracts. Keep controller/optimizer tests in the root
   package and library boundary tests in `lib`.
 
@@ -178,11 +182,47 @@ These invariants are high risk if violated:
   close mining resumption only after two consecutive safe positive-hash polls.
 - A manual operating-point change requires two consecutive observations before adoption. Adoption
   starts a fresh baseline ramp and telemetry window.
-- Telemetry samples remain in memory. Durable state contains optimizer control state, evaluated
-  summaries, and credential-free mutation lifecycle timestamps, not raw polling history.
+- Telemetry samples remain in memory. Durable state contains optimizer control state, the
+  evidence-epoch ledger's settled-sample and window counters, evaluated summaries, and
+  credential-free mutation lifecycle timestamps — not raw polling history. A closed epoch's first
+  admitted window is the one durable exception: it is a stored aggregate, never raw samples.
 - Preserve evaluated-point history across overheat recovery and ordinary process restarts unless a
   deliberate schema or policy change says otherwise.
-- Repeated overheats extend cooldown, capped at 24 hours. Do not remove this backoff accidentally.
+- `COOLDOWN` exits on a durable count of consecutive polls proving the device is actually safe to
+  recover (`recoveryHealthyPolls`, a physical dwell derived from AxeOS's own autonomous overheat
+  recovery cadence — see `power_management_task.c`), never a timer. Any non-satisfying poll resets
+  the count to zero; the poll that reaches the threshold clears `SafetyReason` and opens the
+  `safety_validation` epoch in the same transition. The wall-clock cooldown timer this replaced (and
+  the durable field it wrote) was removed as part of the schema-version-7 cutover; do not reintroduce
+  a duration-based gate here — prefer a monotone, restart-surviving count, as below. A second,
+  distinct emergency interrupting a `COOLDOWN` dwell in progress must reset the count to zero, not
+  carry a prior episode's partial progress into the new one — every site that begins a fresh or
+  escalating emergency episode (`transitionEmergencyState`'s new-episode branch and its callers'
+  equivalents) resets `RecoveryHealthyCount` for exactly this reason.
+- Repeated overheats extending cooldown (an `OverheatCount`-derived exploration-restriction ladder
+  after repeated episodes) is a distinct, separately-tracked, **not-yet-implemented** invariant from
+  the `COOLDOWN` exit predicate above — do not conflate the two. `OverheatCount` itself is durable
+  and increments correctly, but no restriction currently reads it, and the RFC's stated derivation
+  (an "episode anchor" read from `MinerState.PhaseStartedAt`) does not hold: `PhaseStartedAt` is
+  overwritten by ordinary transitions (`ResetPass`, `AdmitTrial`, `FinalizeTrial`, `FinalizeBaseline`,
+  `AdoptManualPoint`, mutation completion) that can occur between an overheat episode and a later
+  exploration pass, so it cannot serve as a stable anchor for "how recently did this miner overheat."
+  This is a known, reported gap requiring a design decision (e.g., deriving the anchor from
+  `mutation_attempts` history instead), not license to guess at a replacement unilaterally.
+- Time may be an input to a predicate; time must never be the authority for a transition. A durable
+  count of consecutive satisfying polls degrades correctly under a degraded poll yield by taking
+  longer; a wall-clock deadline racing that same yield degrades by failing invisibly. Prefer a
+  monotone, restart-surviving count over any new duration-based gate.
+- An unreadable poll (unsupported device identity, non-canonical ASIC grid, or incomplete
+  telemetry) is a non-event for the optimizer: no phase transition, no cleared pending authority,
+  no cleared evidence progress, and no supersession — only a durable count that escalates after
+  twelve consecutive misses. It must never suppress instantaneous safety assessment over whatever
+  telemetry did validate: a device reporting an unsafe reading alongside a malformed ASIC grid is a
+  thermal emergency, not a read failure, and that assessment runs at every value of that count.
+- A blocked `HOLD` splits by cause: `starved` (the environment never delivered a usable evaluation
+  window) exits automatically once it proves it can, with no timer and no operator step; `rejected`
+  (the controller measured the point and it failed) stays terminal until an explicit retune. Do not
+  collapse them back into one absorbing state.
 - Actual sustained hash rate is the objective. Expected hash rate, attainment, ASIC error
   percentage, and share deltas are diagnostics or quality constraints; expected hash alone must not
   veto a faster safe point.

@@ -15,13 +15,14 @@ defaults:
   # Optional AxeOS ASIC error telemetry is a health constraint.
   maxErrorPercentage: 5
 
-  # Each trial ramps for 60 seconds, then collects a five-minute window.
+  # Ramp and evaluation-window duration are inputs to durable sample counts,
+  # not deadlines: a trial ramps for roughly 60 seconds' worth of consecutive
+  # settled samples, then collects roughly a five-minute window's worth of
+  # admitted samples. A slow or lossy poll cycle takes longer instead of
+  # failing; a process restart resumes against whatever it already collected.
   metricsInterval: 10
   rampUpSeconds: 60
   evaluationWindowMinutes: 5
-
-  # Repeated overheats multiply this cooldown, capped at 24 hours.
-  overheatCooldownMinutes: 120
 
   # Set enabled here to apply mining settings to every selected miner, or
   # override it per hostname. Passwords are read from the named .env entries
