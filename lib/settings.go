@@ -26,7 +26,6 @@ const (
 	defaultMetricsInterval      = 10
 	defaultRampUpSeconds        = 60
 	defaultEvaluationWindowMins = 5
-	defaultOverheatCooldownMins = 120
 	maxPasswordFileBytes        = 64 * 1024
 	axeOSASICTripTemp           = 75
 	axeOSVRTripTemp             = 105
@@ -44,7 +43,6 @@ type Settings struct {
 	MetricsInterval         int            `yaml:"metricsInterval"`
 	RampUpSeconds           int            `yaml:"rampUpSeconds"`
 	EvaluationWindowMinutes int            `yaml:"evaluationWindowMinutes"`
-	OverheatCooldownMins    int            `yaml:"overheatCooldownMinutes"`
 	Mining                  MiningSettings `yaml:"mining"`
 
 	MetricsTime          time.Duration `yaml:"-"`
@@ -82,7 +80,6 @@ type SettingsOverride struct {
 	MaxErrorPercentage      *float64                `yaml:"maxErrorPercentage"`
 	RampUpSeconds           *int                    `yaml:"rampUpSeconds"`
 	EvaluationWindowMinutes *int                    `yaml:"evaluationWindowMinutes"`
-	OverheatCooldownMins    *int                    `yaml:"overheatCooldownMinutes"`
 	Mining                  *MiningSettingsOverride `yaml:"mining"`
 }
 
@@ -300,9 +297,6 @@ func withDefaults(settings Settings) Settings {
 	if settings.EvaluationWindowMinutes == 0 {
 		settings.EvaluationWindowMinutes = defaultEvaluationWindowMins
 	}
-	if settings.OverheatCooldownMins == 0 {
-		settings.OverheatCooldownMins = defaultOverheatCooldownMins
-	}
 	return withDurations(settings)
 }
 
@@ -343,8 +337,6 @@ func validateSettings(settings Settings) error {
 		return fmt.Errorf("rampUpSeconds must be between 0 and 1800")
 	case settings.EvaluationWindowMinutes <= 0 || settings.EvaluationWindowMinutes > 24*60:
 		return fmt.Errorf("evaluationWindowMinutes must be between 1 and 1440")
-	case settings.OverheatCooldownMins <= 0 || settings.OverheatCooldownMins > 24*60:
-		return fmt.Errorf("overheatCooldownMinutes must be between 1 and 1440")
 	}
 	if err := validateMiningSettings(settings.Mining); err != nil {
 		return err
@@ -382,9 +374,6 @@ func mergeSettings(settings Settings, override SettingsOverride) Settings {
 	}
 	if override.EvaluationWindowMinutes != nil {
 		settings.EvaluationWindowMinutes = *override.EvaluationWindowMinutes
-	}
-	if override.OverheatCooldownMins != nil {
-		settings.OverheatCooldownMins = *override.OverheatCooldownMins
 	}
 	if override.Mining != nil {
 		settings.Mining = mergeMiningSettings(settings.Mining, *override.Mining)

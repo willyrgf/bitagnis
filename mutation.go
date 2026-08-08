@@ -423,9 +423,9 @@ func (coordinator *mutationCoordinator) advanceRetuneLocked(
 	// with all controller state changes; ResetOptimizationPass then rechecks
 	// the durable state in its own transaction before deleting point history.
 	startedAt := now
-	rampUntil := startedAt.Add(observation.settings.RampUpTime)
-	deadline := rampUntil.Add(4 * observation.settings.EvaluationWindowTime)
-	if err := coordinator.states.ResetOptimizationPass(state.MacAddr, state.CurrentPoint(), startedAt, rampUntil, deadline); err != nil {
+	if _, err := coordinator.states.Apply(lib.ResetPass{
+		MacAddr: state.MacAddr, Point: state.CurrentPoint(),
+	}, startedAt); err != nil {
 		return false, fmt.Errorf("retune %s: %w", coordinator.retuneHost, err)
 	}
 	coordinator.reset(state.MacAddr)
@@ -541,32 +541,16 @@ func (coordinator *mutationCoordinator) advanceMiningResumeLocked(
 			coordinator.resumeHealth[macAddr] = health
 			continue
 		}
-		settings := observation.settings
-		rampUntil := now.Add(settings.RampUpTime)
-		windowCount := 1
-		if observation.state.Phase == lib.PhaseBaseline ||
-			observation.state.Phase == lib.PhaseUndervolt ||
-			observation.state.Phase == lib.PhaseFrequencyTest ||
-			observation.state.Phase == lib.PhaseVoltageTest {
-			windowCount = 2
-		} else if observation.state.Phase == lib.PhaseHold &&
-			(observation.state.HoldReason == lib.HoldOptimized || observation.state.HoldReason == lib.HoldManual) {
-			windowCount = 1
-		}
-		deadlineBase := rampUntil
-		if observation.state.CooldownUntil.After(deadlineBase) {
-			deadlineBase = observation.state.CooldownUntil
-		}
-		deadline := deadlineBase.Add(time.Duration(windowCount*2) * settings.EvaluationWindowTime)
-		if err := coordinator.states.CompleteMiningResume(
-			&observation.state,
-			attempt.ID,
-			now,
-			rampUntil,
-			deadline,
-		); err != nil {
+		// CompleteResume now derives the epoch it opens (purpose and required-window count) from
+		// whatever phase and hold reason the completed mutation already left durable
+		// (lib.EpochShapeForPhase), so the caller no longer precomputes a window count or deadline.
+		result, err := coordinator.states.Apply(lib.CompleteResume{
+			MacAddr: observation.state.MacAddr, AttemptID: attempt.ID,
+		}, now)
+		if err != nil {
 			return err
 		}
+		observation.state = result.State
 		delete(coordinator.resumeHealth, macAddr)
 	}
 	return nil
@@ -584,7 +568,12 @@ func (coordinator *mutationCoordinator) handleMutationResumeFailureLocked(
 	if attempt.Kind == lib.MutationMiningConfiguration {
 		state.MiningPending = true
 		coordinator.startupBlocked = state.Hostname
-		return coordinator.states.FailMutationAndSave(state, attempt.ID, lib.MutationFailureMiningResume, now)
+		result, err := coordinator.states.Apply(lib.FailMutation{State: *state, AttemptID: attempt.ID, Stage: lib.MutationFailureMiningResume}, now)
+		if err != nil {
+			return err
+		}
+		*state = result.State
+		return nil
 	}
 	if attempt.Kind == lib.MutationOperatingPoint {
 		records, err := coordinator.states.ListPoints(state.MacAddr)
@@ -610,12 +599,17 @@ func (coordinator *mutationCoordinator) handleMutationResumeFailureLocked(
 				record.ErrorPercent = nil
 				record.AcceptedDelta = 0
 				record.RejectedDelta = 0
-				if err := coordinator.states.FailMutationAndFinalizeTrial(
-					state, record, lib.TrialReturn, attempt.ID,
-					lib.MutationFailureMiningResume, now, time.Time{}, time.Time{},
-				); err != nil {
+				// This candidate never reached CompleteResume (that is what would have opened its
+				// trial epoch, once two healthy polls proved it was the running configuration), so
+				// there is no epoch to close here — the zero-value Epoch tells finalizeTrialTx that.
+				result, err := coordinator.states.Apply(lib.FailMutationFinalizeTrial{
+					State: *state, Record: record, Decision: lib.TrialReturn, AttemptID: attempt.ID,
+					Stage: lib.MutationFailureMiningResume,
+				}, now)
+				if err != nil {
 					return err
 				}
+				*state = result.State
 				return nil
 			}
 		}
@@ -626,17 +620,30 @@ func (coordinator *mutationCoordinator) handleMutationResumeFailureLocked(
 		state.Phase = lib.PhaseCooldown
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.EvidenceDeadlineAt = time.Time{}
-		return coordinator.states.FailMutationAndSave(state, attempt.ID, lib.MutationFailureMiningResume, now)
+		result, err := coordinator.states.Apply(lib.FailMutation{State: *state, AttemptID: attempt.ID, Stage: lib.MutationFailureMiningResume}, now)
+		if err != nil {
+			return err
+		}
+		*state = result.State
+		return nil
 	}
+	// This attempt already completed (PATCH + restart + readback verified), so the device is
+	// confirmed running at this exact configuration; it simply never produced a positive hash within
+	// the health deadline. That is itself a real, measured conclusion about this configuration —
+	// mirroring the trial-phase branch above, which reaches the identical no-positive-hash outcome
+	// via PointUnstable/TrialReturn — so this is HoldRejected, not HoldStarved.
 	state.ClearPendingMutation()
 	state.SetFallbackPoint(lib.OperatingPoint{})
 	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldBlocked
+	state.HoldReason = lib.HoldRejected
 	state.SettledAt = time.Time{}
-	state.EvidenceDeadlineAt = time.Time{}
 	coordinator.startupBlocked = state.Hostname
-	return coordinator.states.FailMutationAndSave(state, attempt.ID, lib.MutationFailureMiningResume, now)
+	result, err := coordinator.states.Apply(lib.FailMutation{State: *state, AttemptID: attempt.ID, Stage: lib.MutationFailureMiningResume}, now)
+	if err != nil {
+		return err
+	}
+	*state = result.State
+	return nil
 }
 
 func (coordinator *mutationCoordinator) advanceStartupLocked(
@@ -680,13 +687,15 @@ func (coordinator *mutationCoordinator) advanceStartupLocked(
 		delete(coordinator.startupHealthSince, macAddr)
 		if !observation.state.MiningPending {
 			observation.state.MiningPending = true
-			if err := coordinator.states.SaveMiner(&observation.state); err != nil {
+			result, err := coordinator.states.Apply(lib.SaveState{State: observation.state}, now)
+			if err != nil {
 				return fmt.Errorf(
 					"persist mining configuration obligation for %s: %w",
 					observation.info.Hostname,
 					err,
 				)
 			}
+			observation.state = result.State
 		}
 		primaryPassword, fallbackPassword, err := coordinator.resolveMiningPasswords(mining)
 		if err != nil {
@@ -712,10 +721,18 @@ func (coordinator *mutationCoordinator) advanceStartupLocked(
 		return nil
 	}
 
-	if now.Before(observation.state.RampUntil) ||
-		!startupHealthy(observation.info, observation.settings) {
+	// Ramp completion is now a settled-sample count against the miner's open evidence epoch rather
+	// than a wall-clock deadline. A miner with no open epoch (e.g. HOLD/OVERHEAT at startup) has
+	// nothing to ramp toward, so it is not held back here.
+	rampIncomplete := false
+	if epoch, open, err := coordinator.states.OpenEvidenceEpochFor(macAddr); err != nil {
+		return err
+	} else if open && epoch.Progress.SettledSamples() < rampSamples(observation.settings) {
+		rampIncomplete = true
+	}
+	if rampIncomplete || !startupHealthy(observation.info, observation.settings) {
 		coordinator.startupHealth[macAddr] = 0
-		if now.Before(observation.state.RampUntil) {
+		if rampIncomplete {
 			return nil
 		}
 		if coordinator.healthExpiredLocked(macAddr, now) {
@@ -758,7 +775,6 @@ func (coordinator *mutationCoordinator) blockHealthLocked(macAddr string) {
 }
 
 func (coordinator *mutationCoordinator) openGateLocked(now time.Time) error {
-	_ = now
 	for _, macAddr := range coordinator.selected {
 		state, err := coordinator.states.LoadMiner(macAddr)
 		if err != nil {
@@ -771,7 +787,7 @@ func (coordinator *mutationCoordinator) openGateLocked(now time.Time) error {
 		state.ObservedFrequency = 0
 		state.ObservedCoreVoltage = 0
 		state.ObservedCount = 0
-		if err := coordinator.states.SaveMiner(&state); err != nil {
+		if _, err := coordinator.states.Apply(lib.SaveState{State: state}, now); err != nil {
 			return fmt.Errorf("open startup gate for %s: %w", state.Hostname, err)
 		}
 		coordinator.reset(macAddr)
@@ -1062,21 +1078,14 @@ func (coordinator *mutationCoordinator) execute(
 					current.ObservedCount = 1
 				}
 				if current.ObservedCount < manualConfirmationPolls {
-					if err := coordinator.states.SaveMiner(&current); err != nil {
+					if _, err := coordinator.states.Apply(lib.SaveState{State: current}, coordinator.now()); err != nil {
 						return open(lib.MutationFailurePreflight, fmt.Errorf("persist external operating-point observation: %w", err))
 					}
 					return open(lib.MutationFailurePreflight, fmt.Errorf("awaiting second safe external operating-point observation"))
 				}
-				rampUntil := coordinator.now().Add(request.settings.RampUpTime)
-				deadline := rampUntil.Add(2 * request.settings.EvaluationWindowTime)
-				if err := coordinator.states.AdoptExternalPoint(
-					&current,
-					operatingPointFromInfo(preflight),
-					request.attemptID,
-					coordinator.now(),
-					rampUntil,
-					deadline,
-				); err != nil {
+				if _, err := coordinator.states.Apply(lib.AdoptExternalPoint{
+					State: current, Point: operatingPointFromInfo(preflight), AttemptID: request.attemptID,
+				}, coordinator.now()); err != nil {
 					return open(lib.MutationFailurePreflight, fmt.Errorf("adopt external operating point: %w", err))
 				}
 				result.stateReconciled = true
@@ -1499,13 +1508,11 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 		if err != nil {
 			return err
 		}
-		settings, err := coordinator.settings.ForHost(state.Hostname)
-		if err != nil {
+		if _, err := coordinator.settings.ForHost(state.Hostname); err != nil {
 			return err
 		}
 		if state.Phase != lib.PhaseOverheat {
 			state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-			state.CooldownUntil = coordinator.now().Add(overheatCooldown(settings, state.OverheatCount))
 			state.PhaseStartedAt = coordinator.now()
 		}
 		state.ClearPendingMutation()
@@ -1513,9 +1520,14 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 		state.Phase = lib.PhaseOverheat
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.EvidenceDeadlineAt = time.Time{}
 		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-		return coordinator.states.QuarantineMutation(&state, result.attemptID, result.failureStage, coordinator.now())
+		// See optimizer.go's matching resets: a COOLDOWN dwell in progress before this escalation
+		// proved recovery from a different failure and must not carry over into this one.
+		state.RecoveryHealthyCount = 0
+		_, err = coordinator.states.Apply(lib.QuarantineMutation{
+			State: state, AttemptID: result.attemptID, Stage: result.failureStage,
+		}, coordinator.now())
+		return err
 	}
 	if attempt.FailureStage == lib.MutationFailureSafetySuperseded {
 		// Safety arbitration already replaced the normal state and finalized
@@ -1528,8 +1540,7 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 		return err
 	}
 	now := coordinator.now()
-	settings, err := coordinator.settings.ForHost(state.Hostname)
-	if err != nil {
+	if _, err := coordinator.settings.ForHost(state.Hostname); err != nil {
 		return err
 	}
 	if result.kind == lib.MutationOperatingPoint {
@@ -1557,18 +1568,22 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 				record.ErrorPercent = nil
 				record.AcceptedDelta = 0
 				record.RejectedDelta = 0
-				return coordinator.states.FailMutationAndFinalizeTrial(
-					&state, record, lib.TrialReturn, result.attemptID, result.failureStage,
-					now, now.Add(settings.RampUpTime),
-					now.Add(settings.RampUpTime+4*settings.EvaluationWindowTime),
-				)
+				// A readback-unavailable failure this early means the mutation never reached
+				// CompleteMutation, let alone CompleteResume, so this candidate never had a trial
+				// epoch to close (zero-value Epoch).
+				_, err := coordinator.states.Apply(lib.FailMutationFinalizeTrial{
+					State: state, Record: record, Decision: lib.TrialReturn, AttemptID: result.attemptID,
+					Stage: result.failureStage,
+				}, now)
+				return err
 			}
 		}
 	}
 	if result.kind == lib.MutationMiningConfiguration {
 		state.MiningPending = true
 		coordinator.startupBlocked = state.Hostname
-		return coordinator.states.FailMutationAndSave(&state, result.attemptID, result.failureStage, now)
+		_, err := coordinator.states.Apply(lib.FailMutation{State: state, AttemptID: result.attemptID, Stage: result.failureStage}, now)
+		return err
 	}
 	if result.kind == lib.MutationSafetyRollback || result.kind == lib.MutationOverheatRecovery {
 		// A safety attempt that reaches a readable same-obligation mismatch or
@@ -1576,25 +1591,37 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 		// history row is terminal, but a later coordinator pass may create the
 		// next recorded safety attempt after fresh preflight.
 		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.EvidenceDeadlineAt = time.Time{}
 		state.SettledAt = time.Time{}
 		state.HoldReason = ""
-		return coordinator.states.FailMutationAndSave(&state, result.attemptID, result.failureStage, now)
+		_, err := coordinator.states.Apply(lib.FailMutation{State: state, AttemptID: result.attemptID, Stage: result.failureStage}, now)
+		return err
 	}
 	state.ClearPendingMutation()
 	state.SetFallbackPoint(lib.OperatingPoint{})
-	state.EvidenceDeadlineAt = time.Time{}
 	if result.kind == lib.MutationSafetyRollback || result.kind == lib.MutationOverheatRecovery {
 		if state.Phase != lib.PhaseOverheat {
 			state.Phase = lib.PhaseCooldown
 		}
 		state.HoldReason = ""
 	} else {
+		// The mutation pipeline itself failed (preflight, PATCH, restart, or rediscovery) before ever
+		// reaching CompleteMutation, so hardware was never confirmed running the target
+		// configuration at all — the textbook "never got its patch/restart to complete" shape. That
+		// reads as starvation, but this commit deliberately still classifies it HoldRejected: the
+		// starved/probation exit this commit wires (see optimizer.go's starveBaseline/closeProbation)
+		// only knows how to resume a starved BASELINE epoch, because EpochPurpose is coarser than
+		// OptimizerPhase (trial's three sub-phases, hold_validation's Optimized/Manual sub-reason)
+		// and there is no durable epoch here at all to recover that context from. Giving this site
+		// HoldStarved without a working, correctly-targeted resume would recreate exactly the
+		// mislabeled-but-still-permanently-absorbing trap this file's own history warned against
+		// when the starved close was first deferred. See this commit's report for the full
+		// reasoning.
 		state.Phase = lib.PhaseHold
-		state.HoldReason = lib.HoldBlocked
+		state.HoldReason = lib.HoldRejected
 		state.SettledAt = time.Time{}
 	}
-	return coordinator.states.FailMutationAndSave(&state, result.attemptID, result.failureStage, now)
+	_, err = coordinator.states.Apply(lib.FailMutation{State: state, AttemptID: result.attemptID, Stage: result.failureStage}, now)
+	return err
 }
 
 func (coordinator *mutationCoordinator) completeMutationLocked(
@@ -1619,8 +1646,7 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 		return fmt.Errorf("complete mutation: attempt %d does not exist", result.attemptID)
 	}
 	completedAt := coordinator.now()
-	settings, err := coordinator.settings.ForHost(state.Hostname)
-	if err != nil {
+	if _, err := coordinator.settings.ForHost(state.Hostname); err != nil {
 		return err
 	}
 	if !attempt.CompletedAt.IsZero() {
@@ -1628,14 +1654,18 @@ func (coordinator *mutationCoordinator) completeMutationLocked(
 			state.IP = result.miner.IP
 		}
 		coordinator.routes[result.macAddr] = result.miner
-		return coordinator.states.CompleteMutationAttempt(&state, result.attemptID, attempt.CompletedAt)
+		_, err := coordinator.states.Apply(lib.CompleteMutation{
+			MacAddr: state.MacAddr, IP: state.IP, AttemptID: result.attemptID,
+		}, attempt.CompletedAt)
+		return err
 	}
 
 	if result.miner.IP != "" {
 		state.IP = result.miner.IP
 	}
-	state.RampUntil = completedAt.Add(settings.RampUpTime)
-	if err := coordinator.states.CompleteMutationAttempt(&state, result.attemptID, completedAt); err != nil {
+	if _, err := coordinator.states.Apply(lib.CompleteMutation{
+		MacAddr: state.MacAddr, IP: state.IP, AttemptID: result.attemptID,
+	}, completedAt); err != nil {
 		return fmt.Errorf("complete mutation for %s: %w", state.Hostname, err)
 	}
 	coordinator.routes[result.macAddr] = result.miner
@@ -1686,14 +1716,13 @@ func (coordinator *mutationCoordinator) cancelSupersededLocked(
 			active.cancel()
 			continue
 		}
-		if err := coordinator.states.SupersedeMutation(
-			&observation.state,
-			&observation.state,
-			active.attemptID,
-			now,
-		); err != nil {
+		result, err := coordinator.states.Apply(lib.SupersedeMutation{
+			Expected: observation.state, State: observation.state, AttemptID: active.attemptID,
+		}, now)
+		if err != nil {
 			return fmt.Errorf("close superseded mutation %d: %w", active.attemptID, err)
 		}
+		observation.state = result.State
 		active.cancel()
 	}
 	return nil
@@ -1898,11 +1927,11 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.Phase = lib.PhaseOverheat
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.EvidenceDeadlineAt = time.Time{}
 		state.SafetyReason = lib.SafetyReasonMutationUncertain
 		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-		state.CooldownUntil = now.Add(overheatCooldown(settings, state.OverheatCount))
-		return coordinator.states.SupersedeMutation(&expected, &state, request.attemptID, now)
+		state.RecoveryHealthyCount = 0
+		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
+		return err
 	}
 	minimum, err := minimumAdvertisedPoint(asic)
 	if err != nil || !supportedSafetyIdentity(observed) || !operatingPointAdvertised(asic, minimum) {
@@ -1911,17 +1940,17 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.Phase = lib.PhaseOverheat
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.EvidenceDeadlineAt = time.Time{}
 		state.SafetyReason = lib.SafetyReasonMutationUncertain
 		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-		state.CooldownUntil = now.Add(overheatCooldown(settings, state.OverheatCount))
-		return coordinator.states.SupersedeMutation(&expected, &state, request.attemptID, now)
+		state.RecoveryHealthyCount = 0
+		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
+		return err
 	}
 	assessment := assessInstantaneousSafety(observed, settings, operatingPointFromInfo(observed), minimum)
 	if assessment.action == safetyNormal || assessment.action == safetyUnavailable {
 		assessment = safetyAssessment{
 			action:  safetyEmergencyHold,
-			failure: safetyFailure{status: lib.PointThermal, reason: "mutation configuration became uncertain"},
+			failure: safetyFailure{status: string(lib.PointThermal), reason: "mutation configuration became uncertain"},
 		}
 	}
 	if assessment.action == safetyRollback {
@@ -1943,19 +1972,21 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.Phase = lib.PhaseCooldown
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.EvidenceDeadlineAt = time.Time{}
+		state.RecoveryHealthyCount = 0
 		if target == operatingPointFromInfo(observed) {
 			state.Phase = lib.PhaseOverheat
 			state.SafetyReason = lib.SafetyReasonMutationUncertain
 		} else {
 			state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 		}
-		return coordinator.states.SupersedeMutation(&expected, &state, request.attemptID, now)
+		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
+		return err
 	}
 	if _, err := transitionEmergencyState(&state, observed, asic, settings, now, assessment, false); err != nil {
 		return err
 	}
-	return coordinator.states.SupersedeMutation(&expected, &state, request.attemptID, now)
+	_, err = coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
+	return err
 }
 
 func pointHash(records []lib.OperatingPointRecord, point lib.OperatingPoint) float64 {

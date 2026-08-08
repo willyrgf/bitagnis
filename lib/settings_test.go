@@ -35,8 +35,7 @@ func TestLoadSettingsAppliesOptimizerDefaults(t *testing.T) {
 		defaults.VRTempHigh != 97 {
 		t.Fatalf("safety defaults = %+v", defaults)
 	}
-	if defaults.MaxErrorPercentage != 5 ||
-		defaults.OverheatCooldownMins != 120 {
+	if defaults.MaxErrorPercentage != 5 {
 		t.Fatalf("optimizer defaults = %+v", defaults)
 	}
 	if defaults.MetricsTime != 10*time.Second ||

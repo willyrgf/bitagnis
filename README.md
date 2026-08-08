@@ -34,6 +34,22 @@ This low-to-high sweep prevents a hot high-voltage trial from hiding a faster,
 cooler point at the same frequency. One bad window at an established point is
 never enough to change voltage.
 
+Evidence collection is durable and state-linear, not wall-clock. Ramp
+completion is a count of consecutive settled samples at the current point, not
+a timer, so a slow or lossy poll cycle degrades by taking longer instead of by
+failing. A window closes once it has enough samples or its span backstop is
+reached, and is admitted only if it kept enough samples and no gap inside it
+was too large; a poll that cannot be read (bad identity, bad ASIC grid, or
+incomplete telemetry) is a non-event for this machinery and neither advances
+nor discards progress. Progress toward the current evaluation, including a
+window already closed and stored, survives a process restart. An evaluation
+that keeps failing to produce an admissible window six times over is starved,
+not silently absorbed: the miner automatically re-attempts once the
+environment proves it can deliver a window's worth of samples again, with no
+timer and no operator action required. A point the controller did measure and
+reject is a different, and different-looking, terminal state — see `HOLD`
+below.
+
 ## Safety
 
 Safety is checked on every metrics poll, including while a trial is ramping.
@@ -58,8 +74,27 @@ AxeOS v2.8.1 trips strictly above 75°C ASIC temperature or 105°C VR
 temperature and stores the unadvertised emergency state `50 MHz / 1000 mV`.
 Bitagnis never adopts or evaluates that firmware state. Firmware recovery
 requires positive, finite ASIC temperature, VR temperature, and power; every
-recovery boundary; no power fault; and supported device identity. Repeated
-emergency episodes extend cooldown up to 24 hours.
+recovery boundary; no power fault; and supported device identity.
+
+**`COOLDOWN` exits on a durable count of consecutive healthy polls, not a
+timer.** Its previous exit — a wall-clock timer that grew with repeated
+overheat count, capped at 24 hours — raced accumulated evidence rather than
+authorizing a transition and has been removed along with the clock and
+`overheatCooldownMinutes` setting it depended on. Every poll while a miner is
+in `COOLDOWN` is checked against the same `safeToRecover` predicate firmware
+recovery uses; a satisfying poll advances a durable counter, and any
+non-satisfying poll resets it to zero. The dwell length — `ceil(60s /
+metricsInterval)` consecutive satisfying polls — is derived from AxeOS's own
+autonomous overheat recovery (`power_management_task.c`'s six consecutive
+5-second checks at or below its 45°C safe threshold, 30s), doubled for
+Bitagnis's coarser and lossier poll cadence. Reaching the threshold clears the
+durable `SafetyReason` in the same transition and opens a `safety_validation`
+evidence epoch, exactly like a starved `HOLD` re-entering evaluation; a single
+required window's worth of admitted evidence then either settles the miner
+into `HoldSafety` or, if that window's quality is unhealthy, rejects the epoch
+and leaves the miner in `COOLDOWN` to accumulate the healthy-poll count again.
+A process restart or a lost poll tick costs at most the healthy-poll count
+in progress, never previously-earned recovery evidence.
 
 `OVERHEAT` is the one durable emergency episode and fleet safety block. A
 typed `safety_rollback` or `overheat_recovery` intent is the only authority for
@@ -103,15 +138,33 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 6, with typed pending mutations, finite frontier
-state, hourly accounting, and one durable
+The current schema is version 7, with typed pending mutations, finite frontier
+state, hourly accounting, a durable evidence-epoch ledger, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema versions
-3, 4, and 5, an old partial database, or an unknown application object
-is rejected without modification; move it aside or remove it to create the current baseline.
-Evaluated history, cooldown, pending mutation ages, emergency episode ages,
-mutation attempts, and the bounded 384-hour hourly accounting history persist
-across ordinary restarts after that baseline is created.
+`overheat_pending` field, migration, or compatibility reader. Schema version 6
+and earlier, an old partial database, or an unknown application object is
+rejected without modification; move it aside or remove it to create the
+current baseline. Evaluated history, pending mutation ages, emergency episode
+ages, mutation attempts, evidence epochs, and the bounded 384-hour hourly
+accounting history persist across ordinary restarts after that baseline is
+created.
+
+`evidence_epochs` is the durable ledger for evaluation progress, shaped after
+`mutation_attempts`: one open epoch per miner, monotone settled-sample and
+window counters, and a terminal outcome (`validated`, `rejected`, `starved`,
+or `contradicted`). It replaces the volatile in-memory progress and wall-clock
+evidence deadline schema version 6 used, which discarded everything it had
+learned on every process restart or mutation gate and could not distinguish
+"never measured" from "measured many times and lost it." A process restart
+now costs at most one partial evaluation window, not the whole evaluation.
+`optimizer_miners` additionally carries `unreadable_poll_count` (a durable
+count of consecutive polls the optimizer could not read at all — bad grid, bad
+identity, or incomplete telemetry — that escalates to a safety-unknown episode
+after twelve consecutive misses, and never on its own suppresses instantaneous
+safety assessment) and `recovery_healthy_count` (the `COOLDOWN` recovery
+predicate's durable dwell counter described above; nonzero only in `COOLDOWN`
+or `OVERHEAT`, reset to zero by any non-satisfying poll and on the poll that
+reaches the threshold).
 
 Hourly wall-clock coverage is stored as integer nanoseconds, so merged bucket bounds and
 accounting-cursor coverage are exact. Hash-work totals remain floating-point measurements.
@@ -160,7 +213,28 @@ baseline only after the live fleet state is understood.
 If AxeOS settings are changed manually while Bitagnis is running, two consecutive
 polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
 Off-grid manual settings can be monitored, but Bitagnis will not emit them as
-automated requests.
+automated requests. Before treating a differing live pair as a manual change,
+Bitagnis checks whether it is actually the verified target of one of its own
+failed or superseded mutation attempts; if so, the eventual adoption — still
+gated on the same two consecutive polls — is logged as a reconciliation of its
+own ledger rather than as an external retune. This covers a non-safety
+mutation failure after a verified PATCH (for example a post-restart health
+check that never saw a positive hash); it does not yet cover a safety-recovery
+attempt reaching the same shape, since automated safety recovery does not
+currently clear the durable safety reason that a reconciliation would need to
+see cleared — a known, separate gap.
+
+A blocked `HOLD` is one of two distinct terminal causes, not one absorbing
+state: `starved` means the environment never delivered a usable evaluation
+window — the miner is healthy and untested, so it exits automatically the
+moment the environment proves it can deliver a window's worth of samples
+again, with no operator step and no timer. `rejected` means the controller did
+measure the point and it failed the quality or headroom bar, or the miner is
+running an off-grid or unadvertised pair it can observe but never automate; a
+rejected `HOLD` is a real conclusion and stays terminal until an explicit
+retune. A point record is never marked `unobservable` for both reasons at
+once: `starved` carries no measurement, and every other terminal status
+resolves to the closed evaluation that produced it.
 
 Normal optimization is a finite pass. Each advertised complete pair is consumed
 at most once per pass, terminal point outcomes are not reopened by elapsed time
@@ -194,7 +268,6 @@ defaults:
   metricsInterval: 10
   rampUpSeconds: 60
   evaluationWindowMinutes: 5
-  overheatCooldownMinutes: 120
 
   mining:
     enabled: false
@@ -267,8 +340,11 @@ Optimizer states are:
 - `UNDERVOLT`: testing a lower voltage at the same frequency;
 - `FREQ_TEST`: testing the next frequency;
 - `VOLT_TEST`: testing whether one higher voltage improves a new frequency;
-- `HOLD`: running the best currently safe point;
-- `COOLDOWN`: monitoring without upward exploration; and
+- `HOLD`: running the best currently safe point, blocked on a starved
+  environment that can still recover on its own, blocked on a rejected point
+  that needs an operator retune, or settled after a manual or safety hold;
+- `COOLDOWN`: monitoring without upward exploration, and, until the recovery
+  predicate below lands, without an automatic exit either; and
 - `OVERHEAT`: containing or waiting for safe recovery.
 
 Durable ordinary work is shown as `PENDING`, typed hard-limit work as

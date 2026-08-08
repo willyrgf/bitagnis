@@ -58,32 +58,19 @@ type deviceAPI interface {
 }
 
 type optimizerStateStore interface {
-	BootstrapMiner(lib.Info, string, time.Time, time.Duration, time.Duration, bool) (lib.MinerState, bool, error)
 	LoadMiner(string) (lib.MinerState, error)
-	SaveMiner(*lib.MinerState) error
 	ListPoints(string) ([]lib.OperatingPointRecord, error)
-	ResetOptimizationPass(string, lib.OperatingPoint, time.Time, time.Time, time.Time) error
-	AdmitTrial(*lib.MinerState, lib.OperatingPoint, lib.OperatingPoint, lib.OptimizerPhase, float64, time.Time, time.Time) (int64, error)
-	FinalizeTrial(*lib.MinerState, lib.OperatingPointRecord, lib.TrialDecision, time.Time, time.Time, time.Time) error
-	FinalizeBaseline(*lib.MinerState, lib.OperatingPointRecord, bool, time.Time) error
-	AdoptManualPoint(*lib.MinerState, lib.OperatingPoint, time.Time, time.Time, time.Time) error
-	AdoptExternalPoint(*lib.MinerState, lib.OperatingPoint, int64, time.Time, time.Time, time.Time) error
+	Apply(lib.Transition, time.Time) (lib.TransitionResult, error)
 	StartMutationAttempt(*lib.MutationAttempt) (int64, error)
 	AdvanceMutationAttempt(int64, lib.MutationMilestone, time.Time) error
 	RecordConfiguredVerification(int64, time.Time, int) error
 	RecordFirstPositive(int64, time.Time) error
-	CompleteMiningResume(*lib.MinerState, int64, time.Time, time.Time, time.Time) error
-	FailMutationAndSave(*lib.MinerState, int64, lib.MutationFailureStage, time.Time) error
-	FailMutationAndFinalizeTrial(*lib.MinerState, lib.OperatingPointRecord, lib.TrialDecision, int64, lib.MutationFailureStage, time.Time, time.Time, time.Time) error
-	QuarantineMutation(*lib.MinerState, int64, lib.MutationFailureStage, time.Time) error
-	SupersedeMutation(*lib.MinerState, *lib.MinerState, int64, time.Time) error
-	PersistSafetyTransition(*lib.MinerState, *lib.MinerState, *lib.OperatingPointRecord, time.Time) error
-	CompleteMutationAttempt(*lib.MinerState, int64, time.Time) error
 	ListMutationAttempts(string) ([]lib.MutationAttempt, error)
 	PendingMutationResume(string) (lib.MutationAttempt, bool, error)
 	UnfinishedMutationAttempt(string) (lib.MutationAttempt, bool, error)
 	CompareAndSetHourly(string, time.Time, time.Time, []lib.HourlyAggregate, time.Time) error
 	ListHourly(string, time.Time, time.Time) ([]lib.HourlyAggregate, error)
+	OpenEvidenceEpochFor(string) (lib.EvidenceEpoch, bool, error)
 }
 
 type controller struct {
@@ -97,6 +84,101 @@ type controller struct {
 	runtimes  map[string]*minerRuntime
 
 	mutations *mutationCoordinator
+
+	attributionMu     sync.Mutex
+	attributionSince  time.Time
+	attributionWindow []pollCycleAttribution
+}
+
+// pollCycleAttribution is one poll cycle's wall time split across the four segments pollMiners
+// executes serially, in call order. It exists to attribute tick loss: main.go's select loop
+// invokes pollMiners synchronously and time.Ticker drops its one buffered tick when the receiver
+// is slow, so identifying which segment dominates a slow cycle is a prerequisite to fixing it.
+type pollCycleAttribution struct {
+	httpFanOut        time.Duration
+	hourlyAccounting  time.Duration
+	safetyAndControl  time.Duration
+	mutationAndRender time.Duration
+}
+
+func (attribution pollCycleAttribution) total() time.Duration {
+	return attribution.httpFanOut + attribution.hourlyAccounting +
+		attribution.safetyAndControl + attribution.mutationAndRender
+}
+
+type pollCycleAttributionSummary struct {
+	count                        int
+	totalP50, totalP95           time.Duration
+	httpP50, httpP95             time.Duration
+	accountingP50, accountingP95 time.Duration
+	safetyP50, safetyP95         time.Duration
+	mutationP50, mutationP95     time.Duration
+}
+
+func summarizePollCycleAttribution(samples []pollCycleAttribution) pollCycleAttributionSummary {
+	total := make([]float64, len(samples))
+	http := make([]float64, len(samples))
+	accounting := make([]float64, len(samples))
+	safety := make([]float64, len(samples))
+	mutation := make([]float64, len(samples))
+	for index, sample := range samples {
+		total[index] = float64(sample.total())
+		http[index] = float64(sample.httpFanOut)
+		accounting[index] = float64(sample.hourlyAccounting)
+		safety[index] = float64(sample.safetyAndControl)
+		mutation[index] = float64(sample.mutationAndRender)
+	}
+	return pollCycleAttributionSummary{
+		count:         len(samples),
+		totalP50:      time.Duration(percentile(total, .5)),
+		totalP95:      time.Duration(percentile(total, .95)),
+		httpP50:       time.Duration(percentile(http, .5)),
+		httpP95:       time.Duration(percentile(http, .95)),
+		accountingP50: time.Duration(percentile(accounting, .5)),
+		accountingP95: time.Duration(percentile(accounting, .95)),
+		safetyP50:     time.Duration(percentile(safety, .5)),
+		safetyP95:     time.Duration(percentile(safety, .95)),
+		mutationP50:   time.Duration(percentile(mutation, .5)),
+		mutationP95:   time.Duration(percentile(mutation, .95)),
+	}
+}
+
+// recordPollCycleAttribution logs one line per cycle and, once an hour of cycles has
+// accumulated, a percentile summary — the data commit 2's constants are calibrated from, not from
+// the 0.673 clean-interval rate measured against the defect this instruments. Credential-free:
+// only durations and a sample count ever appear in the log line.
+func (minerController *controller) recordPollCycleAttribution(now time.Time, attribution pollCycleAttribution) {
+	minerController.logf(
+		"poll cycle attribution: total=%s http=%s accounting=%s safety=%s mutation=%s",
+		attribution.total().Round(time.Millisecond),
+		attribution.httpFanOut.Round(time.Millisecond),
+		attribution.hourlyAccounting.Round(time.Millisecond),
+		attribution.safetyAndControl.Round(time.Millisecond),
+		attribution.mutationAndRender.Round(time.Millisecond),
+	)
+
+	minerController.attributionMu.Lock()
+	defer minerController.attributionMu.Unlock()
+	if minerController.attributionSince.IsZero() {
+		minerController.attributionSince = now
+	}
+	minerController.attributionWindow = append(minerController.attributionWindow, attribution)
+	if now.Sub(minerController.attributionSince) < time.Hour {
+		return
+	}
+	summary := summarizePollCycleAttribution(minerController.attributionWindow)
+	minerController.attributionWindow = nil
+	minerController.attributionSince = now
+	minerController.logf(
+		"poll cycle attribution (hourly, n=%d): total p50=%s p95=%s http p50=%s p95=%s "+
+			"accounting p50=%s p95=%s safety p50=%s p95=%s mutation p50=%s p95=%s",
+		summary.count,
+		summary.totalP50.Round(time.Millisecond), summary.totalP95.Round(time.Millisecond),
+		summary.httpP50.Round(time.Millisecond), summary.httpP95.Round(time.Millisecond),
+		summary.accountingP50.Round(time.Millisecond), summary.accountingP95.Round(time.Millisecond),
+		summary.safetyP50.Round(time.Millisecond), summary.safetyP95.Round(time.Millisecond),
+		summary.mutationP50.Round(time.Millisecond), summary.mutationP95.Round(time.Millisecond),
+	)
 }
 
 type pollJob struct {
@@ -675,6 +757,7 @@ func (minerController *controller) pollMiners(
 	miners []lib.DiscoveredMiner,
 	now time.Time,
 ) {
+	var attribution pollCycleAttribution
 	output := minerController.outputWriter()
 	results := make([]minerPollResult, len(miners))
 	jobs := make(chan pollJob, len(miners))
@@ -683,6 +766,7 @@ func (minerController *controller) pollMiners(
 	}
 	close(jobs)
 
+	fanOutStart := time.Now()
 	workerCount := min(pollWorkerLimit, len(miners))
 	var workers sync.WaitGroup
 	for range workerCount {
@@ -699,6 +783,7 @@ func (minerController *controller) pollMiners(
 		}()
 	}
 	workers.Wait()
+	attribution.httpFanOut = time.Since(fanOutStart)
 
 	observations := make(map[string]*minerObservation, len(results))
 	handled := make(map[string]bool, len(results))
@@ -708,7 +793,10 @@ func (minerController *controller) pollMiners(
 		if observation == nil {
 			if index < len(miners) {
 				if state, err := minerController.states.LoadMiner(miners[index].Info.MacAddr); err == nil {
-					if err := minerController.accountHourly(miners[index].Info.MacAddr, nil, &state, lib.Info{}, now); err != nil && !errors.Is(err, context.Canceled) {
+					accountingStart := time.Now()
+					err := minerController.accountHourly(miners[index].Info.MacAddr, nil, &state, lib.Info{}, now)
+					attribution.hourlyAccounting += time.Since(accountingStart)
+					if err != nil && !errors.Is(err, context.Canceled) {
 						minerController.logf("Hourly accounting failed for %s: %s", miners[index].Info.Hostname, err)
 					}
 				}
@@ -716,9 +804,13 @@ func (minerController *controller) pollMiners(
 			continue
 		}
 		observations[observation.state.MacAddr] = observation
-		if err := minerController.accountHourly(observation.state.MacAddr, observation, &observation.state, observation.info, now); err != nil && !errors.Is(err, context.Canceled) {
-			minerController.logf("Hourly accounting failed for %s: %s", observation.info.Hostname, err)
+		accountingStart := time.Now()
+		accountingErr := minerController.accountHourly(observation.state.MacAddr, observation, &observation.state, observation.info, now)
+		attribution.hourlyAccounting += time.Since(accountingStart)
+		if accountingErr != nil && !errors.Is(accountingErr, context.Canceled) {
+			minerController.logf("Hourly accounting failed for %s: %s", observation.info.Hostname, accountingErr)
 		}
+		safetyStart := time.Now()
 		wasHandled, err := minerController.enforceMinerSafety(
 			ctx,
 			&observation.state,
@@ -727,6 +819,7 @@ func (minerController *controller) pollMiners(
 			observation.settings,
 			now,
 		)
+		attribution.safetyAndControl += time.Since(safetyStart)
 		handled[observation.state.MacAddr] = wasHandled || err != nil
 		if err != nil && !errors.Is(err, context.Canceled) {
 			minerController.logf(
@@ -737,8 +830,10 @@ func (minerController *controller) pollMiners(
 		}
 	}
 	if minerController.mutations != nil {
+		mutationStart := time.Now()
 		var err error
 		allowOptimization, err = minerController.mutations.Advance(ctx, observations, now)
+		attribution.mutationAndRender += time.Since(mutationStart)
 		if err != nil {
 			minerController.logf("Mutation coordination failed: %s", err)
 		}
@@ -748,15 +843,20 @@ func (minerController *controller) pollMiners(
 		if observation == nil || handled[observation.state.MacAddr] {
 			continue
 		}
-		if err := minerController.controlMinerAfterSafety(
-			ctx,
-			&observation.state,
-			observation.info,
-			observation.asic,
-			observation.settings,
-			now,
-			allowOptimization,
-		); err != nil && !errors.Is(err, context.Canceled) {
+		controlStart := time.Now()
+		var err error
+		if poll, ok := newReadablePoll(observation.info, observation.asic); ok {
+			err = minerController.controlMinerAfterSafety(
+				ctx,
+				&observation.state,
+				poll,
+				observation.settings,
+				now,
+				allowOptimization,
+			)
+		}
+		attribution.safetyAndControl += time.Since(controlStart)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			minerController.logf(
 				"Optimizer control failed for %s: %s",
 				observation.info.Hostname,
@@ -765,10 +865,14 @@ func (minerController *controller) pollMiners(
 		}
 	}
 	if minerController.mutations != nil && allowOptimization {
-		if _, err := minerController.mutations.Advance(ctx, observations, now); err != nil {
+		mutationStart := time.Now()
+		_, err := minerController.mutations.Advance(ctx, observations, now)
+		attribution.mutationAndRender += time.Since(mutationStart)
+		if err != nil {
 			minerController.logf("Mutation coordination failed: %s", err)
 		}
 	}
+	renderStart := time.Now()
 	for index := range results {
 		observation := results[index].observation
 		if observation == nil {
@@ -797,6 +901,8 @@ func (minerController *controller) pollMiners(
 	}
 	writeMinerTable(output, results)
 	fmt.Fprintf(output, "\nTotal: %s\n\n", formatAggregateHashRate(totalHashRate, hashRateAvailable))
+	attribution.mutationAndRender += time.Since(renderStart)
+	minerController.recordPollCycleAttribution(now, attribution)
 }
 
 func (minerController *controller) accountHourly(
@@ -838,7 +944,11 @@ func (minerController *controller) accountHourly(
 			current.referenceHash = entered.ReferenceHash
 		}
 	}
-	current.classification = classifyAccountingState(*state, current.referenceHash, current.settled)
+	_, hasOpenEpoch, epochErr := minerController.states.OpenEvidenceEpochFor(macAddr)
+	if epochErr != nil {
+		return epochErr
+	}
+	current.classification = classifyAccountingState(*state, current.referenceHash, current.settled, hasOpenEpoch)
 	validCurrent := current.validHash
 	previous := runtime.accounting
 	compatible := accountingSamplesCompatible(previous, current, state.AccountedThroughAt, settings.MetricsTime)
@@ -940,12 +1050,22 @@ func qualifiesSettledObservation(
 		return false
 	}
 	if states == nil || state.Phase != lib.PhaseHold || state.SettledAt.IsZero() ||
-		state.RampUntil.IsZero() || now.Before(state.SettledAt) || now.Before(state.RampUntil) ||
-		now.Before(state.CooldownUntil) || !state.EvidenceDeadlineAt.IsZero() ||
+		now.Before(state.SettledAt) ||
 		state.PendingKind != "" || state.MiningPending ||
 		info.MacAddr != state.MacAddr || operatingPointFromInfo(info) != state.CurrentPoint() ||
 		canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, state.CurrentPoint()) ||
 		!completeSafetyTelemetry(info) || hasPowerFault(info) {
+		return false
+	}
+	// Ramp completion and hold/safety validation are now epoch-driven rather than clock-driven: a
+	// settled HOLD with no open evidence epoch has already closed its hold-validation (or
+	// safety-validation) epoch as validated. This predicate authorizes an operator retune
+	// (allowManual's caller), so it deliberately does not relax further: it does not, for example,
+	// gate on recovery_healthy_count, because a settled HoldSafety is only reachable after that
+	// counter already did its job (finishSafetyHold closes the safety_validation epoch that
+	// controlMinerAfterSafety's COOLDOWN recovery predicate opened once recoveryHealthyPolls was
+	// satisfied) — re-checking it here would be redundant, not a gap.
+	if _, open, err := states.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
 		return false
 	}
 	minimum, err := minimumAdvertisedPoint(asic)
@@ -963,7 +1083,13 @@ func qualifiesSettledObservation(
 	}
 	switch state.HoldReason {
 	case lib.HoldSafety:
-		return state.SafetyReason != ""
+		// finishSafetyHold (the only writer of HoldReason == HoldSafety) never runs until the
+		// COOLDOWN recovery predicate has already cleared SafetyReason in the same transition that
+		// opened the safety_validation epoch it closes — a settled HoldSafety therefore always has
+		// SafetyReason == "" today, the same as a settled HoldManual. Requiring it nonzero here (the
+		// pre-recovery-predicate invariant, when SafetyReason stayed latched until an operator acted)
+		// would make this branch permanently unreachable.
+		return state.SafetyReason == ""
 	case lib.HoldManual:
 		return state.SafetyReason == ""
 	case lib.HoldOptimized:
@@ -1045,17 +1171,15 @@ func (minerController *controller) pollMiner(
 	}
 	pairAdvertised := operatingPointAdvertised(asic, operatingPointFromInfo(info)) &&
 		canonicalASICGrid(asic) == nil
-	state, created, err := minerController.states.BootstrapMiner(
-		info,
-		miner.IP,
-		now,
-		settings.RampUpTime,
-		settings.EvaluationWindowTime,
-		pairAdvertised,
-	)
+	result, err := minerController.states.Apply(lib.Bootstrap{
+		Info:           info,
+		IP:             miner.IP,
+		PairAdvertised: pairAdvertised,
+	}, now)
 	if err != nil {
 		return minerPollResult{}, err
 	}
+	state, created := result.State, result.Created
 	if created {
 		minerController.logf(
 			"Bootstrapping %s from live operating point %d MHz/%d mV",
@@ -1187,7 +1311,7 @@ func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 		return colorize(colorRed, "ROLLBACK")
 	case state.PendingKind != "" || state.MiningPending:
 		return colorize(colorYellow, "PENDING")
-	case now.Before(state.CooldownUntil):
+	case state.Phase == lib.PhaseCooldown:
 		return colorize(colorYellow, string(lib.PhaseCooldown))
 	case state.Phase == lib.PhaseHold:
 		return colorize(colorGreen, string(state.Phase))
