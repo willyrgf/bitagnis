@@ -913,6 +913,82 @@ func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 	}
 }
 
+// TestCompleteResumeDoesNotPreopenCooldownEpoch is a regression test for a bug found analyzing a
+// live deployment: applyCompleteResume opened a safety_validation epoch immediately for any
+// completed MutationSafetyRollback/MutationOverheatRecovery attempt (EpochShapeForPhase used to
+// map PhaseCooldown to one), which happens well before controlMinerAfterSafety's recovery
+// predicate (recoveryHealthyPolls consecutive safeToRecover polls) has ever run. Once that epoch
+// existed, every later COOLDOWN poll took the "epoch already open" branch and the healthy-poll
+// count it should have been counting never advanced past whatever it happened to be at that
+// instant — observed in production as a miner permanently stuck in COOLDOWN with
+// RecoveryHealthyCount frozen far below threshold, which in turn fleet-wide-blocked all other
+// miners' normal optimization work (mutationCoordinator.Advance treats any COOLDOWN/OVERHEAT miner
+// as safetyBlocked). This test drives a real safety-rollback attempt through its full milestone
+// lifecycle to CompleteResume and asserts no epoch is open afterward — only the recovery predicate
+// may open one now.
+func TestCompleteResumeDoesNotPreopenCooldownEpoch(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	baseline := mustOpenEpoch(t, store, testMAC)
+	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state.SetCurrentPoint(minimum)
+	state.Phase = PhaseCooldown
+	state.PhaseStartedAt = now
+	state.SafetyReason = SafetyReasonMutationUncertain
+	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
+	if _, err := store.Apply(CloseEpoch{State: state, Epoch: baseline, Outcome: EpochContradicted}, now); err != nil {
+		t.Fatal(err)
+	}
+	attempt := MutationAttempt{
+		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: SafetyReasonMutationUncertain,
+		FromFrequency: minimum.Frequency, FromCoreVoltage: minimum.CoreVoltage,
+		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
+		IntentCreatedAt: now, StartedAt: now,
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestonePatchRequested, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordConfiguredVerification(id, now.Add(2*time.Second), 34); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRestartRequested, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRebootVerified, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	completeResult, err := store.Apply(CompleteMutation{
+		MacAddr: state.MacAddr, IP: state.IP, AttemptID: id,
+	}, now.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = completeResult.State
+	if state.Phase != PhaseCooldown || state.SafetyReason == "" {
+		t.Fatalf("safety completion did not land in COOLDOWN with SafetyReason intact: %+v", state)
+	}
+	if err := store.RecordFirstPositive(id, now.Add(6*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(CompleteResume{MacAddr: state.MacAddr, AttemptID: id}, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, open, err := store.OpenEvidenceEpochFor(testMAC); err != nil {
+		t.Fatal(err)
+	} else if open {
+		t.Fatal("CompleteResume opened a safety_validation epoch before the recovery predicate ran")
+	}
+	loaded, err := store.LoadMiner(testMAC)
+	if err != nil || loaded.Phase != PhaseCooldown || loaded.SafetyReason == "" || loaded.PendingKind != "" {
+		t.Fatalf("post-resume state = %+v, %v", loaded, err)
+	}
+}
+
 func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)

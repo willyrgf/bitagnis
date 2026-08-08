@@ -1157,15 +1157,18 @@ func closeCandidateEpoch(tx *sql.Tx, macAddr string, record *OperatingPointRecor
 // EpochShapeForPhase derives the evidence-epoch purpose and required-window count for the phase and
 // hold reason that bootstrap, a pass reset, or a completed mutation already left durable. It replaces
 // the windowCount derivation that used to live in mutation.go. The bool result is false when the
-// phase and reason combination warrants no epoch (OVERHEAT, or a HOLD reason that is not settling).
+// phase and reason combination warrants no epoch immediately: OVERHEAT; a HOLD reason that is not
+// settling; or COOLDOWN, whose safety_validation epoch must not open until
+// controlMinerAfterSafety's recovery predicate (recoveryHealthyPolls consecutive safeToRecover
+// polls) has proven the device safe — opening it here, at mutation completion, would let a device
+// reach HoldSafety off of one admitted window with no consecutive-healthy-poll dwell behind it at
+// all, defeating the predicate entirely.
 func EpochShapeForPhase(phase OptimizerPhase, reason HoldReason) (EpochPurpose, int, bool) {
 	switch phase {
 	case PhaseBaseline:
 		return EpochBaseline, 2, true
 	case PhaseUndervolt, PhaseFrequencyTest, PhaseVoltageTest:
 		return EpochTrial, 2, true
-	case PhaseCooldown:
-		return EpochSafetyValidation, 1, true
 	case PhaseHold:
 		if reason == HoldOptimized || reason == HoldManual {
 			return EpochHoldValidation, 1, true
@@ -2645,8 +2648,9 @@ func applyCompleteResume(tx *sql.Tx, value CompleteResume, at time.Time) (Transi
 	}
 	// A mining-only completion touches no operating point, so whatever epoch was already open (if
 	// any) is untouched. Every other kind opens the epoch its now-durable phase and hold reason
-	// warrant (EpochShapeForPhase): trial re-entry, a return to baseline, final placement's hold
-	// validation, or safety validation after a rollback/recovery mutation.
+	// warrant (EpochShapeForPhase): trial re-entry, a return to baseline, or final placement's hold
+	// validation. A landing in PhaseCooldown (safety/overheat recovery) deliberately opens none here
+	// — see EpochShapeForPhase's own doc comment.
 	if attempt.Kind != MutationMiningConfiguration {
 		if purpose, requiredWindows, open := EpochShapeForPhase(durable.Phase, durable.HoldReason); open {
 			if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
