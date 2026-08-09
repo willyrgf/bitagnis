@@ -44,8 +44,116 @@ func newRootMutationStore(t *testing.T) (*lib.OptimizerStore, lib.Settings, lib.
 	return store, settings, result.State, now
 }
 
+func TestCooldownRecoveryReleasesFleetNormalMutationBlock(t *testing.T) {
+	store, settings, _, now := newRootMutationStore(t)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	safetyState, err := store.LoadMiner(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := mustOpenEpoch(t, store, safetyState.MacAddr)
+	safetyState.Phase = lib.PhaseCooldown
+	safetyState.PhaseStartedAt = now
+	safetyState.SafetyReason = lib.SafetyReasonFirmwareOverheat
+	result, err := store.Apply(lib.CloseEpoch{
+		State: safetyState, Epoch: baseline, Outcome: lib.EpochContradicted,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safetyState = result.State
+
+	otherInfo := rootTestInfo(point, 100)
+	otherInfo.MacAddr = "aa:bb:cc:dd:ee:03"
+	otherInfo.Hostname = "root-test-other"
+	otherIP := "192.0.2.13"
+	otherResult, err := store.Apply(lib.Bootstrap{
+		Info: otherInfo, IP: otherIP, PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherState := closeInitialBaselineEpoch(t, store, otherResult.State, now)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	otherState.SetPendingMutation(lib.MutationOperatingPoint, target, now)
+	if result, err := store.Apply(lib.SaveState{State: otherState}, now); err != nil {
+		t.Fatal(err)
+	} else {
+		otherState = result.State
+	}
+
+	asic := rootTestASIC()
+	safetyInfo := rootTestInfo(point, 100)
+	observations := map[string]*minerObservation{
+		safetyState.MacAddr: {
+			miner: lib.DiscoveredMiner{IP: safetyState.IP, Info: safetyInfo},
+			info:  safetyInfo, asic: asic, settings: settings, state: safetyState,
+		},
+		otherState.MacAddr: {
+			miner: lib.DiscoveredMiner{IP: otherIP, Info: otherInfo},
+			info:  otherInfo, asic: asic, settings: settings, state: otherState,
+		},
+	}
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{},
+		[]lib.DiscoveredMiner{observations[safetyState.MacAddr].miner, observations[otherState.MacAddr].miner},
+		nil, "", nil, nil, log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.gateOpen = true
+	coordinator.now = func() time.Time { return now.Add(time.Hour) }
+	if allowed, err := coordinator.Advance(context.Background(), observations, now); err != nil || allowed {
+		t.Fatalf("advance while cooldown blocks fleet = allowed:%t err:%v", allowed, err)
+	}
+	if coordinator.normalActive != "" {
+		t.Fatalf("normal mutation started during fleet safety block: %s", coordinator.normalActive)
+	}
+	if _, unfinished, err := store.UnfinishedMutationAttempt(otherState.MacAddr); err != nil || unfinished {
+		t.Fatalf("other miner attempt started during cooldown: unfinished:%t err:%v", unfinished, err)
+	}
+
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	for poll := 1; poll <= recoveryHealthyPolls(settings); poll++ {
+		at := now.Add(time.Duration(poll) * settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &safetyState, mustReadablePoll(t, safetyInfo, asic), settings, at, true,
+		); err != nil {
+			t.Fatalf("recovery poll %d: %v", poll, err)
+		}
+	}
+	epoch := mustOpenEpoch(t, store, safetyState.MacAddr)
+	window, err := lib.NewWindowAggregate(
+		30, settings.EvaluationWindowTime, 100, 100, 1, 55, 55, 70, 18, nil, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := now.Add(time.Hour)
+	if err := minerController.finishSafetyHold(&safetyState, epoch, window, settings, finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if safetyState.Phase != lib.PhaseHold || safetyState.HoldReason != lib.HoldSafety ||
+		safetyState.SafetyReason != "" {
+		t.Fatalf("recovery did not reach canonical safety HOLD: %+v", safetyState)
+	}
+
+	observations[safetyState.MacAddr].state = safetyState
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if allowed, err := coordinator.Advance(ctx, observations, finishedAt); err != nil || allowed {
+		t.Fatalf("advance after recovery = allowed:%t err:%v", allowed, err)
+	}
+	if coordinator.normalActive != otherState.MacAddr {
+		t.Fatalf("normal mutation active = %q, want %q", coordinator.normalActive, otherState.MacAddr)
+	}
+	attempt, unfinished, err := store.UnfinishedMutationAttempt(otherState.MacAddr)
+	if err != nil || !unfinished || attempt.Kind != lib.MutationOperatingPoint || attempt.TargetPoint() != target {
+		t.Fatalf("other miner attempt = %+v unfinished:%t err:%v", attempt, unfinished, err)
+	}
+}
+
 func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -96,6 +204,7 @@ func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 
 func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = lib.PhaseCooldown
 	state.SafetyReason = lib.SafetyReasonASICLimit
@@ -167,6 +276,7 @@ func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 // applyFailMutation's comment in lib/state.go for the full reasoning.
 func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -221,6 +331,7 @@ func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T)
 // no-positive-hash outcome, so it is classified HoldRejected, not HoldStarved.
 func TestMiningResumeFailureAfterCompletedOperatingPointMutationIsRejected(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	saveResult, err := store.Apply(lib.SaveState{State: state}, now)
@@ -305,8 +416,8 @@ func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 	if !qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
 		t.Fatal("verified optimized hold was rejected")
 	}
-	// An open evidence epoch (hold validation still in progress, ramp-equivalent under the epoch
-	// model) must block settled-observation qualification exactly as an unexpired ramp did before.
+	// An unsettled optimized HOLD with its required validation epoch must not qualify for retune.
+	state.SettledAt = time.Time{}
 	if _, err := store.Apply(lib.OpenEpoch{
 		State: state, Purpose: lib.EpochHoldValidation, Point: state.CurrentPoint(), RequiredWindows: 1,
 	}, now.Add(time.Hour)); err != nil {
@@ -322,6 +433,12 @@ func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 		t.Fatal(err)
 	}
 	state = closed.State
+	state.SettledAt = now.Add(-time.Second)
+	if result, err := store.Apply(lib.SaveState{State: state}, now.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	} else {
+		state = result.State
+	}
 	state.SetBestPoint(lib.OperatingPoint{Frequency: 550, CoreVoltage: 1000})
 	state.BestHashRate = 200
 	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
@@ -692,6 +809,7 @@ func TestUnreconciledForeignPointIsStillAdoptedAsManual(t *testing.T) {
 
 func TestPostRediscoveryASICReadUsesTheRediscoveredIP(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -859,6 +977,7 @@ func TestUnreadablePollLimitEscalatesAfterTwelveConsecutivePolls(t *testing.T) {
 // proves its new boot.
 func TestRebootInFlightSuppressesUnreadableEscalationAndStillCompletes(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	controller := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
 	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	incumbent := state.CurrentPoint()
@@ -971,6 +1090,7 @@ func TestInvalidErrorPercentageFailsPollConstruction(t *testing.T) {
 
 func TestCompletionRetryRequiresTheOriginalTimestamp(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {

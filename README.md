@@ -93,6 +93,11 @@ evidence epoch, exactly like a starved `HOLD` re-entering evaluation; a single
 required window's worth of admitted evidence then either settles the miner
 into `HoldSafety` or, if that window's quality is unhealthy, rejects the epoch
 and leaves the miner in `COOLDOWN` to accumulate the healthy-poll count again.
+A completed safety mutation and healthy-mining resumption never open this
+epoch: the cooldown recovery predicate is its sole owner. Every store
+transition and database reopen verifies that an open `safety_validation` epoch
+is paired with `COOLDOWN`, an empty `SafetyReason`, a zero recovery counter,
+and no unfinished safety resumption.
 A process restart or a lost poll tick costs at most the healthy-poll count
 in progress, never previously-earned recovery evidence.
 
@@ -138,21 +143,27 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 7, with typed pending mutations, finite frontier
+The current schema is version 8, with typed pending mutations, finite frontier
 state, hourly accounting, a durable evidence-epoch ledger, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema version 6
+`overheat_pending` field, migration, or compatibility reader. Schema version 7
 and earlier, an old partial database, or an unknown application object is
 rejected without modification; move it aside or remove it to create the
-current baseline. Evaluated history, pending mutation ages, emergency episode
-ages, mutation attempts, evidence epochs, and the bounded 384-hour hourly
-accounting history persist across ordinary restarts after that baseline is
-created.
+current baseline. Version 7 used the same physical evidence tables but could
+not prove that a safety-validation epoch was opened only after the required
+healthy-poll dwell, so it is rejected whole rather than repaired from
+timestamps. Evaluated history, pending mutation ages, emergency episode ages,
+mutation attempts, evidence epochs, and the bounded 384-hour hourly accounting
+history persist across ordinary restarts after that baseline is created.
 
 `evidence_epochs` is the durable ledger for evaluation progress, shaped after
 `mutation_attempts`: one open epoch per miner, monotone settled-sample and
 window counters, and a terminal outcome (`validated`, `rejected`, `starved`,
-or `contradicted`). It replaces the volatile in-memory progress and wall-clock
+or `contradicted`). Each open purpose has one durable state shape: baseline and
+trial epochs require their matching phase and two windows; hold validation,
+safety validation, and probation require their matching phase/reason and one
+window. This mapping is checked before every `Apply` commit and on reopen. It
+replaces the volatile in-memory progress and wall-clock
 evidence deadline schema version 6 used, which discarded everything it had
 learned on every process restart or mutation gate and could not distinguish
 "never measured" from "measured many times and lost it." A process restart

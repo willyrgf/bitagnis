@@ -1173,6 +1173,7 @@ func TestMutationUsesConfiguredReadbackBeforeOneRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := bootstrapResult.State
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	state.SetPendingMutation(lib.MutationOperatingPoint, targetPoint, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
@@ -1210,6 +1211,7 @@ func TestMutationUsesConfiguredReadbackBeforeOneRestart(t *testing.T) {
 
 func TestReopenedConfiguredStageUsesItsOwnDeadline(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -1405,6 +1407,7 @@ func TestMutationReadbackMismatchSupersedesBeforeRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := bootstrapResult.State
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	state.SetPendingMutation(lib.MutationOperatingPoint, wantedPoint, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)

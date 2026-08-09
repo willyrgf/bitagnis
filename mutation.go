@@ -543,7 +543,7 @@ func (coordinator *mutationCoordinator) advanceMiningResumeLocked(
 		}
 		// CompleteResume now derives the epoch it opens (purpose and required-window count) from
 		// whatever phase and hold reason the completed mutation already left durable
-		// (lib.EpochShapeForPhase), so the caller no longer precomputes a window count or deadline.
+		// from durable state, so the caller no longer precomputes a window count or deadline.
 		result, err := coordinator.states.Apply(lib.CompleteResume{
 			MacAddr: observation.state.MacAddr, AttemptID: attempt.ID,
 		}, now)
