@@ -192,9 +192,15 @@ These invariants are high risk if violated:
   recover (`recoveryHealthyPolls`, a physical dwell derived from AxeOS's own autonomous overheat
   recovery cadence — see `power_management_task.c`), never a timer. Any non-satisfying poll resets
   the count to zero; the poll that reaches the threshold clears `SafetyReason` and opens the
-  `safety_validation` epoch in the same transition. The wall-clock cooldown timer this replaced (and
-  the durable field it wrote) was removed as part of the schema-version-7 cutover; do not reintroduce
-  a duration-based gate here — prefer a monotone, restart-surviving count, as below. A second,
+  `safety_validation` epoch in the same transition. This recovery predicate is the sole owner of
+  opening that epoch: mutation completion and healthy-mining resumption must not open it. Every open
+  epoch must match its exact phase/reason, current point, required-window count, pending-authority,
+  settlement, and safety-recovery shape; enforce that invariant both as an `Apply` postcondition and
+  on reopen. Schema version 8 rejects version 7 unchanged because a version-7 ledger cannot prove
+  that an existing or already-closed safety epoch followed the dwell; do not repair it from
+  timestamps. The wall-clock cooldown timer this replaced (and the durable field it wrote) was
+  removed as part of the schema-version-7 cutover; do not reintroduce a duration-based gate here —
+  prefer a monotone, restart-surviving count, as below. A second,
   distinct emergency interrupting a `COOLDOWN` dwell in progress must reset the count to zero, not
   carry a prior episode's partial progress into the new one — every site that begins a fresh or
   escalating emergency episode (`transitionEmergencyState`'s new-episode branch and its callers'

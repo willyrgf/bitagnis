@@ -323,9 +323,13 @@ func (minerController *controller) enforceMinerSafety(
 				*state = supersedeResult.State
 				return true, nil
 			}
-			if saveErr := minerController.saveMinerState(state, now); saveErr != nil {
+			result, saveErr := minerController.states.Apply(lib.SafetyTransition{
+				Expected: expected, State: *state,
+			}, now)
+			if saveErr != nil {
 				return true, fmt.Errorf("unsupported ASIC grid: %w; persist block: %v", err, saveErr)
 			}
+			*state = result.State
 			return true, nil
 		}
 		// Non-event: the grid failed validation, there is no firmware emergency, and the assessment
@@ -448,7 +452,14 @@ func (minerController *controller) recordUnreadablePoll(
 		*state = supersedeResult.State
 		return nil
 	}
-	return minerController.saveMinerState(state, now)
+	result, err := minerController.states.Apply(lib.SafetyTransition{
+		Expected: expected, State: *state,
+	}, now)
+	if err != nil {
+		return err
+	}
+	*state = result.State
+	return nil
 }
 
 // controlMinerAfterSafety implements the per-poll evidence-epoch lifecycle. Ordering: live-point
@@ -1209,7 +1220,7 @@ func (minerController *controller) finalizeTrial(
 		ReferenceHash: entered.ReferenceHash,
 	}
 	if status == lib.PointStarved {
-		// Starved carries no measurement (RFC schema-version-7 contract): aggregate here is the
+		// Starved carries no measurement (the durable evidence-epoch contract): aggregate here is the
 		// last individually-rejected window, not a real measurement of the point, so it must not be
 		// persisted as one.
 		record.MedianHash, record.ExpectedHash, record.Attainment = 0, 0, 0

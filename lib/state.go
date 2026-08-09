@@ -16,7 +16,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 7
+const optimizerSchemaVersion = 8
 
 // LongTermRetentionHours bounds the credential-free hourly accounting history.
 const LongTermRetentionHours = 384
@@ -793,8 +793,8 @@ type SaveState struct {
 func (SaveState) isOptimizerTransition() {}
 
 // CompleteResume replaces CompleteMiningResume. It atomically closes the healthy-mining gate and
-// opens the epoch appropriate to whatever phase and hold reason the completed mutation already left
-// durable (EpochShapeForPhase), except for a mining-only completion, which touches no operating
+// opens the normal epoch appropriate to whatever phase and hold reason the completed mutation
+// already left durable, except for a mining-only completion, which touches no operating
 // point and therefore leaves any already-open epoch untouched. The attempt and miner row become
 // visible together so a crash cannot report resumed mining without the corresponding epoch.
 type CompleteResume struct {
@@ -981,6 +981,9 @@ func (store *OptimizerStore) Apply(transition Transition, at time.Time) (Transit
 	if err != nil {
 		return TransitionResult{}, err
 	}
+	if err := validateAppliedEpochState(tx, result.State.MacAddr); err != nil {
+		return TransitionResult{}, fmt.Errorf("apply transition: invalid durable epoch state: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return TransitionResult{}, fmt.Errorf("apply transition: commit: %w", err)
 	}
@@ -989,8 +992,8 @@ func (store *OptimizerStore) Apply(transition Transition, at time.Time) (Transit
 }
 
 // applyBootstrap is the canonical new-miner load path. Creation of the
-// optimizer row and its baseline entered row is one transaction with a fixed
-// evidence deadline; a process reopen cannot observe a miner without its pass
+// optimizer row and its baseline entered row is one transaction with a fresh
+// evidence epoch; a process reopen cannot observe a miner without its pass
 // authority.
 // --- Evidence epoch storage and helpers -----------------------------------------------------
 
@@ -1154,29 +1157,112 @@ func closeCandidateEpoch(tx *sql.Tx, macAddr string, record *OperatingPointRecor
 	return 0, nil
 }
 
-// EpochShapeForPhase derives the evidence-epoch purpose and required-window count for the phase and
-// hold reason that bootstrap, a pass reset, or a completed mutation already left durable. It replaces
-// the windowCount derivation that used to live in mutation.go. The bool result is false when the
-// phase and reason combination warrants no epoch immediately: OVERHEAT; a HOLD reason that is not
-// settling; or COOLDOWN, whose safety_validation epoch must not open until
-// controlMinerAfterSafety's recovery predicate (recoveryHealthyPolls consecutive safeToRecover
-// polls) has proven the device safe — opening it here, at mutation completion, would let a device
-// reach HoldSafety off of one admitted window with no consecutive-healthy-poll dwell behind it at
-// all, defeating the predicate entirely.
-func EpochShapeForPhase(phase OptimizerPhase, reason HoldReason) (EpochPurpose, int, bool) {
-	switch phase {
+// normalResumeEpochShape derives only the normal evidence epoch that a completed operating-point
+// mutation resumes. COOLDOWN is deliberately absent: controlMinerAfterSafety is the sole owner of
+// opening safety_validation after recoveryHealthyPolls consecutive safe polls.
+func normalResumeEpochShape(state MinerState) (EpochPurpose, int, bool) {
+	switch state.Phase {
 	case PhaseBaseline:
 		return EpochBaseline, 2, true
 	case PhaseUndervolt, PhaseFrequencyTest, PhaseVoltageTest:
 		return EpochTrial, 2, true
 	case PhaseHold:
-		if reason == HoldOptimized || reason == HoldManual {
+		if state.HoldReason == HoldOptimized || state.HoldReason == HoldManual {
 			return EpochHoldValidation, 1, true
 		}
 		return "", 0, false
 	default:
 		return "", 0, false
 	}
+}
+
+// expectedOpenEpochShape is the single purpose/phase mapping used by both Apply's transactional
+// postcondition and database-open validation. Absence of an expected shape means an open epoch is
+// forbidden for that state.
+func expectedOpenEpochShape(state MinerState) (EpochPurpose, int, bool) {
+	if purpose, requiredWindows, open := normalResumeEpochShape(state); open {
+		return purpose, requiredWindows, true
+	}
+	if state.Phase == PhaseCooldown {
+		return EpochSafetyValidation, 1, true
+	}
+	if state.Phase == PhaseHold && state.HoldReason == HoldStarved {
+		return EpochProbation, 1, true
+	}
+	return "", 0, false
+}
+
+// validateOpenEpochState proves that any open epoch is the exact evidence authority warranted by
+// the durable miner state. A safety epoch additionally proves that cooldown recovery completed and
+// no safety mutation is still waiting for healthy-mining resumption.
+func validateOpenEpochState(state MinerState, open *EvidenceEpoch, unfinishedSafetyResume bool) error {
+	if open == nil {
+		if state.Phase == PhaseHold && state.HoldReason == HoldStarved {
+			return fmt.Errorf("miner %s is starved HOLD with no open evidence epoch", state.MacAddr)
+		}
+		return nil
+	}
+	if open.MacAddr != state.MacAddr {
+		return fmt.Errorf("open evidence epoch belongs to another miner")
+	}
+	if open.Point != state.CurrentPoint() {
+		return fmt.Errorf("miner %s has an open evidence epoch whose point does not match durable current", state.MacAddr)
+	}
+	if state.PendingKind != "" {
+		return fmt.Errorf("miner %s has a pending mutation with an open evidence epoch", state.MacAddr)
+	}
+	if !state.SettledAt.IsZero() {
+		return fmt.Errorf("miner %s is settled with an open evidence epoch", state.MacAddr)
+	}
+	purpose, requiredWindows, expected := expectedOpenEpochShape(state)
+	if !expected {
+		return fmt.Errorf("miner %s state %s/%s forbids an open evidence epoch", state.MacAddr, state.Phase, state.HoldReason)
+	}
+	if open.Purpose != purpose || open.RequiredWindows != requiredWindows {
+		return fmt.Errorf("miner %s open evidence epoch shape is %s/%d, want %s/%d",
+			state.MacAddr, open.Purpose, open.RequiredWindows, purpose, requiredWindows)
+	}
+	if open.Purpose == EpochSafetyValidation {
+		if state.SafetyReason != "" || state.RecoveryHealthyCount != 0 {
+			return fmt.Errorf("miner %s safety-validation epoch lacks completed recovery proof", state.MacAddr)
+		}
+		if state.MiningPending || unfinishedSafetyResume {
+			return fmt.Errorf("miner %s safety-validation epoch overlaps unfinished mutation resumption", state.MacAddr)
+		}
+	}
+	return nil
+}
+
+func validateAppliedEpochState(tx *sql.Tx, macAddr string) error {
+	if macAddr == "" {
+		return fmt.Errorf("transition returned no miner")
+	}
+	state, err := queryMiner(tx, macAddr)
+	if err != nil {
+		return fmt.Errorf("load miner %s: %w", macAddr, err)
+	}
+	var open *EvidenceEpoch
+	epoch, err := queryOpenEpoch(tx, macAddr)
+	if err == nil {
+		open = &epoch
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("load open evidence epoch for %s: %w", macAddr, err)
+	}
+	unfinishedSafetyResume, err := hasUnfinishedSafetyResume(tx, macAddr)
+	if err != nil {
+		return fmt.Errorf("inspect unfinished safety resumption for %s: %w", macAddr, err)
+	}
+	return validateOpenEpochState(state, open, unfinishedSafetyResume)
+}
+
+func hasUnfinishedSafetyResume(queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, macAddr string) (bool, error) {
+	var count int
+	err := queryer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM mutation_attempts
+		WHERE mac_addr = ? AND kind IN (?, ?) AND failed_at = 0 AND mining_resumed_at = 0`,
+		macAddr, MutationSafetyRollback, MutationOverheatRecovery).Scan(&count)
+	return count != 0, err
 }
 
 func validEpochPurpose(purpose EpochPurpose) bool {
@@ -2648,11 +2734,11 @@ func applyCompleteResume(tx *sql.Tx, value CompleteResume, at time.Time) (Transi
 	}
 	// A mining-only completion touches no operating point, so whatever epoch was already open (if
 	// any) is untouched. Every other kind opens the epoch its now-durable phase and hold reason
-	// warrant (EpochShapeForPhase): trial re-entry, a return to baseline, or final placement's hold
+	// warrant: trial re-entry, a return to baseline, or final placement's hold
 	// validation. A landing in PhaseCooldown (safety/overheat recovery) deliberately opens none here
-	// — see EpochShapeForPhase's own doc comment.
+	// because only controlMinerAfterSafety may open safety_validation after the recovery dwell.
 	if attempt.Kind != MutationMiningConfiguration {
-		if purpose, requiredWindows, open := EpochShapeForPhase(durable.Phase, durable.HoldReason); open {
+		if purpose, requiredWindows, open := normalResumeEpochShape(durable); open {
 			if _, err := queryOpenEpoch(tx, durable.MacAddr); err == nil {
 				return TransitionResult{}, fmt.Errorf("complete mining resume: an evidence epoch is still open")
 			} else if !errors.Is(err, sql.ErrNoRows) {
@@ -4178,7 +4264,7 @@ CREATE UNIQUE INDEX evidence_epochs_one_open
 	WHERE closed_at = 0;
 CREATE INDEX evidence_epochs_mac_opened
 	ON evidence_epochs (mac_addr, opened_at);
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -4591,6 +4677,13 @@ func validateCrossTableState(
 				record.MacAddr, record.Frequency, record.CoreVoltage, epoch.Outcome)
 		}
 	}
+	unfinishedSafetyByMac := make(map[string]bool)
+	for _, attempt := range attempts {
+		if (attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery) &&
+			attempt.FailedAt.IsZero() && attempt.MiningResumedAt.IsZero() {
+			unfinishedSafetyByMac[attempt.MacAddr] = true
+		}
+	}
 	for macAddr, state := range states {
 		open, hasOpen := openEpochByMac[macAddr]
 		// A starved HOLD is the one HOLD reason that requires an open evidence epoch: starveBaseline
@@ -4600,33 +4693,16 @@ func validateCrossTableState(
 		// has a closed epoch whose outcome is starved" — the open probation epoch alone is not that
 		// evidence; the closed starved epoch that opened it, still present in the ledger, is.
 		if state.Phase == PhaseHold && state.HoldReason == HoldStarved {
-			if !hasOpen {
-				return fmt.Errorf("miner %s is starved HOLD with no open evidence epoch", macAddr)
-			}
 			if !starvedByMac[macAddr] {
 				return fmt.Errorf("miner %s is starved HOLD with no closed starved evidence epoch in its ledger", macAddr)
 			}
 		}
-		if !hasOpen {
-			continue
+		var openPointer *EvidenceEpoch
+		if hasOpen {
+			openPointer = &open
 		}
-		if open.Point != state.CurrentPoint() {
-			return fmt.Errorf("miner %s has an open evidence epoch whose point does not match durable current", macAddr)
-		}
-		if state.Phase == PhaseOverheat {
-			return fmt.Errorf("miner %s is OVERHEAT with an open evidence epoch", macAddr)
-		}
-		if state.PendingKind != "" {
-			return fmt.Errorf("miner %s has a pending mutation with an open evidence epoch", macAddr)
-		}
-		if !state.SettledAt.IsZero() {
-			return fmt.Errorf("miner %s is settled with an open evidence epoch", macAddr)
-		}
-		if state.Phase == PhaseHold && state.HoldReason == HoldRejected {
-			return fmt.Errorf("miner %s is rejected HOLD with an open evidence epoch", macAddr)
-		}
-		if state.Phase == PhaseHold && state.HoldReason == HoldStarved && open.Purpose != EpochProbation {
-			return fmt.Errorf("miner %s is starved HOLD with a non-probation open evidence epoch", macAddr)
+		if err := validateOpenEpochState(state, openPointer, unfinishedSafetyByMac[macAddr]); err != nil {
+			return err
 		}
 	}
 	attemptsByID := make(map[int64]MutationAttempt, len(attempts))
@@ -5055,8 +5131,11 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("pass reference hash %.2f is invalid", state.PassReferenceHash)
 	case !validSafetyReason(state.SafetyReason):
 		return fmt.Errorf("safety reason %q is invalid", state.SafetyReason)
-	case state.SafetyReason != "" && state.Phase != PhaseCooldown && state.Phase != PhaseOverheat &&
-		!(state.Phase == PhaseHold && state.HoldReason == HoldSafety):
+	case state.Phase == PhaseHold && state.HoldReason == HoldSafety && state.SafetyReason != "":
+		return fmt.Errorf("settled safety hold retains an active safety reason")
+	case state.Phase == PhaseHold && state.HoldReason == HoldSafety && state.SettledAt.IsZero():
+		return fmt.Errorf("safety hold is not settled")
+	case state.SafetyReason != "" && state.Phase != PhaseCooldown && state.Phase != PhaseOverheat:
 		return fmt.Errorf("safety reason exists outside a safety-owned phase")
 	case state.Phase == PhaseHold && !validHoldReason(state.HoldReason):
 		return fmt.Errorf("hold reason %q is invalid", state.HoldReason)

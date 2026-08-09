@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,7 +103,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return result.State, now
 }
 
-func TestSchemaV7BootstrapAndReopen(t *testing.T) {
+func TestSchemaV8BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -116,7 +117,7 @@ func TestSchemaV7BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 7 {
+	if err != nil || version != 8 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -452,11 +453,13 @@ func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
 func TestUnsettledManualHoldPersistsWithoutEvidenceDeadline(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
-	state.Phase = PhaseHold
-	state.HoldReason = HoldManual
-	state.SettledAt = time.Time{}
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
+	state = closeInitialBaselineEpoch(t, store, state, now)
+	result, err := store.Apply(AdoptManualPoint{MacAddr: state.MacAddr, Point: state.CurrentPoint()}, now.Add(time.Minute))
+	if err != nil {
 		t.Fatalf("unsettled manual hold: %v", err)
+	}
+	if result.State.Phase != PhaseHold || result.State.HoldReason != HoldManual || !result.State.SettledAt.IsZero() {
+		t.Fatalf("manual hold state = %+v", result.State)
 	}
 }
 
@@ -510,7 +513,7 @@ func TestResetOptimizationPassAcceptsSettledSafetyHold(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	state.Phase = PhaseHold
 	state.HoldReason = HoldSafety
-	state.SafetyReason = SafetyReasonASICLimit
+	state.SafetyReason = ""
 	state.SettledAt = now.Add(time.Hour)
 	state.PhaseStartedAt = now.Add(time.Hour)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -573,84 +576,36 @@ func storePath(t *testing.T, store *OptimizerStore) string {
 	return path
 }
 
-func TestRejectSchemaV3WithoutMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 3"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenOptimizerStore(path); err == nil {
-		t.Fatal("schema v3 was accepted")
-	}
-}
-
-func TestRejectSchemaV4WithoutMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 4"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenOptimizerStore(path); err == nil {
-		t.Fatal("schema v4 was accepted")
+// Schema 7 cannot prove that an existing safety_validation epoch was opened only after the durable
+// healthy-poll dwell. Reject it whole rather than repairing or inferring history from timestamps.
+func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
+	for _, version := range []int{3, 4, 5, 6, 7} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "optimizer.db")
+			store, err := OpenOptimizerStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenOptimizerStore(path); err == nil {
+				t.Fatalf("schema v%d was accepted", version)
+			}
+			if _, err := OpenOptimizerStoreReadOnly(path); err == nil {
+				t.Fatalf("schema v%d was accepted read-only", version)
+			}
+		})
 	}
 }
 
-func TestRejectSchemaV5WithoutMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 5"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenOptimizerStore(path); err == nil {
-		t.Fatal("schema v5 was accepted")
-	}
-}
-
-// TestRejectSchemaV6WithoutMigration is the schema-version-7 boundary's central assertion:
-// bug_optimizer3.db (schema 6) and any other version-6 database is rejected outright at open time,
-// never migrated or dual-read, per "Exact Schema-Version-7 Contract".
-func TestRejectSchemaV6WithoutMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "optimizer.db")
-	store, err := OpenOptimizerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.conn.ExecContext(context.Background(), "PRAGMA user_version = 6"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenOptimizerStore(path); err == nil {
-		t.Fatal("schema v6 was accepted")
-	}
-	if _, err := OpenOptimizerStoreReadOnly(path); err == nil {
-		t.Fatal("schema v6 was accepted read-only")
-	}
-}
-
-// TestSchemaV7ExactColumnAndIndexSet locks the evidence_epochs shape and the two new indexes
+// TestSchemaV8ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
 // (evidence_epochs_one_open, evidence_epochs_mac_opened) into the schema-validation boundary: an
 // unexpected column or a missing/altered index must fail loudly, not silently.
-func TestSchemaV7ExactColumnAndIndexSet(t *testing.T) {
+func TestSchemaV8ExactColumnAndIndexSet(t *testing.T) {
 	store := openTestStore(t)
 	columns, err := tableColumns(context.Background(), store.conn, "evidence_epochs")
 	if err != nil {
@@ -677,7 +632,7 @@ func TestSchemaV7ExactColumnAndIndexSet(t *testing.T) {
 }
 
 // TestNewEpochProgressRejectsInvalidCombinations covers the constructor rejection table required by
-// the schema-version-7 boundary tests: negative counters, a window without a matching closed-window
+// the evidence-epoch boundary tests: negative counters, a window without a matching closed-window
 // count, and vice versa.
 func TestNewEpochProgressRejectsInvalidCombinations(t *testing.T) {
 	window, err := NewWindowAggregate(30, 5*time.Minute, 100, 100, 1, 55, 56, 70, 18, nil, 0, 0)
@@ -915,8 +870,9 @@ func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 
 // TestCompleteResumeDoesNotPreopenCooldownEpoch is a regression test for a bug found analyzing a
 // live deployment: applyCompleteResume opened a safety_validation epoch immediately for any
-// completed MutationSafetyRollback/MutationOverheatRecovery attempt (EpochShapeForPhase used to
-// map PhaseCooldown to one), which happens well before controlMinerAfterSafety's recovery
+// completed MutationSafetyRollback/MutationOverheatRecovery attempt (the old resume mapping
+// treated PhaseCooldown as safety_validation), which happens well before controlMinerAfterSafety's
+// recovery
 // predicate (recoveryHealthyPolls consecutive safeToRecover polls) has ever run. Once that epoch
 // existed, every later COOLDOWN poll took the "epoch already open" branch and the healthy-poll
 // count it should have been counting never advanced past whatever it happened to be at that
@@ -989,9 +945,154 @@ func TestCompleteResumeDoesNotPreopenCooldownEpoch(t *testing.T) {
 	}
 }
 
+func TestSafetyValidationEpochRequiresCompletedRecoveryAndRollsBack(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	state.Phase = PhaseCooldown
+	state.PhaseStartedAt = now
+	state.SafetyReason = SafetyReasonASICLimit
+	result, err := store.Apply(CloseEpoch{State: state, Epoch: epoch, Outcome: EpochContradicted}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+
+	if _, err := store.Apply(OpenEpoch{
+		State: state, Purpose: EpochSafetyValidation, Point: state.CurrentPoint(), RequiredWindows: 1,
+	}, now.Add(time.Minute)); err == nil || !strings.Contains(err.Error(), "lacks completed recovery proof") {
+		t.Fatalf("pre-recovery safety epoch error = %v", err)
+	}
+	if _, open, err := store.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
+		t.Fatalf("rejected transition left an open epoch: open=%t err=%v", open, err)
+	}
+	loaded, err := store.LoadMiner(state.MacAddr)
+	if err != nil || loaded != state {
+		t.Fatalf("rejected transition changed miner: loaded=%+v want=%+v err=%v", loaded, state, err)
+	}
+
+	state.SafetyReason = ""
+	if _, err := store.Apply(OpenEpoch{
+		State: state, Purpose: EpochSafetyValidation, Point: state.CurrentPoint(), RequiredWindows: 1,
+	}, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("open proven safety epoch: %v", err)
+	}
+	path := storePath(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen canonical safety epoch: %v", err)
+	}
+	defer reopened.Close()
+}
+
+func TestReopenRejectsSafetyEpochWithoutRecoveryProof(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, now := bootstrapTestMiner(t, store)
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	state.Phase = PhaseCooldown
+	state.PhaseStartedAt = now
+	state.SafetyReason = ""
+	if _, err := store.Apply(CloseEpoch{
+		State: state, Epoch: epoch, Outcome: EpochContradicted,
+		Successor: &OpenEpoch{
+			State: state, Purpose: EpochSafetyValidation, Point: state.CurrentPoint(), RequiredWindows: 1,
+		},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.conn.ExecContext(context.Background(),
+		"UPDATE optimizer_miners SET safety_reason = ? WHERE mac_addr = ?",
+		SafetyReasonMutationUncertain, state.MacAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOptimizerStore(path); err == nil || !strings.Contains(err.Error(), "lacks completed recovery proof") {
+		t.Fatalf("writable reopen error = %v", err)
+	}
+	if _, err := OpenOptimizerStoreReadOnly(path); err == nil || !strings.Contains(err.Error(), "lacks completed recovery proof") {
+		t.Fatalf("read-only reopen error = %v", err)
+	}
+}
+
+func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
+	states := []struct {
+		name    string
+		phase   OptimizerPhase
+		reason  HoldReason
+		purpose EpochPurpose
+		windows int
+	}{
+		{"baseline", PhaseBaseline, "", EpochBaseline, 2},
+		{"undervolt", PhaseUndervolt, "", EpochTrial, 2},
+		{"frequency", PhaseFrequencyTest, "", EpochTrial, 2},
+		{"voltage", PhaseVoltageTest, "", EpochTrial, 2},
+		{"manual hold", PhaseHold, HoldManual, EpochHoldValidation, 1},
+		{"optimized hold", PhaseHold, HoldOptimized, EpochHoldValidation, 1},
+		{"starved hold", PhaseHold, HoldStarved, EpochProbation, 1},
+		{"cooldown", PhaseCooldown, "", EpochSafetyValidation, 1},
+	}
+	for _, testCase := range states {
+		t.Run(testCase.name, func(t *testing.T) {
+			state := MinerState{MacAddr: testMAC, Phase: testCase.phase, HoldReason: testCase.reason,
+				CurrentFrequency: 400, CurrentCoreVoltage: 1000}
+			epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(),
+				Purpose: testCase.purpose, RequiredWindows: testCase.windows}
+			if err := validateOpenEpochState(state, epoch, false); err != nil {
+				t.Fatalf("canonical shape: %v", err)
+			}
+			epoch.RequiredWindows = 3 - testCase.windows
+			if err := validateOpenEpochState(state, epoch, false); err == nil {
+				t.Fatal("wrong required-window count was accepted")
+			}
+			epoch.RequiredWindows = testCase.windows
+			epoch.Purpose = EpochBaseline
+			if testCase.purpose == EpochBaseline {
+				epoch.Purpose = EpochSafetyValidation
+			}
+			if err := validateOpenEpochState(state, epoch, false); err == nil {
+				t.Fatal("wrong purpose was accepted")
+			}
+		})
+	}
+	for _, state := range []MinerState{
+		{MacAddr: testMAC, Phase: PhaseOverheat, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
+		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldRejected, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
+		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldSafety, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
+	} {
+		epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(), Purpose: EpochBaseline, RequiredWindows: 2}
+		if err := validateOpenEpochState(state, epoch, false); err == nil {
+			t.Fatalf("state %s/%s accepted an open epoch", state.Phase, state.HoldReason)
+		}
+	}
+}
+
+func TestSafetyHoldRejectsActiveSafetyReason(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
+	state.Phase = PhaseHold
+	state.HoldReason = HoldSafety
+	state.SafetyReason = SafetyReasonASICLimit
+	state.SettledAt = now.Add(time.Minute)
+	if _, err := store.Apply(SaveState{State: state}, now.Add(time.Minute)); err == nil ||
+		!strings.Contains(err.Error(), "settled safety hold retains") {
+		t.Fatalf("invalid safety HOLD error = %v", err)
+	}
+}
+
 func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -1074,6 +1175,7 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 func TestStartMutationAttemptRequiresIntentTimestampMatch(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -1148,6 +1250,7 @@ func TestQuarantineMutationClosesAmbiguousCandidateAtomically(t *testing.T) {
 func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = PhaseCooldown
 	state.SafetyReason = SafetyReasonASICLimit
@@ -1386,6 +1489,7 @@ func TestApplyIsExhaustiveOverTransitionVariants(t *testing.T) {
 func TestApplyRollsBackCompletelyOnSecondWriteFailure(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
