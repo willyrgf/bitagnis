@@ -1041,7 +1041,7 @@ func qualifiesSettledObservation(
 	allowManual bool,
 ) bool {
 	switch state.HoldReason {
-	case lib.HoldOptimized, lib.HoldSafety:
+	case lib.HoldOptimized:
 	case lib.HoldManual:
 		if !allowManual {
 			return false
@@ -1057,14 +1057,8 @@ func qualifiesSettledObservation(
 		!completeSafetyTelemetry(info) || hasPowerFault(info) {
 		return false
 	}
-	// Ramp completion and hold/safety validation are now epoch-driven rather than clock-driven: a
-	// settled HOLD with no open evidence epoch has already closed its hold-validation (or
-	// safety-validation) epoch as validated. This predicate authorizes an operator retune
-	// (allowManual's caller), so it deliberately does not relax further: it does not, for example,
-	// gate on recovery_healthy_count, because a settled HoldSafety is only reachable after that
-	// counter already did its job (finishSafetyHold closes the safety_validation epoch that
-	// controlMinerAfterSafety's COOLDOWN recovery predicate opened once recoveryHealthyPolls was
-	// satisfied) — re-checking it here would be redundant, not a gap.
+	// Ramp completion and hold validation are epoch-driven rather than clock-driven: a settled HOLD
+	// with no open evidence epoch has already closed its validation epoch successfully.
 	if _, open, err := states.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
 		return false
 	}
@@ -1082,14 +1076,6 @@ func qualifiesSettledObservation(
 		}
 	}
 	switch state.HoldReason {
-	case lib.HoldSafety:
-		// finishSafetyHold (the only writer of HoldReason == HoldSafety) never runs until the
-		// COOLDOWN recovery predicate has already cleared SafetyReason in the same transition that
-		// opened the safety_validation epoch it closes — a settled HoldSafety therefore always has
-		// SafetyReason == "" today, the same as a settled HoldManual. Requiring it nonzero here (the
-		// pre-recovery-predicate invariant, when SafetyReason stayed latched until an operator acted)
-		// would make this branch permanently unreachable.
-		return state.SafetyReason == ""
 	case lib.HoldManual:
 		return state.SafetyReason == ""
 	case lib.HoldOptimized:

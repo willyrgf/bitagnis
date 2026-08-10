@@ -128,12 +128,16 @@ func TestCooldownRecoveryReleasesFleetNormalMutationBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	finishedAt := now.Add(time.Hour)
-	if err := minerController.finishSafetyHold(&safetyState, epoch, window, settings, finishedAt); err != nil {
+	if err := minerController.finishSafetyValidation(&safetyState, epoch, window, settings, finishedAt); err != nil {
 		t.Fatal(err)
 	}
-	if safetyState.Phase != lib.PhaseHold || safetyState.HoldReason != lib.HoldSafety ||
-		safetyState.SafetyReason != "" {
-		t.Fatalf("recovery did not reach canonical safety HOLD: %+v", safetyState)
+	if safetyState.Phase != lib.PhaseBaseline || safetyState.HoldReason != "" ||
+		safetyState.SafetyReason != "" || !safetyState.SettledAt.IsZero() {
+		t.Fatalf("recovery did not resume the finite pass: %+v", safetyState)
+	}
+	recoveryBaseline := mustOpenEpoch(t, store, safetyState.MacAddr)
+	if recoveryBaseline.Purpose != lib.EpochBaseline || recoveryBaseline.RequiredWindows != 2 {
+		t.Fatalf("recovery baseline = %+v", recoveryBaseline)
 	}
 
 	observations[safetyState.MacAddr].state = safetyState
@@ -207,6 +211,8 @@ func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = lib.PhaseCooldown
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonASICLimit
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -264,6 +270,8 @@ func TestProductionOverheatLoopStateEntersCooldownWithoutMutation(t *testing.T) 
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
 	state.Phase = lib.PhaseOverheat
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now.Add(-time.Hour)
 	state.SafetyReason = lib.SafetyReasonMutationUncertain
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now.Add(-time.Minute))
@@ -305,6 +313,8 @@ func TestRedundantMinimumSafetyMutationIsSupersededBeforePatch(t *testing.T) {
 			state = closeInitialBaselineEpoch(t, store, state, now)
 			state.SetCurrentPoint(minimum)
 			state.Phase = lib.PhaseOverheat
+			state.HoldReason = ""
+			state.SettledAt = time.Time{}
 			state.PhaseStartedAt = now
 			state.SafetyReason = testCase.reason
 			state.SetPendingMutation(testCase.kind, minimum, now)
@@ -364,6 +374,8 @@ func TestRebootPollsPreserveSafetyAuthority(t *testing.T) {
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
 	state.Phase = lib.PhaseOverheat
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now
 	state.SafetyReason = lib.SafetyReasonMutationUncertain
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
@@ -565,22 +577,7 @@ func TestMiningResumeFailureAfterCompletedOperatingPointMutationIsRejected(t *te
 
 func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
-	epoch := mustOpenEpoch(t, store, rootTestMAC)
-	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
-	record.EnteredAt = now
-	record.MeasuredAt = now.Add(time.Minute)
-	record.ReferenceHash = 0
-	finalizeResult, err := store.Apply(lib.FinalizeBaseline{State: state, Record: record, Block: false, Epoch: epoch}, record.MeasuredAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = finalizeResult.State
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldOptimized
-	state.SettledAt = now.Add(-time.Second)
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	settings := rootTestSettings(t)
 	info := rootTestInfo(state.CurrentPoint(), 100)
 	asic := rootTestASIC()
@@ -597,19 +594,14 @@ func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
 		t.Fatal("retune qualification ignored an open evidence epoch")
 	}
+	state.SettledAt = now.Add(-time.Second)
 	closed, err := store.Apply(lib.CloseEpoch{
-		State: state, Epoch: mustOpenEpoch(t, store, rootTestMAC), Outcome: lib.EpochContradicted,
+		State: state, Epoch: mustOpenEpoch(t, store, rootTestMAC), Outcome: lib.EpochValidated,
 	}, now.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	state = closed.State
-	state.SettledAt = now.Add(-time.Second)
-	if result, err := store.Apply(lib.SaveState{State: state}, now.Add(3*time.Hour)); err != nil {
-		t.Fatal(err)
-	} else {
-		state = result.State
-	}
 	state.SetBestPoint(lib.OperatingPoint{Frequency: 550, CoreVoltage: 1000})
 	state.BestHashRate = 200
 	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
@@ -690,16 +682,6 @@ func TestRetuneHealthyPollsMustBeConsecutive(t *testing.T) {
 func TestRetuneSafetyBlockBreaksConsecutivePair(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldSafety
-	// A settled HoldSafety always has an empty SafetyReason: finishSafetyHold (the only writer of
-	// HoldReason == HoldSafety) never runs until the COOLDOWN recovery predicate has already cleared
-	// it in the same transition that opened the safety_validation epoch it closes.
-	state.SafetyReason = ""
-	state.SettledAt = now.Add(-time.Second)
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
 	info := rootTestInfo(state.CurrentPoint(), 100)
 	coordinator := newMutationCoordinator(
 		nil, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: info}}, nil,
@@ -727,65 +709,9 @@ func TestRetuneSafetyBlockBreaksConsecutivePair(t *testing.T) {
 	}
 }
 
-func TestRetuneAcceptsSettledSafetyHoldAfterTwoHealthyPolls(t *testing.T) {
-	store, _, state, now := newRootMutationStore(t)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldSafety
-	// A settled HoldSafety always has an empty SafetyReason: finishSafetyHold (the only writer of
-	// HoldReason == HoldSafety) never runs until the COOLDOWN recovery predicate has already cleared
-	// it in the same transition that opened the safety_validation epoch it closes.
-	state.SafetyReason = ""
-	state.SettledAt = now.Add(-time.Second)
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
-	settings := rootTestSettings(t)
-	info := rootTestInfo(state.CurrentPoint(), 100)
-	asic := rootTestASIC()
-	coordinator := newMutationCoordinator(
-		nil, store, lib.SettingsFile{}, []lib.DiscoveredMiner{{IP: state.IP, Info: info}}, nil,
-		state.Hostname, nil, nil, log.New(io.Discard, "", 0), nil,
-	)
-	coordinator.retuneHost = state.Hostname
-	observations := map[string]*minerObservation{
-		state.MacAddr: {miner: lib.DiscoveredMiner{IP: state.IP, Info: info}, info: info, asic: asic, settings: settings, state: state},
-	}
-	accepted, err := coordinator.advanceRetuneLocked(observations, now)
-	if err != nil || accepted {
-		t.Fatalf("first safety retune poll = accepted:%t err:%v", accepted, err)
-	}
-	accepted, err = coordinator.advanceRetuneLocked(observations, now.Add(time.Second))
-	if err != nil || !accepted {
-		t.Fatalf("second safety retune poll = accepted:%t err:%v", accepted, err)
-	}
-	loaded, err := store.LoadMiner(state.MacAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Phase != lib.PhaseBaseline || loaded.SafetyReason != "" || loaded.PassTrigger != lib.PassOperator {
-		t.Fatalf("accepted safety retune state = %+v", loaded)
-	}
-}
-
 func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
-	epoch := mustOpenEpoch(t, store, rootTestMAC)
-	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
-	record.EnteredAt = now
-	record.MeasuredAt = now.Add(time.Minute)
-	record.ReferenceHash = 0
-	finalizeResult, err := store.Apply(lib.FinalizeBaseline{State: state, Record: record, Block: false, Epoch: epoch}, record.MeasuredAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = finalizeResult.State
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldOptimized
-	state.SettledAt = now
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	controller := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
 	offGrid := lib.OperatingPoint{Frequency: 500, CoreVoltage: 1000}
 	asic := rootTestASIC()
@@ -820,22 +746,7 @@ func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
 // this reordering.
 func TestPhaseHandlingRunsBeforeLiveDifferingPointReconciliation(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
-	epoch := mustOpenEpoch(t, store, rootTestMAC)
-	record := rootRecord(rootTestMAC, state.CurrentPoint(), 100, 55, 18, 70)
-	record.EnteredAt = now
-	record.MeasuredAt = now.Add(time.Minute)
-	record.ReferenceHash = 0
-	finalizeResult, err := store.Apply(lib.FinalizeBaseline{State: state, Record: record, Block: false, Epoch: epoch}, record.MeasuredAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = finalizeResult.State
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldOptimized
-	state.SettledAt = now
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
+	state = closeInitialBaselineEpoch(t, store, state, now)
 	controller := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
 	drifted := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	asic := rootTestASIC()
@@ -873,18 +784,8 @@ func TestPhaseHandlingRunsBeforeLiveDifferingPointReconciliation(t *testing.T) {
 func TestLedgerReconciledPointIsAdoptedNotRefusedAsForeign(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	incumbent := state.CurrentPoint()
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.BestHashRate = 100
-	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
 	candidate := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	admitResult, err := store.Apply(lib.AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: incumbent, Phase: lib.PhaseUndervolt, ReferenceHash: 100,
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
+	admitResult := admitTestTrial(t, store, state, candidate, lib.PhaseUndervolt, 100, now)
 	state = admitResult.State
 	attemptID := admitResult.AttemptID
 	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestonePatchRequested, now.Add(time.Second)); err != nil {
@@ -1055,6 +956,8 @@ func TestUnreadableSafetySupersessionPreservesFirmwareCause(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = lib.PhaseOverheat
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonFirmwareOverheat
 	state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
 	if result, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
@@ -1195,6 +1098,8 @@ func TestRebootInFlightSuppressesUnreadableEscalationAndStillCompletes(t *testin
 	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	incumbent := state.CurrentPoint()
 	state.Phase = lib.PhaseCooldown
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonASICLimit
 	state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {

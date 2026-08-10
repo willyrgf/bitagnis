@@ -373,6 +373,41 @@ func TestTrialPredicatesApplyToEachWindow(t *testing.T) {
 	}
 }
 
+func TestUnhealthyManualValidationBecomesRejectedHold(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	result, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := closeInitialBaselineEpoch(t, store, result.State, now)
+	result, err = store.Apply(lib.AdoptManualPoint{MacAddr: state.MacAddr, Point: point}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	if err := minerController.finishManualHold(
+		&state, mustOpenEpoch(t, store, state.MacAddr),
+		mustWindow(t, 0, 100, 55, 55, 70, 18, nil), rootTestSettings(t), now.Add(2*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldRejected || !state.SettledAt.IsZero() {
+		t.Fatalf("unhealthy manual validation = %+v", state)
+	}
+	if _, open, err := store.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
+		t.Fatalf("rejected manual hold retained epoch: open=%t err=%v", open, err)
+	}
+}
+
 func TestLongTermReportFormattingIsDeterministicAndCredentialFree(t *testing.T) {
 	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	report := lib.ArmReport{
@@ -432,16 +467,20 @@ func TestReportLoaderUsesHistoricalControlBoundaryAfterSecondRetune(t *testing.T
 		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
 		MeasuredAt: createdAt.Add(10 * time.Minute), EnteredAt: createdAt,
 	}
-	finalizeResult, err := store.Apply(lib.FinalizeBaseline{State: state, Record: baseline, Block: false, Epoch: epoch}, baseline.MeasuredAt)
+	finalizeResult, err := store.Apply(lib.CompleteBaseline{
+		State: state, Record: baseline, Epoch: epoch, Decision: lib.BaselinePlace,
+		Selected: oldPoint, Best: oldPoint, BestHashRate: baseline.MedianHash,
+	}, baseline.MeasuredAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state = finalizeResult.State
 	boundarySettledAt := createdAt.Add(23 * time.Hour)
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldOptimized
+	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
 	state.SettledAt = boundarySettledAt
-	if _, err := store.Apply(lib.SaveState{State: state}, createdAt); err != nil {
+	if _, err := store.Apply(lib.CloseEpoch{
+		State: state, Epoch: holdEpoch, Outcome: lib.EpochValidated,
+	}, boundarySettledAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -661,6 +700,48 @@ func TestWindowClosesOnTargetSampleCountAtHealthyRate(t *testing.T) {
 	}
 	if window.Span() >= windowMaxSpan(settings) {
 		t.Fatalf("window span %s reached windowMaxSpan %s at a healthy rate", window.Span(), windowMaxSpan(settings))
+	}
+}
+
+func TestFleetGatePausesFrontierDecisionAfterRamp(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := bootstrap.State
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	at := now
+	poll := mustReadablePoll(t, rootTestInfo(point, 100), asic)
+	for index := 0; index < rampSamples(settings)+2*targetSampleCount(settings); index++ {
+		at = at.Add(settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(context.Background(), &state, poll, settings, at, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	epoch := mustOpenEpoch(t, store, rootTestMAC)
+	if epoch.Progress.SettledSamples() < rampSamples(settings) || epoch.Progress.ClosedWindows() != 0 ||
+		state.PendingKind != "" {
+		t.Fatalf("closed fleet gate advanced frontier: state=%+v epoch=%+v", state, epoch)
+	}
+	for index := 0; index < 2*targetSampleCount(settings); index++ {
+		at = at.Add(settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(context.Background(), &state, poll, settings, at, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if state.PendingKind != lib.MutationOperatingPoint || state.PendingPoint() == (lib.OperatingPoint{}) {
+		t.Fatalf("opened fleet gate did not resume frontier: %+v", state)
 	}
 }
 
@@ -1152,10 +1233,7 @@ func TestProbationAtDegradedRateDoesNotOscillate(t *testing.T) {
 	t.Logf("observation: at a 0.4 delivered-tick rate, the single probation epoch (id %d) opened by starvation at %s exited cleanly at %s with no reopen and no rejected window ever recorded against it — probation's pure sample-count race is immune to the admission-rate degradation that would starve a normal window-evaluating epoch", probationEpochID, now, reopenedAt)
 }
 
-// mustOpenEpoch and closeInitialBaselineEpoch mirror the lib-package test helpers of the same
-// purpose: production code always closes a miner's baseline epoch (FinalizeBaseline) before any
-// later transition that requires no epoch be open, and tests that skip straight to that later
-// transition need to do the same.
+// mustOpenEpoch and closeInitialBaselineEpoch mirror the lib-package test helpers.
 func mustOpenEpoch(t *testing.T, store *lib.OptimizerStore, macAddr string) lib.EvidenceEpoch {
 	t.Helper()
 	epoch, open, err := store.OpenEvidenceEpochFor(macAddr)
@@ -1177,11 +1255,46 @@ func closeInitialBaselineEpoch(t *testing.T, store *lib.OptimizerStore, state li
 		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
 		MeasuredAt: at, EnteredAt: state.PassStartedAt,
 	}
-	result, err := store.Apply(lib.FinalizeBaseline{State: state, Record: record, Block: false, Epoch: epoch}, at)
+	result, err := store.Apply(lib.CompleteBaseline{
+		State: state, Record: record, Epoch: epoch, Decision: lib.BaselinePlace,
+		Selected: state.CurrentPoint(), Best: state.CurrentPoint(), BestHashRate: record.MedianHash,
+	}, at)
 	if err != nil {
 		t.Fatalf("close initial baseline epoch: %v", err)
 	}
+	state = result.State
+	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	state.SettledAt = at
+	result, err = store.Apply(lib.CloseEpoch{State: state, Epoch: holdEpoch, Outcome: lib.EpochValidated}, at)
+	if err != nil {
+		t.Fatalf("settle initial optimized hold: %v", err)
+	}
 	return result.State
+}
+
+func admitTestTrial(
+	t *testing.T,
+	store *lib.OptimizerStore,
+	state lib.MinerState,
+	candidate lib.OperatingPoint,
+	phase lib.OptimizerPhase,
+	referenceHash float64,
+	at time.Time,
+) lib.TransitionResult {
+	t.Helper()
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	record := rootRecord(state.MacAddr, state.CurrentPoint(), 100, 55, 18, 70)
+	record.EnteredAt = state.PassStartedAt
+	record.MeasuredAt = at
+	record.ReferenceHash = 0
+	result, err := store.Apply(lib.CompleteBaseline{
+		State: state, Record: record, Epoch: epoch, Decision: lib.BaselineContinue,
+		Candidate: candidate, CandidatePhase: phase, ReferenceHash: referenceHash,
+	}, at)
+	if err != nil {
+		t.Fatalf("admit test trial: %v", err)
+	}
+	return result
 }
 
 func mustReadablePoll(t *testing.T, info lib.Info, asic lib.ASICSettings) readablePoll {
@@ -1908,18 +2021,10 @@ func TestFreshEmergencyEpisodeResetsStaleRecoveryHealthyCount(t *testing.T) {
 	}
 }
 
-// TestSettledHoldSafetyQualifiesForRetuneAndSettledAccounting is a regression test for a bug found
-// in adversarial review: qualifiesSettledObservation's HoldSafety branch used to require
-// SafetyReason != "", an invariant from before this session's change, when SafetyReason stayed
-// latched through HoldSafety until an operator acted. Now that the COOLDOWN recovery predicate
-// clears SafetyReason in the same transition that opens the safety_validation epoch
-// finishSafetyHold later closes, every real settled HoldSafety has SafetyReason == "" — the old
-// check was permanently false for the real path, silently breaking --retune (advanceRetuneLocked
-// calls this same function) and hourly "settled" accounting classification for any miner that ever
-// overheats and recovers. This test drives the real end-to-end path (COOLDOWN -> recovery
-// predicate -> safety_validation epoch -> closed window -> HoldSafety) instead of hand-constructing
-// the state, so it fails if that invariant regresses again.
-func TestSettledHoldSafetyQualifiesForRetuneAndSettledAccounting(t *testing.T) {
+// TestSafetyRecoveryResumesPassAndIsNotSettled drives the complete durable recovery path. A
+// successful safety-validation window must open a fresh baseline for the same pass, not become a
+// terminal or retune-eligible HOLD.
+func TestSafetyRecoveryResumesPassAndIsNotSettled(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1952,17 +2057,238 @@ func TestSettledHoldSafetyQualifiesForRetuneAndSettledAccounting(t *testing.T) {
 			t.Fatalf("control miner after safety (window poll %d): %v", i, err)
 		}
 	}
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldSafety || state.SettledAt.IsZero() {
-		t.Fatalf("miner did not settle into HoldSafety: %+v", state)
+	if state.Phase != lib.PhaseBaseline || state.HoldReason != "" || !state.SettledAt.IsZero() {
+		t.Fatalf("miner did not resume its pass baseline: %+v", state)
 	}
 	if state.SafetyReason != "" {
-		t.Fatalf("SafetyReason reappeared by settlement: %q", state.SafetyReason)
+		t.Fatalf("SafetyReason reappeared during pass resumption: %q", state.SafetyReason)
 	}
-	settledAt := nextTick()
-	if !qualifiesSettledObservation(store, state, info, asic, settings, settledAt, false) {
-		t.Fatal("a genuinely recovered, settled HoldSafety miner did not qualify as a settled observation")
+	recoveryBaseline := mustOpenEpoch(t, store, rootTestMAC)
+	if recoveryBaseline.Purpose != lib.EpochBaseline || recoveryBaseline.RequiredWindows != 2 ||
+		recoveryBaseline.Point != state.CurrentPoint() {
+		t.Fatalf("recovery baseline = %+v", recoveryBaseline)
 	}
-	if !minerController.verifiedSettledObservation(state, info, asic, settings, settledAt) {
-		t.Fatal("verifiedSettledObservation rejected a genuinely recovered, settled HoldSafety miner")
+	observedAt := nextTick()
+	if qualifiesSettledObservation(store, state, info, asic, settings, observedAt, false) {
+		t.Fatal("resumed recovery baseline qualified as settled")
+	}
+	if minerController.verifiedSettledObservation(state, info, asic, settings, observedAt) {
+		t.Fatal("resumed recovery baseline was classified as settled accounting")
+	}
+}
+
+// TestSafetyInterruptedCandidateIsConsumedAndRecoveryContinuesFrontier reproduces the incident
+// shape: 400/1060 was reserved but never became observable before emergency recovery returned the
+// miner to 400/1000. Recovery must preserve 400/1060 as consumed, revalidate the safe incumbent,
+// and continue with the next unseen frequency candidate instead of entering a terminal HOLD or
+// retrying the interrupted voltage point.
+func TestSafetyInterruptedCandidateIsConsumedAndRecoveryContinuesFrontier(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 10, 10, 18, 39, 0, time.UTC)
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	interrupted := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}
+	next := lib.OperatingPoint{Frequency: 490, CoreVoltage: 1000}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(minimum, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := admitTestTrial(t, store, bootstrap.State, interrupted, lib.PhaseVoltageTest, 100, now.Add(time.Second))
+	state := admitted.State
+	expected := state
+	state.SetFallbackPoint(lib.OperatingPoint{})
+	state.ClearPendingMutation()
+	state.Phase = lib.PhaseCooldown
+	state.PhaseStartedAt = now.Add(2 * time.Second)
+	state.SafetyReason = lib.SafetyReasonFirmwareOverheat
+	result, err := store.Apply(lib.SafetyTransition{
+		Expected: expected, State: state,
+	}, state.PhaseStartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	records, err := store.ListPoints(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, found := findRecord(records, interrupted)
+	if !found || consumed.Status != lib.PointUnobservable || consumed.EvidenceEpochID != 0 {
+		t.Fatalf("safety-interrupted point = %+v, found=%t", consumed, found)
+	}
+
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	info := rootTestInfo(minimum, 100)
+	at := state.PhaseStartedAt
+	for poll := 0; poll < recoveryHealthyPolls(settings); poll++ {
+		at = at.Add(settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, info, asic), settings, at, true,
+		); err != nil {
+			t.Fatalf("recovery poll %d: %v", poll, err)
+		}
+	}
+	safetyEpoch := mustOpenEpoch(t, store, rootTestMAC)
+	if safetyEpoch.Purpose != lib.EpochSafetyValidation {
+		t.Fatalf("recovery epoch = %+v", safetyEpoch)
+	}
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.finishSafetyValidation(
+		&state, safetyEpoch, mustWindow(t, 100, 100, 48, 48, 44, 12, nil), settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoveryBaseline := mustOpenEpoch(t, store, rootTestMAC)
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.evaluateBaseline(
+		context.Background(), &state, recoveryBaseline,
+		mustWindow(t, 100, 100, 48, 48, 44, 12, nil), asic, settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != lib.PhaseFrequencyTest || state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != next || state.PendingPoint() == interrupted || state.HoldReason != "" {
+		t.Fatalf("frontier did not continue past interrupted point: %+v", state)
+	}
+	records, err = store.ListPoints(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, found = findRecord(records, interrupted)
+	if !found || consumed.Status != lib.PointUnobservable {
+		t.Fatalf("interrupted point was reopened: %+v, found=%t", consumed, found)
+	}
+	entered, found := findRecord(records, next)
+	if !found || entered.Status != lib.PointEntered || entered.EntryAttemptID <= admitted.AttemptID {
+		t.Fatalf("next frontier point = %+v, found=%t", entered, found)
+	}
+}
+
+func TestSafetyRecoveryAtUnseenMinimumPreservesPassAnchorAndReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 10, 11, 0, 0, 0, time.UTC)
+	rootPoint := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(rootPoint, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := bootstrap.State
+	state := expected
+	state.Phase = lib.PhaseCooldown
+	state.PhaseStartedAt = now.Add(time.Second)
+	state.SafetyReason = lib.SafetyReasonASICLimit
+	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, state.PhaseStartedAt)
+	result, err := store.Apply(lib.SafetyTransition{Expected: expected, State: state}, state.PhaseStartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: lib.MutationSafetyRollback, Reason: state.SafetyReason,
+		FromFrequency: rootPoint.Frequency, FromCoreVoltage: rootPoint.CoreVoltage,
+		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
+		IntentCreatedAt: state.PendingSince, StartedAt: state.PendingSince,
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, lib.MutationMilestonePatchRequested, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordConfiguredVerification(id, now.Add(3*time.Second), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, lib.MutationMilestoneRestartRequested, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, lib.MutationMilestoneRebootVerified, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Apply(lib.CompleteMutation{
+		MacAddr: state.MacAddr, IP: state.IP, AttemptID: id,
+	}, now.Add(6*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	if err := store.RecordFirstPositive(id, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Apply(lib.CompleteResume{MacAddr: state.MacAddr, AttemptID: id}, now.Add(8*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	info := rootTestInfo(minimum, 10)
+	at := now.Add(8 * time.Second)
+	for poll := 0; poll < recoveryHealthyPolls(settings); poll++ {
+		at = at.Add(settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, info, asic), settings, at, true,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	safetyEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.finishSafetyValidation(
+		&state, safetyEpoch, mustWindow(t, 100, 100, 48, 48, 44, 12, nil), settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoveryEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.evaluateBaseline(
+		context.Background(), &state, recoveryEpoch,
+		mustWindow(t, 100, 100, 48, 48, 44, 12, nil), asic, settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.ListPoints(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, found := findRecord(records, rootPoint)
+	if !found || root.Status != lib.PointUnobservable || !root.EnteredAt.Equal(state.PassStartedAt) {
+		t.Fatalf("interrupted pass anchor = %+v, found=%t", root, found)
+	}
+	recovery, found := findRecord(records, minimum)
+	if !found || recovery.Status != lib.PointValidated || !recovery.EnteredAt.After(state.PassStartedAt) ||
+		recovery.EvidenceEpochID != recoveryEpoch.ID {
+		t.Fatalf("recovery point = %+v, found=%t", recovery, found)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("reopen recovery pass: %v", err)
+	}
+	defer reopened.Close()
+	loaded, err := reopened.LoadMiner(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PendingKind != lib.MutationOperatingPoint || loaded.PendingPoint() != (lib.OperatingPoint{Frequency: 400, CoreVoltage: 1060}) {
+		t.Fatalf("reopened frontier state = %+v", loaded)
 	}
 }
