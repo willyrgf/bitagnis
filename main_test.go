@@ -137,6 +137,117 @@ func TestSafetyThresholdsRemainDistinct(t *testing.T) {
 	}
 }
 
+func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	aboveMinimum := lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	priorPending := now.Add(-time.Minute)
+
+	type emergencyCase struct {
+		name             string
+		reason           lib.SafetyReason
+		current          lib.OperatingPoint
+		live             lib.OperatingPoint
+		pending          lib.MutationKind
+		pendingSince     time.Time
+		configure        func(*lib.Info)
+		wantPhase        lib.OptimizerPhase
+		wantReason       lib.SafetyReason
+		wantPending      lib.MutationKind
+		wantPendingSince time.Time
+	}
+	tests := []emergencyCase{
+		{
+			name: "firmware owns powered-down cooling", current: aboveMinimum, live: lib.OperatingPoint{Frequency: 50, CoreVoltage: 1000},
+			configure: func(info *lib.Info) { info.OverHeatMode, info.Temp, info.HashRate = 1, -1, 0 },
+			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
+		},
+		{
+			name: "safe firmware marker authorizes recovery", current: aboveMinimum, live: aboveMinimum,
+			configure: func(info *lib.Info) { info.OverHeatMode = 1 },
+			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
+			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+		},
+		{
+			name: "firmware episode already canonical", reason: lib.SafetyReasonFirmwareOverheat,
+			current: minimum, live: minimum, wantPhase: lib.PhaseCooldown,
+			wantReason: lib.SafetyReasonFirmwareOverheat,
+		},
+		{
+			name: "production uncertain state already canonical", reason: lib.SafetyReasonMutationUncertain,
+			current: minimum, live: minimum, wantPhase: lib.PhaseCooldown,
+			wantReason: lib.SafetyReasonMutationUncertain,
+		},
+		{
+			name: "firmware changed point behind durable state", reason: lib.SafetyReasonFirmwareOverheat,
+			current: aboveMinimum, live: minimum, wantPhase: lib.PhaseOverheat,
+			wantReason:  lib.SafetyReasonFirmwareOverheat,
+			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+		},
+		{
+			name: "unsafe exact minimum is mutation free", reason: lib.SafetyReasonMutationUncertain,
+			current: minimum, live: minimum,
+			configure: func(info *lib.Info) { info.Temp = settings.TempCutoff },
+			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonHostCutoff,
+		},
+		{
+			name: "unchanged rollback keeps authority identity", reason: lib.SafetyReasonMutationUncertain,
+			current: aboveMinimum, live: aboveMinimum, pending: lib.MutationSafetyRollback,
+			pendingSince: priorPending, wantPhase: lib.PhaseOverheat,
+			wantReason:  lib.SafetyReasonMutationUncertain,
+			wantPending: lib.MutationSafetyRollback, wantPendingSince: priorPending,
+		},
+		{
+			name: "firmware fact supersedes rollback", reason: lib.SafetyReasonMutationUncertain,
+			current: aboveMinimum, live: aboveMinimum, pending: lib.MutationSafetyRollback,
+			pendingSince: priorPending, configure: func(info *lib.Info) { info.OverHeatMode = 1 },
+			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
+			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+		},
+	}
+	for _, reason := range []lib.SafetyReason{
+		lib.SafetyReasonASICLimit,
+		lib.SafetyReasonHostCutoff,
+		lib.SafetyReasonFirmwareTrip,
+		lib.SafetyReasonPowerLimit,
+		lib.SafetyReasonVRLimit,
+	} {
+		tests = append(tests, emergencyCase{
+			name: "settled minimum retires " + string(reason), reason: reason,
+			current: minimum, live: minimum, wantPhase: lib.PhaseCooldown, wantReason: reason,
+		})
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			state := lib.MinerState{
+				MacAddr: rootTestMAC, Hostname: "root-test", Phase: lib.PhaseOverheat,
+				PhaseStartedAt: now.Add(-time.Hour), SafetyReason: testCase.reason, OverheatCount: 1,
+			}
+			state.SetCurrentPoint(testCase.current)
+			if testCase.pending != "" {
+				state.SetPendingMutation(testCase.pending, minimum, testCase.pendingSince)
+			}
+			info := rootTestInfo(testCase.live, 100)
+			if testCase.configure != nil {
+				testCase.configure(&info)
+			}
+			assessment := assessInstantaneousSafety(info, settings, testCase.live, minimum)
+			if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment); err != nil {
+				t.Fatal(err)
+			}
+			if state.Phase != testCase.wantPhase || state.SafetyReason != testCase.wantReason ||
+				state.PendingKind != testCase.wantPending || !state.PendingSince.Equal(testCase.wantPendingSince) {
+				t.Fatalf("disposition = phase:%s reason:%s pending:%s since:%s; want phase:%s reason:%s pending:%s since:%s",
+					state.Phase, state.SafetyReason, state.PendingKind, state.PendingSince,
+					testCase.wantPhase, testCase.wantReason, testCase.wantPending, testCase.wantPendingSince)
+			}
+		})
+	}
+}
+
 // mustWindow builds a lib.WindowAggregate through its one constructor, failing the test if the
 // synthetic evidence supplied is itself invalid.
 func mustWindow(t *testing.T, medianHash, expectedHash, meanTemp, p95Temp, p95VRTemp, p95Power float64, errorPercent *float64) lib.WindowAggregate {
@@ -1786,7 +1897,7 @@ func TestFreshEmergencyEpisodeResetsStaleRecoveryHealthyCount(t *testing.T) {
 		action:  safetyEmergencyHold,
 		failure: safetyFailure{status: string(lib.PointThermal), reason: "test-induced fresh emergency"},
 	}
-	if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment, true); err != nil {
+	if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment); err != nil {
 		t.Fatalf("transitionEmergencyState: %v", err)
 	}
 	if state.Phase != lib.PhaseOverheat {

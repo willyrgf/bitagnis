@@ -295,14 +295,14 @@ func (minerController *controller) enforceMinerSafety(
 				state.Phase = lib.PhaseOverheat
 				state.HoldReason = ""
 				if firmwareOverheat {
-					state.SafetyReason = lib.SafetyReasonFirmwareOverheat
+					state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonFirmwareOverheat)
 				} else {
 					state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonFirmwareTrip)
 				}
 			} else {
 				state.Phase = lib.PhaseOverheat
 				state.HoldReason = ""
-				state.SafetyReason = lib.SafetyReasonMutationUncertain
+				state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
 				state.OverheatCount = incrementOverheatCount(state.OverheatCount)
 			}
 			state.UnreadablePollCount = 0
@@ -345,6 +345,22 @@ func (minerController *controller) enforceMinerSafety(
 	}
 	live := operatingPointFromInfo(info)
 	assessment := assessInstantaneousSafety(info, settings, live, minimum)
+	// A canonical grid does not make incomplete telemetry informative. In particular, AxeOS 600-
+	// series boards cannot report ASIC temperature while firmware has powered the ASIC down, and a
+	// host-requested reboot has the same transient shape. An unavailable poll may not revoke typed
+	// safety authority; the emergency transition below also preserves a neutral poll's unchanged
+	// disposition byte-for-byte.
+	if assessment.action == safetyUnavailable {
+		return true, nil
+	}
+	if assessment.action == safetyNormal &&
+		(state.PendingKind == lib.MutationSafetyRollback || state.PendingKind == lib.MutationOverheatRecovery) {
+		if _, unfinished, err := minerController.states.UnfinishedMutationAttempt(state.MacAddr); err != nil {
+			return true, fmt.Errorf("preserve neutral safety mutation: %w", err)
+		} else if unfinished {
+			return true, nil
+		}
+	}
 	if state.Phase == lib.PhaseOverheat ||
 		assessment.action == safetyHostContainment ||
 		assessment.action == safetyFirmwareRecovery ||
@@ -355,9 +371,6 @@ func (minerController *controller) enforceMinerSafety(
 		return true, minerController.rollbackForSafety(
 			ctx, state, live, info, asic, settings, now, assessment.failure, true,
 		)
-	}
-	if assessment.action == safetyUnavailable {
-		return true, nil
 	}
 	if state.PendingKind != "" || state.MiningPending {
 		return true, nil
@@ -436,7 +449,7 @@ func (minerController *controller) recordUnreadablePoll(
 	}
 	state.Phase = lib.PhaseOverheat
 	state.HoldReason = ""
-	state.SafetyReason = lib.SafetyReasonMutationUncertain
+	state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
 	state.UnreadablePollCount = 0
 	// See the matching reset in enforceMinerSafety: a dwell count from a prior COOLDOWN belongs to
 	// that episode, not this new escalation.
@@ -1472,7 +1485,7 @@ func (minerController *controller) rollbackForSafety(
 	}
 	if target == failedPoint || !validLivePoint(target) {
 		if _, err := transitionEmergencyState(state, info, asic, settings, now,
-			safetyAssessment{action: safetyEmergencyHold, failure: failure}, true); err != nil {
+			safetyAssessment{action: safetyEmergencyHold, failure: failure}); err != nil {
 			return err
 		}
 		result, err := minerController.states.Apply(lib.SafetyTransition{Expected: expected, State: *state, Record: safetyRecord}, now)
@@ -1485,7 +1498,7 @@ func (minerController *controller) rollbackForSafety(
 	if state.PendingKind == lib.MutationSafetyRollback && state.PendingPoint() == target && safetyRecord == nil {
 		return minerController.saveMinerState(state, now)
 	}
-	state.SafetyReason = reasonForSafetyFailure(failure)
+	state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(failure))
 	state.SetFallbackPoint(lib.OperatingPoint{})
 	state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 	state.Phase = lib.PhaseCooldown
@@ -1609,7 +1622,7 @@ func (minerController *controller) handleEmergency(
 			return recordErr
 		}
 	}
-	event, err := transitionEmergencyState(state, info, asic, settings, now, assessment, true)
+	event, err := transitionEmergencyState(state, info, asic, settings, now, assessment)
 	if err != nil {
 		return err
 	}
@@ -1628,8 +1641,10 @@ func (minerController *controller) handleEmergency(
 // does not touch a durable cooldown-expiry clock — that column and the wall-clock cooldown
 // (overheatCooldown/Settings.OverheatCooldownMins) it fed were both deleted; COOLDOWN's exit is a
 // durable count of consecutive healthy polls instead (see recoveryHealthyPolls in
-// controlMinerAfterSafety). OverheatCount still increments here — it remains a durable diagnostic —
-// but nothing computes or stores a cooldown duration from it.
+// controlMinerAfterSafety). Live firmware evidence and agreement between the live and durable exact
+// minimum decide whether hardware work still exists; SafetyReason retains the strongest observed
+// cause but cannot manufacture a redundant same-pair rollback. OverheatCount still increments here
+// — it remains a durable diagnostic — but nothing computes or stores a cooldown duration from it.
 func transitionEmergencyState(
 	state *lib.MinerState,
 	info lib.Info,
@@ -1637,7 +1652,6 @@ func transitionEmergencyState(
 	settings lib.Settings,
 	now time.Time,
 	assessment safetyAssessment,
-	preserveInFlight bool,
 ) (string, error) {
 	minimum, err := minimumAdvertisedPoint(asic)
 	if err != nil {
@@ -1655,54 +1669,43 @@ func transitionEmergencyState(
 		// this episode's recovery proof from zero, never resume a prior episode's partial count.
 		state.RecoveryHealthyCount = 0
 	}
+	priorReason := state.SafetyReason
 	reason := reasonForSafetyFailure(assessment.failure)
 	state.SafetyReason = escalateSafetyReason(state.SafetyReason, reason)
 	live := operatingPointFromInfo(info)
 	firmware := info.OverHeatMode != 0 || live.Frequency == 50 || assessment.action == safetyFirmwareRecovery
-	trip := knownFirmwareTripExceeded(info) || assessment.action == safetyEmergencyHold && !firmware
+	recovered := safeToRecover(info, settings)
+	setPending := func(kind lib.MutationKind) {
+		// Re-observing the same disposition is not a new authority. Keeping PendingSince stable lets
+		// the mutation attempt and the pending state remain one identity across ordinary poll ticks.
+		if state.PendingKind == kind && state.PendingPoint() == minimum && priorReason == state.SafetyReason {
+			return
+		}
+		state.SetPendingMutation(kind, minimum, now)
+	}
 	switch {
-	case state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
-		if safeToRecover(info, settings) {
-			state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
-		} else {
-			state.ClearPendingMutation()
-		}
-	case state.SafetyReason == lib.SafetyReasonFirmwareTrip:
-		if safeToRecover(info, settings) {
-			state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
-		} else {
-			state.ClearPendingMutation()
-		}
-	case state.SafetyReason == lib.SafetyReasonMutationUncertain:
-		if safeToRecover(info, settings) {
-			state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
-		} else {
-			state.ClearPendingMutation()
-		}
 	case firmware:
-		if safeToRecover(info, settings) {
-			state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
+		if recovered {
+			setPending(lib.MutationOverheatRecovery)
 		} else {
 			state.ClearPendingMutation()
 		}
-	case trip:
+	case live == minimum && !recovered:
 		state.ClearPendingMutation()
-	case live == minimum && !safeToRecover(info, settings):
-		state.ClearPendingMutation()
-	case live == minimum && state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
-		state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
-	case live == minimum:
+	case live == minimum && state.CurrentPoint() == minimum:
 		state.ClearPendingMutation()
 		state.Phase = lib.PhaseCooldown
 		state.PhaseStartedAt = now
-	case live != minimum:
-		state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
-	}
-	if preserveInFlight && state.PendingKind == lib.MutationOperatingPoint {
+	case knownFirmwareTripExceeded(info):
 		state.ClearPendingMutation()
-	}
-	if !newEpisode && state.Phase == lib.PhaseOverheat && state.PendingKind == "" && safeToRecover(info, settings) && state.SafetyReason == "" {
-		state.Phase = lib.PhaseCooldown
+	case assessment.action == safetyHostContainment || assessment.action == safetyRollback:
+		setPending(lib.MutationSafetyRollback)
+	case !recovered:
+		state.ClearPendingMutation()
+	case state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
+		setPending(lib.MutationOverheatRecovery)
+	default:
+		setPending(lib.MutationSafetyRollback)
 	}
 	return map[bool]string{true: "started", false: ""}[newEpisode], nil
 }

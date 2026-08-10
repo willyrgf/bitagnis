@@ -75,6 +75,13 @@ temperature and stores the unadvertised emergency state `50 MHz / 1000 mV`.
 Bitagnis never adopts or evaluates that firmware state. Firmware recovery
 requires positive, finite ASIC temperature, VR temperature, and power; every
 recovery boundary; no power fault; and supported device identity.
+On 600-series boards AxeOS powers the ASIC down during this episode, so ASIC
+temperature is unavailable while firmware performs its own VR-temperature and
+minimum-cooling-cycle loop. Bitagnis treats that readback as a non-event: it
+does not PATCH, restart, clear a typed safety intent, or downgrade a previously
+verified firmware-overheat cause. Once complete safe telemetry returns,
+Bitagnis normalizes any firmware-changed point through one restart-verified
+`overheat_recovery` to the exact advertised minimum.
 
 **`COOLDOWN` exits on a durable count of consecutive healthy polls, not a
 timer.** Its previous exit — a wall-clock timer that grew with repeated
@@ -106,7 +113,12 @@ typed `safety_rollback` or `overheat_recovery` intent is the only authority for
 the corresponding PATCH. If the exact minimum is already active and remains
 unsafe without a firmware flag, Bitagnis holds the emergency without replaying
 PATCH or restart. Once a host-contained miner at the minimum reports complete
-recovery telemetry, it enters cooldown without another hardware request.
+recovery telemetry, it enters cooldown without another hardware request. The
+same mutation-free exit applies after a firmware episode only when the live
+pair and durable current point already agree on that exact minimum and the
+firmware marker is clear. A neutral or incomplete poll cannot replace an
+unchanged pending safety authority; only newly validated unsafe evidence can
+supersede it.
 
 ## Hardware mutations and startup
 

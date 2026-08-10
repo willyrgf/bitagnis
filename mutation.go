@@ -861,7 +861,15 @@ func (coordinator *mutationCoordinator) canStartLocked(
 		return false
 	}
 	if validateKindSafety(observation.info, observation.settings, observation.state, minimum) != nil {
-		return false
+		if kind != lib.MutationSafetyRollback && kind != lib.MutationOverheatRecovery {
+			return false
+		}
+		return coordinator.preflightNeedsSafetySupersession(
+			mutationRequest{kind: kind, settings: observation.settings},
+			observation.state,
+			observation.info,
+			observation.asic,
+		)
 	}
 	return true
 }
@@ -1466,6 +1474,11 @@ func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
 			if storedAttempt.ID == 0 {
 				return processed, fmt.Errorf("mutation result references missing attempt %d", result.attemptID)
 			}
+			if storedAttempt.FailureStage == lib.MutationFailureSafetySuperseded {
+				// Safety arbitration already consumed this worker's authority. Its late result is the
+				// same terminal fact, not a second mutation failure and not an operator-facing error.
+				continue
+			}
 			if result.err != nil {
 				if result.failureStage != "" && !result.stateReconciled {
 					if terminalErr := coordinator.handleTerminalMutationFailureLocked(result, storedAttempt); terminalErr != nil {
@@ -1528,12 +1541,6 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 			State: state, AttemptID: result.attemptID, Stage: result.failureStage,
 		}, coordinator.now())
 		return err
-	}
-	if attempt.FailureStage == lib.MutationFailureSafetySuperseded {
-		// Safety arbitration already replaced the normal state and finalized
-		// any entered candidate in one store transaction. A late worker result
-		// must not overwrite that stronger durable outcome.
-		return nil
 	}
 	state, err := coordinator.states.LoadMiner(result.macAddr)
 	if err != nil {
@@ -1798,9 +1805,8 @@ func validateKindSafety(
 		}
 	case lib.MutationSafetyRollback:
 		if state.PendingPoint() == operatingPointFromInfo(info) &&
-			state.SafetyReason != lib.SafetyReasonFirmwareTrip &&
-			state.SafetyReason != lib.SafetyReasonMutationUncertain {
-			return fmt.Errorf("safety target is already the configured live pair")
+			(state.CurrentPoint() == operatingPointFromInfo(info) || !safeToRecover(info, settings)) {
+			return fmt.Errorf("safety rollback target is already the configured live pair")
 		}
 		switch state.Phase {
 		case lib.PhaseCooldown:
@@ -1830,11 +1836,18 @@ func validateKindSafety(
 		if state.Phase != lib.PhaseOverheat {
 			return fmt.Errorf("overheat recovery has no durable emergency episode")
 		}
+		if state.SafetyReason != lib.SafetyReasonFirmwareOverheat {
+			return fmt.Errorf("overheat recovery has no verified firmware-overheat cause")
+		}
 		if state.PendingPoint() != minimum {
 			return fmt.Errorf("overheat recovery target is not the exact advertised minimum")
 		}
 		if !safeToRecover(info, settings) {
 			return fmt.Errorf("device is not cool enough for overheat recovery")
+		}
+		if info.OverHeatMode == 0 && info.Frequency != 50 &&
+			operatingPointFromInfo(info) == minimum && state.CurrentPoint() == minimum {
+			return fmt.Errorf("overheat recovery is already complete at the advertised minimum")
 		}
 	default:
 		return fmt.Errorf("unsupported mutation kind %q", kind)
@@ -1899,11 +1912,18 @@ func (coordinator *mutationCoordinator) preflightNeedsSafetySupersession(
 		return true
 	}
 	assessment := assessInstantaneousSafety(info, request.settings, operatingPointFromInfo(info), minimum)
+	redundantOverheatRecovery := request.kind == lib.MutationOverheatRecovery &&
+		assessment.action == safetyNormal &&
+		info.OverHeatMode == 0 && info.Frequency != 50 &&
+		operatingPointFromInfo(info) == minimum && state.CurrentPoint() == minimum
+	redundantSafetyRollback := request.kind == lib.MutationSafetyRollback &&
+		assessment.action == safetyNormal && state.PendingPoint() == operatingPointFromInfo(info)
 	return assessment.action == safetyRollback ||
 		assessment.action == safetyHostContainment ||
 		assessment.action == safetyFirmwareRecovery ||
 		assessment.action == safetyEmergencyHold ||
-		(request.kind == lib.MutationSafetyRollback && state.PendingPoint() == operatingPointFromInfo(info))
+		redundantSafetyRollback ||
+		redundantOverheatRecovery
 }
 
 func (coordinator *mutationCoordinator) supersedeReadback(
@@ -1927,7 +1947,7 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.Phase = lib.PhaseOverheat
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.SafetyReason = lib.SafetyReasonMutationUncertain
+		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
 		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
 		state.RecoveryHealthyCount = 0
 		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
@@ -1940,7 +1960,7 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.Phase = lib.PhaseOverheat
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
-		state.SafetyReason = lib.SafetyReasonMutationUncertain
+		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
 		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
 		state.RecoveryHealthyCount = 0
 		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
@@ -1968,21 +1988,21 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		}
 		state.ClearPendingMutation()
 		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.SafetyReason = reasonForSafetyFailure(assessment.failure)
+		state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(assessment.failure))
 		state.Phase = lib.PhaseCooldown
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
 		state.RecoveryHealthyCount = 0
 		if target == operatingPointFromInfo(observed) {
 			state.Phase = lib.PhaseOverheat
-			state.SafetyReason = lib.SafetyReasonMutationUncertain
+			state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
 		} else {
 			state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 		}
 		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
 		return err
 	}
-	if _, err := transitionEmergencyState(&state, observed, asic, settings, now, assessment, false); err != nil {
+	if _, err := transitionEmergencyState(&state, observed, asic, settings, now, assessment); err != nil {
 		return err
 	}
 	_, err = coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
