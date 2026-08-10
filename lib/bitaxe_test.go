@@ -99,8 +99,8 @@ func TestOperatingPointPatchesAreCompleteAndDistinct(t *testing.T) {
 	if err := client.PatchOperatingPoint(context.Background(), point, "bitaxe.test"); err != nil {
 		t.Fatalf("PatchOperatingPoint returned an error: %v", err)
 	}
-	if err := client.PatchOverheatRecovery(context.Background(), point, "bitaxe.test"); err != nil {
-		t.Fatalf("PatchOverheatRecovery returned an error: %v", err)
+	if err := client.PatchFirmwareRecovery(context.Background(), point, "bitaxe.test"); err != nil {
+		t.Fatalf("PatchFirmwareRecovery returned an error: %v", err)
 	}
 	if len(patches) != 2 ||
 		len(patches[0]) != 2 ||

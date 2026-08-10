@@ -160,33 +160,44 @@ These invariants are high risk if violated:
   manual points may be observed, but must never become automated request targets.
 - Check instantaneous safety on every metrics poll, including ramp-up and pending-point
   confirmation. Safety is not deferred until an evaluation window completes.
-- Emergency and AxeOS overheat recovery take priority over normal rollback, pending trial
+- Emergency and AxeOS firmware recovery take priority over normal rollback, pending trial
   reconciliation, and upward exploration.
-- `PhaseOverheat` is the canonical durable emergency episode and fleet safety block. Only a typed
+- `PhaseEmergency` is the canonical durable emergency episode and fleet safety block. Only a typed
   pending mutation kind authorizes hardware; optimizer phase and live telemetry never do.
 - Never learn or persist AxeOS v2.8.1 emergency configured state `50 MHz / 1000 mV` as a normal
   operating point.
 - Host cutoff containment immediately applies the exact minimum advertised complete pair without
-  clearing the firmware flag, then retains `PhaseOverheat` until recovery telemetry is safe.
-- AxeOS-overheat recovery waits until telemetry is safe, applies the exact minimum advertised
-  complete pair, clears the firmware overheat flag with that pair, resets samples, and enters
-  cooldown.
+  clearing the firmware flag, then retains `PhaseEmergency` until recovery telemetry is safe.
+- While AxeOS `overheat_mode` or its powered-down sentinel is active, firmware owns cooling and its
+  paired 100 MHz / 100 mV reduction; do not race that loop with PATCH or restart. Once the flag
+  clears, two stable safe observations adopt an advertised reduced pair without hardware work and
+  enter cooldown. An off-grid reduced pair is normalized only after recovery telemetry is safe, to
+  the closest advertised complete pair no greater in either component; use the exact minimum only
+  when no dominated advertised pair exists. That normalization uses the full restart-verified
+  `firmware_recovery` lifecycle and never becomes a normal manual point.
 - Unsafe telemetry at the exact minimum with no firmware flag creates a mutation-free durable
   emergency hold; never replay PATCH or restart for the same pair.
-- Normal safety rollback chooses a validated point with thermal, VR-temperature, and power
-  headroom; if no validated point qualifies, use the minimum advertised pair.
+- Normal safety rollback chooses the closest validated point with thermal, VR-temperature, and
+  power headroom, preferring a point that lowers both components; if no validated point qualifies,
+  use the minimum advertised pair. Never authorize an unvalidated adjacent point for safety.
 - Persist a pending operating-point request before touching the device. Do not evaluate it until
   the same MAC returns after proven reboot and exact complete-pair readback.
 - Persist one mutation-attempt record before hardware work, record PATCH and restart milestones
   before their requests, atomically complete the attempt with durable state reconciliation, and
   close mining resumption only after two consecutive safe positive-hash polls.
+- An incomplete, malformed, disappeared, wrong-identity, or safe mismatched mutation readback is
+  retryable evidence, not emergency authority. A worker deadline only bounds that worker; it leaves
+  the typed attempt unfinished for a later reconciliation pass and never replays an already-recorded
+  PATCH or restart. Only constructed unsafe telemetry may supersede immediately. Two consecutive
+  complete safe post-boot reads exactly 100 MHz / 100 mV below an unfinished requested point are
+  typed AxeOS-reduction evidence; arbitrary stable safe mismatches use the manual-adoption path.
 - A manual operating-point change requires two consecutive observations before adoption. Adoption
   starts a fresh baseline ramp and telemetry window.
 - Telemetry samples remain in memory. Durable state contains optimizer control state, the
   evidence-epoch ledger's settled-sample and window counters, evaluated summaries, and
   credential-free mutation lifecycle timestamps — not raw polling history. A closed epoch's first
   admitted window is the one durable exception: it is a stored aggregate, never raw samples.
-- Preserve evaluated-point history across overheat recovery and ordinary process restarts unless a
+- Preserve evaluated-point history across firmware recovery and ordinary process restarts unless a
   deliberate schema or policy change says otherwise.
 - `COOLDOWN` exits on a durable count of consecutive polls proving the device is actually safe to
   recover (`recoveryHealthyPolls`, a physical dwell derived from AxeOS's own autonomous overheat
@@ -198,7 +209,7 @@ These invariants are high risk if violated:
   settlement, and safety-recovery shape; enforce that invariant both as an `Apply` postcondition and
   on reopen. A validated `safety_validation` epoch atomically opens a fresh two-window baseline for
   the same pass; it never creates a safety-derived `HOLD`, deletes point history, or retries a
-  consumed candidate. Schema version 9 rejects version 8 and earlier unchanged; do not repair or
+  consumed candidate. Schema version 10 rejects version 9 and earlier unchanged; do not repair or
   reinterpret prior semantic contracts. The wall-clock cooldown timer this replaced (and the
   durable field it wrote) was removed as part of the schema-version-7 cutover; do not reintroduce a
   duration-based gate here — prefer a monotone, restart-surviving count, as below. A second,
@@ -206,15 +217,15 @@ These invariants are high risk if violated:
   carry a prior episode's partial progress into the new one — every site that begins a fresh or
   escalating emergency episode (`transitionEmergencyState`'s new-episode branch and its callers'
   equivalents) resets `RecoveryHealthyCount` for exactly this reason.
-- Repeated overheats extending cooldown (an `OverheatCount`-derived exploration-restriction ladder
+- Repeated emergencies extending cooldown (an `EmergencyCount`-derived exploration-restriction ladder
   after repeated episodes) is a distinct, separately-tracked, **not-yet-implemented** invariant from
-  the `COOLDOWN` exit predicate above — do not conflate the two. `OverheatCount` itself is durable
+  the `COOLDOWN` exit predicate above — do not conflate the two. `EmergencyCount` itself is durable
   and increments correctly, but no restriction currently reads it, and the RFC's stated derivation
   (an "episode anchor" read from `MinerState.PhaseStartedAt`) does not hold: `PhaseStartedAt` is
   overwritten by ordinary transitions (`ResetPass`, `CompleteBaseline`, `FinalizeTrial`,
   `ResumePassAfterSafety`, `AdoptManualPoint`, mutation completion) that can occur between an
-  overheat episode and a later exploration pass, so it cannot serve as a stable anchor for "how
-  recently did this miner overheat."
+  emergency episode and a later exploration pass, so it cannot serve as a stable anchor for "how
+  recently did this miner enter emergency control."
   This is a known, reported gap requiring a design decision (e.g., deriving the anchor from
   `mutation_attempts` history instead), not license to guess at a replacement unilaterally.
 - Time may be an input to a predicate; time must never be the authority for a transition. A durable
@@ -227,6 +238,10 @@ These invariants are high risk if violated:
   twelve consecutive misses. It must never suppress instantaneous safety assessment over whatever
   telemetry did validate: a device reporting an unsafe reading alongside a malformed ASIC grid is a
   thermal emergency, not a read failure, and that assessment runs at every value of that count.
+- A real emergency or typed safety intent blocks normal hardware mutations fleet-wide, but it does
+  not erase healthy evidence on other miners. A baseline may durably close its first of two windows
+  behind the gate and pauses before the second window can create frontier authority; a trial pauses
+  immediately because its first window may authorize an early return mutation.
 - A blocked `HOLD` splits by cause: `starved` (the environment never delivered a usable evaluation
   window) exits automatically once it proves it can, with no timer and no operator step; `rejected`
   (the controller measured the point and it failed) stays terminal until an explicit retune. Do not

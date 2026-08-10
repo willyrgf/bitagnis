@@ -61,14 +61,16 @@ The default policy:
 - rolls back above 66°C, at 24 W, or at 97°C VR temperature;
 - treats 70°C as a host emergency and immediately contains a still-running
   miner at the exact minimum advertised pair; and
-- treats AxeOS `overheat_mode` as a firmware emergency that must cool before
-  the flag is cleared with that same minimum pair.
+- treats AxeOS `overheat_mode` as a firmware-owned emergency: Bitagnis waits
+  for AxeOS to cool, restart mining at its paired 100 MHz / 100 mV reduction,
+  and clear the flag before reconciling the reduced complete pair.
 
-Normal rollback selects the validated point with the highest actual hash,
-complete ASIC/VR/power headroom evidence, and no frequency or voltage increase
-relative to the failed live pair. If no such record exists, it uses the exact
-minimum advertised pair. A rollback can run while the failed point remains
-above an ordinary hard limit; ordinary point and mining changes cannot.
+Normal rollback selects the closest validated point with complete
+ASIC/VR/power headroom evidence and no frequency or voltage increase relative
+to the failed live pair. It prefers a point that lowers both components; it
+never guesses an unvalidated adjacent pair. If no such record exists, it uses
+the exact minimum advertised pair. A rollback can run while the failed point
+remains above an ordinary hard limit; ordinary point and mining changes cannot.
 
 AxeOS v2.8.1 trips strictly above 75°C ASIC temperature or 105°C VR
 temperature and stores the unadvertised emergency state `50 MHz / 1000 mV`.
@@ -79,13 +81,18 @@ On 600-series boards AxeOS powers the ASIC down during this episode, so ASIC
 temperature is unavailable while firmware performs its own VR-temperature and
 minimum-cooling-cycle loop. Bitagnis treats that readback as a non-event: it
 does not PATCH, restart, clear a typed safety intent, or downgrade a previously
-verified firmware-overheat cause. Once complete safe telemetry returns,
-Bitagnis normalizes any firmware-changed point through one restart-verified
-`overheat_recovery` to the exact advertised minimum.
+verified firmware-overheat cause. Once the flag clears, two stable safe reads
+adopt an already-advertised reduced pair without another hardware request and
+enter `COOLDOWN`. If AxeOS reduced to an off-grid pair, Bitagnis waits for
+recovery telemetry, chooses the closest advertised complete pair no greater in
+either component (falling back to the exact minimum only when none exists),
+and applies it through one restart-verified `firmware_recovery`. The recovered
+point then passes the normal dwell and safety-validation window before a fresh
+baseline resumes upward exploration.
 
 **`COOLDOWN` exits on a durable count of consecutive healthy polls, not a
 timer.** Its previous exit — a wall-clock timer that grew with repeated
-overheat count, capped at 24 hours — raced accumulated evidence rather than
+emergency count, capped at 24 hours — raced accumulated evidence rather than
 authorizing a transition and has been removed along with the clock and
 `overheatCooldownMinutes` setting it depended on. Every poll while a miner is
 in `COOLDOWN` is checked against the same `safeToRecover` predicate firmware
@@ -113,21 +120,21 @@ and no unfinished safety resumption.
 A process restart or a lost poll tick costs at most the healthy-poll count
 in progress, never previously-earned recovery evidence.
 
-`OVERHEAT` is the one durable emergency episode and fleet safety block. A
-typed `safety_rollback` or `overheat_recovery` intent is the only authority for
+`EMERGENCY` is the one durable emergency episode and fleet safety block. A
+typed `safety_rollback` or `firmware_recovery` intent is the only authority for
 the corresponding PATCH. If the exact minimum is already active and remains
 unsafe without a firmware flag, Bitagnis holds the emergency without replaying
 PATCH or restart. Once a host-contained miner at the minimum reports complete
-recovery telemetry, it enters cooldown without another hardware request. The
-same mutation-free exit applies after a firmware episode only when the live
-pair and durable current point already agree on that exact minimum and the
-firmware marker is clear. A neutral or incomplete poll cannot replace an
+recovery telemetry, it enters cooldown without another hardware request. A
+safe verification-unknown episode likewise adopts two stable observations of
+an advertised live pair and rebaselines; it never manufactures minimum-pair
+containment from missing data. A neutral or incomplete poll cannot replace an
 unchanged pending safety authority; only newly validated unsafe evidence can
 supersede it.
 
 ## Hardware mutations and startup
 
-Every operating-point, rollback, overheat-recovery, and enabled mining-setting
+Every operating-point, rollback, firmware-recovery, and enabled mining-setting
 change uses one restart-verified lifecycle:
 
 ```text
@@ -145,6 +152,15 @@ readback never proves active configuration. Completion still requires restart,
 same-MAC rediscovery, a proven new boot, and exact configured NVS pair readback;
 AxeOS exposes no measured active-frequency field.
 
+Temporary disappearance, incomplete telemetry, a delayed/unsupported grid,
+wrong identity, or a safe pair mismatch never closes the durable attempt. The
+worker deadline bounds only one reconciliation worker; a later pass resumes at
+the recorded milestone without replaying PATCH or restart. Only proven unsafe
+telemetry may supersede immediately. Two consecutive complete safe post-boot
+reads exactly 100 MHz / 100 mV below the requested pair are classified as the
+specific AxeOS autonomous reduction described above; other stable safe
+mismatches use the manual-adoption path.
+
 Fleet polling begins immediately in safety-only mode. Emergency recovery and
 hard rollback outrank normal work and may run concurrently for different
 miners. Any selected miner with an emergency episode or typed safety intent,
@@ -153,6 +169,10 @@ normal fleet work without stopping polling. Enabled mining settings reconcile
 one miner at a time in MAC order, and optimization opens only after every
 selected miner has two consecutive safe, positive-hash startup polls. A mining
 failure blocks the next normal miner while safety polling continues.
+The closed write gate does not erase healthy evidence on other miners: a
+baseline may close and store its first of two windows, then pauses before the
+second window could admit a frontier mutation. Trials pause immediately
+because their first window can authorize an early return mutation.
 
 ## State
 
@@ -160,15 +180,15 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 9, with typed pending mutations, finite frontier
+The current schema is version 10, with typed pending mutations, finite frontier
 state, hourly accounting, a durable evidence-epoch ledger, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema version 8
+`overheat_pending` field, migration, or compatibility reader. Schema version 9
 and earlier, an old partial database, or an unknown application object is
 rejected without modification; move it aside or remove it to create the
-current baseline. Version 8 used terminal safety-hold semantics and did not
-require every active normal phase to carry its exact open evidence authority,
-so it is rejected whole rather than reinterpreted or repaired. Evaluated
+current baseline. Version 9 could turn a temporary post-boot readback gap into
+a durable thermal emergency and used the old emergency names, so it is
+rejected whole rather than reinterpreted or repaired. Evaluated
 history, pending mutation ages, emergency episode ages,
 mutation attempts, evidence epochs, and the bounded 384-hour hourly accounting
 history persist across ordinary restarts after that baseline is created.
@@ -191,7 +211,7 @@ identity, or incomplete telemetry — that escalates to a safety-unknown episode
 after twelve consecutive misses, and never on its own suppresses instantaneous
 safety assessment) and `recovery_healthy_count` (the `COOLDOWN` recovery
 predicate's durable dwell counter described above; nonzero only in `COOLDOWN`
-or `OVERHEAT`, reset to zero by any non-satisfying poll and on the poll that
+or `EMERGENCY`, reset to zero by any non-satisfying poll and on the poll that
 reaches the threshold).
 
 Hourly wall-clock coverage is stored as integer nanoseconds, so merged bucket bounds and
@@ -377,12 +397,15 @@ Optimizer states are:
   blocked on a rejected point that needs an operator retune;
 - `COOLDOWN`: monitoring without upward exploration until the consecutive-safe
   dwell and safety-validation window complete, then resuming `BASELINE`; and
-- `OVERHEAT`: containing or waiting for safe recovery.
+- `EMERGENCY`: the durable fleet safety block; its typed cause determines
+  whether AxeOS is cooling, host containment is required, or verification is
+  waiting for readable evidence.
 
 Durable ordinary work is shown as `PENDING`, typed hard-limit work as
-`ROLLBACK`, host containment as `OVERHEAT / contain <pair>`, firmware cooling
-as `OVERHEAT / wait cool`, and a minimum-pair hold as
-`OVERHEAT / min active / wait cool`. Target and episode ages come from durable
+`BACKOFF`, host or firmware-trip containment as `CONTAIN`, AxeOS-owned cooling
+as `AXEOS`, unreadable verification as `VERIFY`, and post-backoff observation
+as `RECOVERY`. The window column shows `minimum`, `normalize`, `firmware cool`,
+or `verify` for the matching obligation. Target and episode ages come from durable
 timestamps. These labels report obligations, not an unproven in-process PATCH
 stage. The hash column remains live AxeOS actual/expected telemetry, so values
 above 100% expected are possible. Only median actual hash from a completed
@@ -462,7 +485,7 @@ device remains inside its normal approved envelope.
 
 Require exactly the typed minimum-pair PATCH, one restart, same-MAC return,
 proven uptime discontinuity, exact configured pair readback, durable intent
-clear only after proof, retained `OVERHEAT` until recovery telemetry is safe,
+clear only after proof, retained `EMERGENCY` until recovery telemetry is safe,
 no same-pair restart at the minimum, and no change to a second miner. Canary
 authorization never permits a fleet rollout.
 

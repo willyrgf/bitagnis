@@ -16,7 +16,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-const optimizerSchemaVersion = 9
+const optimizerSchemaVersion = 10
 
 // LongTermRetentionHours bounds the credential-free hourly accounting history.
 const LongTermRetentionHours = 384
@@ -34,7 +34,7 @@ const (
 	PhaseVoltageTest   OptimizerPhase = "VOLT_TEST"
 	PhaseHold          OptimizerPhase = "HOLD"
 	PhaseCooldown      OptimizerPhase = "COOLDOWN"
-	PhaseOverheat      OptimizerPhase = "OVERHEAT"
+	PhaseEmergency     OptimizerPhase = "EMERGENCY"
 )
 
 // PointStatus is the closed set of terminal (and entry-in-progress) outcomes
@@ -111,13 +111,13 @@ const (
 type SafetyReason string
 
 const (
-	SafetyReasonASICLimit         SafetyReason = "asic_limit"
-	SafetyReasonHostCutoff        SafetyReason = "host_cutoff"
-	SafetyReasonFirmwareOverheat  SafetyReason = "firmware_overheat"
-	SafetyReasonFirmwareTrip      SafetyReason = "firmware_trip"
-	SafetyReasonPowerLimit        SafetyReason = "power_limit"
-	SafetyReasonVRLimit           SafetyReason = "vr_limit"
-	SafetyReasonMutationUncertain SafetyReason = "mutation_uncertain"
+	SafetyReasonASICLimit            SafetyReason = "asic_limit"
+	SafetyReasonHostCutoff           SafetyReason = "host_cutoff"
+	SafetyReasonFirmwareOverheat     SafetyReason = "firmware_overheat"
+	SafetyReasonFirmwareTrip         SafetyReason = "firmware_trip"
+	SafetyReasonPowerLimit           SafetyReason = "power_limit"
+	SafetyReasonVRLimit              SafetyReason = "vr_limit"
+	SafetyReasonTelemetryUnavailable SafetyReason = "telemetry_unavailable"
 )
 
 // MutationKind identifies the durable hardware mutation represented by a
@@ -127,7 +127,7 @@ type MutationKind string
 const (
 	MutationOperatingPoint      MutationKind = "operating_point"
 	MutationSafetyRollback      MutationKind = "safety_rollback"
-	MutationOverheatRecovery    MutationKind = "overheat_recovery"
+	MutationFirmwareRecovery    MutationKind = "firmware_recovery"
 	MutationMiningConfiguration MutationKind = "mining_configuration"
 )
 
@@ -161,11 +161,11 @@ type MinerState struct {
 	ObservedCoreVoltage int
 	ObservedCount       int
 
-	OverheatCount int
+	EmergencyCount int
 
 	// RecoveryHealthyCount and UnreadablePollCount are durable monotone counters replacing the
 	// deleted cooldown_until wall clock and the unreadable-poll escalation window respectively.
-	// RecoveryHealthyCount is nonzero only inside COOLDOWN/OVERHEAT (see recoveryHealthyPolls in
+	// RecoveryHealthyCount is nonzero only inside COOLDOWN/EMERGENCY (see recoveryHealthyPolls in
 	// optimizer.go); UnreadablePollCount resets to zero on escalation (see unreadablePollLimit).
 	RecoveryHealthyCount int
 	UnreadablePollCount  int
@@ -775,6 +775,7 @@ type AdoptExternalPoint struct {
 	State     MinerState
 	Point     OperatingPoint
 	AttemptID int64
+	Stage     MutationFailureStage
 }
 
 func (AdoptExternalPoint) isOptimizerTransition() {}
@@ -849,18 +850,6 @@ type FailMutationFinalizeTrial struct {
 }
 
 func (FailMutationFinalizeTrial) isOptimizerTransition() {}
-
-// QuarantineMutation atomically closes a post-request mutation whose device state is unavailable or
-// ambiguous. An operating-point candidate is made unobservable, any open evidence epoch closes
-// contradicted, all actuatable authority is cleared, and the miner enters the durable
-// mutation-uncertain emergency block without claiming containment.
-type QuarantineMutation struct {
-	State     MinerState
-	AttemptID int64
-	Stage     MutationFailureStage
-}
-
-func (QuarantineMutation) isOptimizerTransition() {}
 
 // SupersedeMutation closes a normal or mining mutation that safety arbitration replaced, finalizing
 // an entered candidate as unobservable when necessary, closing any open evidence epoch as
@@ -970,8 +959,6 @@ func (store *OptimizerStore) Apply(transition Transition, at time.Time) (Transit
 		result, err = applyFailMutation(tx, value, at)
 	case FailMutationFinalizeTrial:
 		result, err = applyFailMutationFinalizeTrial(tx, value, at)
-	case QuarantineMutation:
-		result, err = applyQuarantineMutation(tx, value, at)
 	case SupersedeMutation:
 		result, err = applySupersedeMutation(tx, value, at)
 	case CompleteMutation:
@@ -1302,7 +1289,7 @@ func hasUnfinishedSafetyResume(queryer interface {
 	var count int
 	err := queryer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM mutation_attempts
 		WHERE mac_addr = ? AND kind IN (?, ?) AND failed_at = 0 AND mining_resumed_at = 0`,
-		macAddr, MutationSafetyRollback, MutationOverheatRecovery).Scan(&count)
+		macAddr, MutationSafetyRollback, MutationFirmwareRecovery).Scan(&count)
 	return count != 0, err
 }
 
@@ -1524,8 +1511,8 @@ func applyBootstrap(tx *sql.Tx, value Bootstrap, at time.Time) (TransitionResult
 	point := pointFromInfo(info)
 	emergency := info.OverHeatMode != 0 || point.Frequency == 50
 	if emergency {
-		state.Phase = PhaseOverheat
-		state.OverheatCount = 1
+		state.Phase = PhaseEmergency
+		state.EmergencyCount = 1
 		state.SafetyReason = SafetyReasonFirmwareOverheat
 	} else if pairAdvertised && validCanonicalPoint(point) {
 		state.SetCurrentPoint(point)
@@ -1707,7 +1694,7 @@ func admitTrialTx(
 		return 0, fmt.Errorf("unfinished mutation attempt exists")
 	}
 	if durable.CurrentPoint() != incumbent || durable.FallbackPoint() != (OperatingPoint{}) ||
-		durable.PendingKind != "" || durable.Phase == PhaseOverheat ||
+		durable.PendingKind != "" || durable.Phase == PhaseEmergency ||
 		durable.Phase == PhaseCooldown || durable.HoldReason != "" {
 		return 0, fmt.Errorf("durable incumbent is not established")
 	}
@@ -2166,7 +2153,7 @@ func applyAdoptManualPoint(tx *sql.Tx, value AdoptManualPoint, at time.Time) (Tr
 	} else if count != 0 {
 		return TransitionResult{}, fmt.Errorf("adopt manual point: unfinished mutation attempt exists")
 	}
-	if durable.PendingKind != "" || durable.MiningPending || durable.Phase == PhaseOverheat ||
+	if durable.PendingKind != "" || durable.MiningPending || durable.Phase == PhaseEmergency ||
 		durable.Phase == PhaseCooldown || durable.SafetyReason != "" {
 		return TransitionResult{}, fmt.Errorf("adopt manual point: miner is not in a clean manual-adoption state")
 	}
@@ -2200,8 +2187,13 @@ func applyAdoptExternalPoint(tx *sql.Tx, value AdoptExternalPoint, at time.Time)
 	state := value.State
 	point := value.Point
 	attemptID := value.AttemptID
-	if !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 || at.IsZero() {
+	stage := value.Stage
+	if !validStoredPoint(point) || point.Frequency == 50 || attemptID <= 0 || at.IsZero() ||
+		(stage != MutationFailurePreflight && stage != MutationFailureRebootVerification) {
 		return TransitionResult{}, fmt.Errorf("adopt external point: invalid state, point, attempt, or timing")
+	}
+	if err := validateMinerState(state); err != nil {
+		return TransitionResult{}, fmt.Errorf("adopt external point: state: %w", err)
 	}
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
@@ -2215,7 +2207,7 @@ func applyAdoptExternalPoint(tx *sql.Tx, value AdoptExternalPoint, at time.Time)
 		return TransitionResult{}, fmt.Errorf("adopt external point: attempt is not an operating-point attempt for this miner")
 	}
 	if !attempt.FailedAt.IsZero() {
-		if attempt.FailureStage == MutationFailurePreflight && durable.Phase == PhaseHold && durable.HoldReason == HoldManual &&
+		if attempt.FailureStage == stage && durable.Phase == PhaseHold && durable.HoldReason == HoldManual &&
 			durable.CurrentPoint() == point {
 			return TransitionResult{State: durable}, nil
 		}
@@ -2225,6 +2217,7 @@ func applyAdoptExternalPoint(tx *sql.Tx, value AdoptExternalPoint, at time.Time)
 		durable.PendingKind != MutationOperatingPoint || durable.PendingPoint() != attempt.TargetPoint() {
 		return TransitionResult{}, fmt.Errorf("adopt external point: stale or changed durable intent")
 	}
+	durable.IP = state.IP
 	record, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("adopt external point: load target row: %w", err)
@@ -2256,7 +2249,7 @@ func applyAdoptExternalPoint(tx *sql.Tx, value AdoptExternalPoint, at time.Time)
 	durable.ObservedCoreVoltage = 0
 	durable.ObservedCount = 0
 	attempt.FailedAt = at
-	attempt.FailureStage = MutationFailurePreflight
+	attempt.FailureStage = stage
 	if err := validateMutationAttempt(attempt, true); err != nil {
 		return TransitionResult{}, fmt.Errorf("adopt external point: validate attempt: %w", err)
 	}
@@ -2551,7 +2544,7 @@ func (store *OptimizerStore) StartMutationAttempt(
 	if attempt.Kind == MutationOperatingPoint && durable.CurrentPoint() != attempt.FromPoint() {
 		return 0, fmt.Errorf("start mutation attempt: source operating point does not match durable state")
 	}
-	if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery {
+	if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationFirmwareRecovery {
 		if durable.SafetyReason == "" || durable.SafetyReason != attempt.Reason {
 			return 0, fmt.Errorf("start mutation attempt: safety reason does not match durable episode")
 		}
@@ -2956,8 +2949,8 @@ func applyFailMutation(tx *sql.Tx, value FailMutation, at time.Time) (Transition
 	}
 	// Only CurrentPoint and the accounting cursor are checked against the unchanged durable value.
 	// FailMutation's whole purpose is to persist the caller's post-failure authority — a cleared
-	// PendingKind/PendingPoint/FallbackPoint/MiningPending, exactly like QuarantineMutation's
-	// narrower pattern below. The real "is this genuinely the attempt's own pending authority"
+	// PendingKind/PendingPoint/FallbackPoint/MiningPending. The real "is this genuinely the
+	// attempt's own pending authority"
 	// invariant is enforced immediately below, against durable and attempt.Kind/TargetPoint, not
 	// against the caller's state; checking it again here against the caller's (already-cleared)
 	// state made every caller that clears pending authority before calling — the normal, intended
@@ -2995,68 +2988,6 @@ func applyFailMutation(tx *sql.Tx, value FailMutation, at time.Time) (Transition
 	}
 	if err := openNormalSuccessorIfMissing(tx, state, at); err != nil {
 		return TransitionResult{}, fmt.Errorf("fail mutation and save: open successor epoch: %w", err)
-	}
-	return TransitionResult{State: state}, nil
-}
-
-func applyQuarantineMutation(tx *sql.Tx, value QuarantineMutation, at time.Time) (TransitionResult, error) {
-	state := value.State
-	id := value.AttemptID
-	stage := value.Stage
-	if id <= 0 || stage == "" || at.IsZero() {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: invalid state or timing")
-	}
-	if err := validateMinerState(state); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: %w", err)
-	}
-	attempt, err := queryMutationAttempt(tx, id)
-	if err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: load attempt: %w", err)
-	}
-	durable, err := queryMiner(tx, state.MacAddr)
-	if err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: load miner: %w", err)
-	}
-	if attempt.MacAddr != durable.MacAddr || durable.CurrentPoint() != state.CurrentPoint() ||
-		durable.AccountedThroughAt != state.AccountedThroughAt {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: stale miner state")
-	}
-	if !attempt.FailedAt.IsZero() {
-		if attempt.FailureStage != stage || !attempt.FailedAt.Equal(at) {
-			return TransitionResult{}, fmt.Errorf("quarantine mutation: failure milestone conflicts with stored value")
-		}
-		return TransitionResult{State: durable}, nil
-	}
-	if attempt.Kind == MutationOperatingPoint {
-		candidate, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return TransitionResult{}, fmt.Errorf("quarantine mutation: load candidate: %w", err)
-		}
-		if err == nil && candidate.Status == PointEntered && candidate.EntryAttemptID == attempt.ID {
-			candidate = unobservablePoint(candidate, at)
-			if err := updateOperatingPoint(tx, candidate); err != nil {
-				return TransitionResult{}, fmt.Errorf("quarantine mutation: finalize candidate: %w", err)
-			}
-		}
-	}
-	if err := closeOpenEpochIfAny(tx, state.MacAddr, EpochContradicted, at); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: close open epoch: %w", err)
-	}
-	attempt.FailedAt = at
-	attempt.FailureStage = stage
-	if err := validateMutationAttempt(attempt, true); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: %w", err)
-	}
-	if err := saveMiner(tx, &state); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: save state: %w", err)
-	}
-	if _, err := tx.ExecContext(context.Background(), `UPDATE mutation_attempts
-		SET failed_at = ?, failure_stage = ? WHERE id = ? AND failed_at = 0`,
-		timeValue(attempt.FailedAt), attempt.FailureStage, id); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: close attempt: %w", err)
-	}
-	if err := openNormalSuccessorIfMissing(tx, state, at); err != nil {
-		return TransitionResult{}, fmt.Errorf("quarantine mutation: open successor epoch: %w", err)
 	}
 	return TransitionResult{State: state}, nil
 }
@@ -3215,7 +3146,7 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 	}
 	if err == nil {
 		closeAttempt := attempt.Kind == MutationOperatingPoint || attempt.Kind == MutationMiningConfiguration
-		if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery {
+		if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationFirmwareRecovery {
 			closeAttempt = state.PendingKind != attempt.Kind || state.PendingPoint() != attempt.TargetPoint() ||
 				state.SafetyReason != attempt.Reason || !state.PendingSince.Equal(attempt.IntentCreatedAt)
 		}
@@ -3353,7 +3284,7 @@ func deriveCompletedMutationState(
 		next.SetFallbackPoint(OperatingPoint{})
 	}
 	switch {
-	case attempt.Kind == MutationOverheatRecovery || attempt.Kind == MutationSafetyRollback:
+	case attempt.Kind == MutationFirmwareRecovery || attempt.Kind == MutationSafetyRollback:
 		next.Phase = PhaseCooldown
 		next.PhaseStartedAt = completedAt
 		next.HoldReason = ""
@@ -3378,7 +3309,7 @@ func deriveCompletedMutationState(
 func validateCompletedMutationShape(state MinerState, attempt MutationAttempt) error {
 	if state.PendingKind != "" ||
 		(state.MiningPending && attempt.Kind != MutationMiningConfiguration &&
-			attempt.Kind != MutationSafetyRollback && attempt.Kind != MutationOverheatRecovery) {
+			attempt.Kind != MutationSafetyRollback && attempt.Kind != MutationFirmwareRecovery) {
 		return fmt.Errorf("completed state retains pending authority")
 	}
 	if attempt.Kind == MutationMiningConfiguration {
@@ -3411,7 +3342,7 @@ func validateCompletedMutationShape(state MinerState, attempt MutationAttempt) e
 		default:
 			return fmt.Errorf("operating-point completion has invalid phase %q", state.Phase)
 		}
-	case MutationSafetyRollback, MutationOverheatRecovery:
+	case MutationSafetyRollback, MutationFirmwareRecovery:
 		if state.Phase != PhaseCooldown || state.HoldReason != "" || state.SafetyReason == "" {
 			return fmt.Errorf("safety completion has invalid cooldown state")
 		}
@@ -3996,7 +3927,7 @@ func saveMinerWithValidation(
 			fallback_core_voltage, pending_kind, pending_frequency,
 			pending_core_voltage, pending_since, mining_pending,
 			observed_frequency, observed_core_voltage, observed_count,
-			overheat_count, recovery_healthy_count, unreadable_poll_count,
+			emergency_count, recovery_healthy_count, unreadable_poll_count,
 			pass_started_at, pass_trigger, pass_reference_hash,
 			pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
 			safety_reason,
@@ -4027,7 +3958,7 @@ func saveMinerWithValidation(
 			observed_frequency = excluded.observed_frequency,
 			observed_core_voltage = excluded.observed_core_voltage,
 			observed_count = excluded.observed_count,
-			overheat_count = excluded.overheat_count,
+			emergency_count = excluded.emergency_count,
 			recovery_healthy_count = excluded.recovery_healthy_count,
 			unreadable_poll_count = excluded.unreadable_poll_count,
 			pass_started_at = excluded.pass_started_at,
@@ -4063,7 +3994,7 @@ func saveMinerWithValidation(
 		state.ObservedFrequency,
 		state.ObservedCoreVoltage,
 		state.ObservedCount,
-		state.OverheatCount,
+		state.EmergencyCount,
 		state.RecoveryHealthyCount,
 		state.UnreadablePollCount,
 		timeValue(state.PassStartedAt),
@@ -4094,7 +4025,7 @@ const minerSelect = `SELECT
 	fallback_core_voltage, pending_kind, pending_frequency,
 	pending_core_voltage, pending_since, mining_pending,
 		observed_frequency, observed_core_voltage, observed_count,
-		overheat_count, recovery_healthy_count, unreadable_poll_count,
+		emergency_count, recovery_healthy_count, unreadable_poll_count,
 		pass_started_at, pass_trigger, pass_reference_hash,
 		pass_reference_frequency, pass_reference_core_voltage, pass_reference_settled_at,
 		safety_reason,
@@ -4137,7 +4068,7 @@ func queryMiner(queryer interface {
 		&state.ObservedFrequency,
 		&state.ObservedCoreVoltage,
 		&state.ObservedCount,
-		&state.OverheatCount,
+		&state.EmergencyCount,
 		&state.RecoveryHealthyCount,
 		&state.UnreadablePollCount,
 		&passStartedAt,
@@ -4219,7 +4150,7 @@ var optimizerSchema = map[string][]schemaColumn{
 		{name: "observed_frequency", sqlType: "INTEGER", notNull: 1},
 		{name: "observed_core_voltage", sqlType: "INTEGER", notNull: 1},
 		{name: "observed_count", sqlType: "INTEGER", notNull: 1},
-		{name: "overheat_count", sqlType: "INTEGER", notNull: 1},
+		{name: "emergency_count", sqlType: "INTEGER", notNull: 1},
 		{name: "recovery_healthy_count", sqlType: "INTEGER", notNull: 1},
 		{name: "unreadable_poll_count", sqlType: "INTEGER", notNull: 1},
 		{name: "pass_started_at", sqlType: "INTEGER", notNull: 1},
@@ -4343,7 +4274,7 @@ CREATE TABLE optimizer_miners (
 	observed_frequency INTEGER NOT NULL,
 	observed_core_voltage INTEGER NOT NULL,
 	observed_count INTEGER NOT NULL,
-	overheat_count INTEGER NOT NULL,
+	emergency_count INTEGER NOT NULL,
 	recovery_healthy_count INTEGER NOT NULL,
 	unreadable_poll_count INTEGER NOT NULL,
 	pass_started_at INTEGER NOT NULL,
@@ -4430,7 +4361,7 @@ CREATE UNIQUE INDEX evidence_epochs_one_open
 	WHERE closed_at = 0;
 CREATE INDEX evidence_epochs_mac_opened
 	ON evidence_epochs (mac_addr, opened_at);
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 `
 
 func ensureOptimizerSchema(ctx context.Context, conn *sql.Conn) error {
@@ -4860,7 +4791,7 @@ func validateCrossTableState(
 	for _, attempt := range attempts {
 		if attempt.FailedAt.IsZero() && attempt.MiningResumedAt.IsZero() {
 			unfinishedByMac[attempt.MacAddr] = true
-			if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery {
+			if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationFirmwareRecovery {
 				unfinishedSafetyByMac[attempt.MacAddr] = true
 			}
 		}
@@ -4988,7 +4919,7 @@ func validateCrossTableState(
 		if passBaselineCount == 0 && len(minerRecords) > 0 {
 			return fmt.Errorf("miner %s has point history without exactly one pass baseline", macAddr)
 		}
-		if passBaselineCount == 0 && state.Phase != PhaseOverheat &&
+		if passBaselineCount == 0 && state.Phase != PhaseEmergency &&
 			!(state.Phase == PhaseHold && state.HoldReason == HoldRejected) {
 			return fmt.Errorf("miner %s has no pass baseline", macAddr)
 		}
@@ -5028,7 +4959,7 @@ func validateCrossTableState(
 					!state.PendingSince.Equal(attempt.IntentCreatedAt) {
 					return fmt.Errorf("unfinished mutation attempt %d has no durable operating-point authority", attempt.ID)
 				}
-				if (attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery) &&
+				if (attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationFirmwareRecovery) &&
 					state.SafetyReason != attempt.Reason {
 					return fmt.Errorf("unfinished safety attempt %d does not match the durable safety reason", attempt.ID)
 				}
@@ -5255,7 +5186,7 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 	case state.PendingKind != "" &&
 		state.PendingKind != MutationOperatingPoint &&
 		state.PendingKind != MutationSafetyRollback &&
-		state.PendingKind != MutationOverheatRecovery:
+		state.PendingKind != MutationFirmwareRecovery:
 		return fmt.Errorf("pending mutation kind %q is invalid", state.PendingKind)
 	case state.PendingKind != "" && !validStoredPoint(state.PendingPoint()):
 		return fmt.Errorf("pending operating point is invalid")
@@ -5267,19 +5198,19 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("mining and operating-point obligations overlap")
 	case state.PendingKind == MutationSafetyRollback &&
 		state.Phase != PhaseCooldown &&
-		state.Phase != PhaseOverheat:
-		return fmt.Errorf("safety rollback requires cooldown or overheat phase")
-	case state.PendingKind == MutationOverheatRecovery &&
-		state.Phase != PhaseOverheat:
-		return fmt.Errorf("overheat recovery requires overheat phase")
-	case state.PendingKind == MutationOverheatRecovery &&
+		state.Phase != PhaseEmergency:
+		return fmt.Errorf("safety rollback requires cooldown or emergency phase")
+	case state.PendingKind == MutationFirmwareRecovery &&
+		state.Phase != PhaseEmergency:
+		return fmt.Errorf("firmware recovery requires emergency phase")
+	case state.PendingKind == MutationFirmwareRecovery &&
 		state.SafetyReason != SafetyReasonFirmwareOverheat:
-		return fmt.Errorf("overheat recovery requires firmware-overheat cause")
-	case state.Phase == PhaseOverheat &&
+		return fmt.Errorf("firmware recovery requires firmware-overheat cause")
+	case state.Phase == PhaseEmergency &&
 		state.PendingKind != "" &&
 		state.PendingKind != MutationSafetyRollback &&
-		state.PendingKind != MutationOverheatRecovery:
-		return fmt.Errorf("overheat phase has invalid pending mutation kind %q", state.PendingKind)
+		state.PendingKind != MutationFirmwareRecovery:
+		return fmt.Errorf("emergency phase has invalid pending mutation kind %q", state.PendingKind)
 	case state.ObservedCount == 0 &&
 		(state.ObservedFrequency != 0 || state.ObservedCoreVoltage != 0):
 		return fmt.Errorf("observed operating point exists without confirmations")
@@ -5290,18 +5221,18 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("observed operating point is invalid")
 	case state.ObservedCount < 0:
 		return fmt.Errorf("observed count %d is invalid", state.ObservedCount)
-	case state.OverheatCount < 0:
-		return fmt.Errorf("overheat count %d is invalid", state.OverheatCount)
+	case state.EmergencyCount < 0:
+		return fmt.Errorf("emergency count %d is invalid", state.EmergencyCount)
 	// recovery_healthy_count is bounded by recoveryHealthyPolls, but that bound is settings-derived
 	// and this package has no settings at load time; the bound is enforced by construction in the
 	// control-flow that increments it (it always exits COOLDOWN and resets to zero at the limit, so
 	// a value at or above the limit can never be produced), not by this validator. Only
-	// non-negative, and only nonzero inside COOLDOWN/OVERHEAT, are structural facts this validator
+	// non-negative, and only nonzero inside COOLDOWN/EMERGENCY, are structural facts this validator
 	// can state.
 	case state.RecoveryHealthyCount < 0:
 		return fmt.Errorf("recovery healthy count %d is invalid", state.RecoveryHealthyCount)
-	case state.RecoveryHealthyCount != 0 && state.Phase != PhaseCooldown && state.Phase != PhaseOverheat:
-		return fmt.Errorf("recovery healthy count must be zero outside COOLDOWN/OVERHEAT")
+	case state.RecoveryHealthyCount != 0 && state.Phase != PhaseCooldown && state.Phase != PhaseEmergency:
+		return fmt.Errorf("recovery healthy count must be zero outside COOLDOWN/EMERGENCY")
 	// unreadable_poll_count is bounded by unreadablePollLimit, but that bound is settings-derived
 	// and this package has no settings at load time; the bound is enforced by construction in the
 	// control-flow that increments it (it always escalates and resets to zero at the limit, so a
@@ -5319,7 +5250,7 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 		return fmt.Errorf("pass reference hash %.2f is invalid", state.PassReferenceHash)
 	case !validSafetyReason(state.SafetyReason):
 		return fmt.Errorf("safety reason %q is invalid", state.SafetyReason)
-	case state.SafetyReason != "" && state.Phase != PhaseCooldown && state.Phase != PhaseOverheat:
+	case state.SafetyReason != "" && state.Phase != PhaseCooldown && state.Phase != PhaseEmergency:
 		return fmt.Errorf("safety reason exists outside a safety-owned phase")
 	case state.Phase == PhaseHold && !validHoldReason(state.HoldReason):
 		return fmt.Errorf("hold reason %q is invalid", state.HoldReason)
@@ -5632,7 +5563,7 @@ func validMutationKind(kind MutationKind) bool {
 	switch kind {
 	case MutationOperatingPoint,
 		MutationSafetyRollback,
-		MutationOverheatRecovery,
+		MutationFirmwareRecovery,
 		MutationMiningConfiguration:
 		return true
 	default:
@@ -5661,7 +5592,7 @@ func validOptimizerPhase(phase OptimizerPhase) bool {
 		PhaseVoltageTest,
 		PhaseHold,
 		PhaseCooldown,
-		PhaseOverheat:
+		PhaseEmergency:
 		return true
 	default:
 		return false
@@ -5709,7 +5640,7 @@ func validSafetyReason(reason SafetyReason) bool {
 		SafetyReasonFirmwareTrip,
 		SafetyReasonPowerLimit,
 		SafetyReasonVRLimit,
-		SafetyReasonMutationUncertain:
+		SafetyReasonTelemetryUnavailable:
 		return true
 	default:
 		return false
@@ -5720,7 +5651,7 @@ func validMutationReason(kind MutationKind, reason SafetyReason) bool {
 	switch kind {
 	case MutationOperatingPoint, MutationMiningConfiguration:
 		return reason == ""
-	case MutationSafetyRollback, MutationOverheatRecovery:
+	case MutationSafetyRollback, MutationFirmwareRecovery:
 		return validSafetyReason(reason) && reason != ""
 	default:
 		return false

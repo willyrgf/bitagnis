@@ -252,16 +252,16 @@ func (client *BitaxeClient) PatchOperatingPoint(
 	}, false)
 }
 
-// PatchOverheatRecovery sends one complete pair while clearing the firmware
+// PatchFirmwareRecovery sends one complete pair while clearing the firmware
 // overheat flag. The caller must validate first, then restart and prove exact
 // configured readback after a new boot.
-func (client *BitaxeClient) PatchOverheatRecovery(
+func (client *BitaxeClient) PatchFirmwareRecovery(
 	ctx context.Context,
 	point OperatingPoint,
 	target string,
 ) error {
 	if err := validateOperatingPoint(point); err != nil {
-		return fmt.Errorf("patch overheat recovery: %w", err)
+		return fmt.Errorf("patch firmware recovery: %w", err)
 	}
 
 	disabled := 0

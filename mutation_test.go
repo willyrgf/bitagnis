@@ -155,7 +155,7 @@ func TestCooldownRecoveryReleasesFleetNormalMutationBlock(t *testing.T) {
 	}
 }
 
-func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
+func TestWrongMACAfterPatchLeavesAttemptOpenWithoutRestart(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
@@ -177,7 +177,11 @@ func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 		}, nil, log.New(io.Discard, "", 0), nil,
 	)
 	coordinator.rediscoveryDelay = time.Millisecond
-	coordinator.now = func() time.Time { return now }
+	nowCalls := 0
+	coordinator.now = func() time.Time {
+		nowCalls++
+		return now.Add(time.Duration(nowCalls) * 30 * time.Second)
+	}
 	observation := &minerObservation{
 		miner: lib.DiscoveredMiner{IP: state.IP, Info: device.source},
 		info:  device.source, asic: device.asic, settings: settings, state: state,
@@ -186,7 +190,7 @@ func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := <-coordinator.results
-	if result.err == nil || result.failureStage == "" || !result.readbackUnavailable {
+	if result.err == nil || result.failureStage != "" {
 		t.Fatalf("wrong-MAC result = %+v", result)
 	}
 	coordinator.results <- result
@@ -197,12 +201,13 @@ func TestWrongMACAfterPatchIsQuarantinedWithoutActuation(t *testing.T) {
 		t.Fatalf("wrong-MAC response issued restart: %d", device.restartCount)
 	}
 	attempts, err := store.ListMutationAttempts(state.MacAddr)
-	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != lib.MutationFailureConfiguredVerification {
+	if err != nil || len(attempts) != 1 || !attempts[0].FailedAt.IsZero() || attempts[0].PatchRequestedAt.IsZero() {
 		t.Fatalf("wrong-MAC attempt = %+v, %v", attempts, err)
 	}
 	loaded, err := store.LoadMiner(state.MacAddr)
-	if err != nil || loaded.Phase != lib.PhaseOverheat || loaded.SafetyReason != lib.SafetyReasonMutationUncertain {
-		t.Fatalf("wrong-MAC quarantine state = %+v, %v", loaded, err)
+	if err != nil || loaded.Phase == lib.PhaseEmergency || loaded.SafetyReason != "" ||
+		loaded.PendingKind != lib.MutationOperatingPoint || loaded.PendingPoint() != target {
+		t.Fatalf("wrong-MAC retry state = %+v, %v", loaded, err)
 	}
 }
 
@@ -244,8 +249,7 @@ func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 	result := mutationResult{
 		attemptID: attemptID, macAddr: state.MacAddr, hostname: state.Hostname,
 		kind: lib.MutationSafetyRollback, point: minimum,
-		failureStage:        lib.MutationFailureConfiguredVerification,
-		readbackUnavailable: true,
+		failureStage: lib.MutationFailureConfiguredVerification,
 	}
 	if err := coordinator.handleTerminalMutationFailureLocked(result, attempts[0]); err != nil {
 		t.Fatal(err)
@@ -269,11 +273,11 @@ func TestProductionOverheatLoopStateEntersCooldownWithoutMutation(t *testing.T) 
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
-	state.Phase = lib.PhaseOverheat
+	state.Phase = lib.PhaseEmergency
 	state.HoldReason = ""
 	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now.Add(-time.Hour)
-	state.SafetyReason = lib.SafetyReasonMutationUncertain
+	state.SafetyReason = lib.SafetyReasonTelemetryUnavailable
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now.Add(-time.Minute))
 	if result, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
@@ -304,15 +308,15 @@ func TestRedundantMinimumSafetyMutationIsSupersededBeforePatch(t *testing.T) {
 		kind   lib.MutationKind
 		reason lib.SafetyReason
 	}{
-		{name: "uncertain rollback", kind: lib.MutationSafetyRollback, reason: lib.SafetyReasonMutationUncertain},
-		{name: "completed firmware recovery", kind: lib.MutationOverheatRecovery, reason: lib.SafetyReasonFirmwareOverheat},
+		{name: "uncertain rollback", kind: lib.MutationSafetyRollback, reason: lib.SafetyReasonTelemetryUnavailable},
+		{name: "completed firmware recovery", kind: lib.MutationFirmwareRecovery, reason: lib.SafetyReasonFirmwareOverheat},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			store, settings, state, now := newRootMutationStore(t)
 			state = closeInitialBaselineEpoch(t, store, state, now)
 			state.SetCurrentPoint(minimum)
-			state.Phase = lib.PhaseOverheat
+			state.Phase = lib.PhaseEmergency
 			state.HoldReason = ""
 			state.SettledAt = time.Time{}
 			state.PhaseStartedAt = now
@@ -373,11 +377,11 @@ func TestRebootPollsPreserveSafetyAuthority(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
-	state.Phase = lib.PhaseOverheat
+	state.Phase = lib.PhaseEmergency
 	state.HoldReason = ""
 	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now
-	state.SafetyReason = lib.SafetyReasonMutationUncertain
+	state.SafetyReason = lib.SafetyReasonTelemetryUnavailable
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
 	if result, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
@@ -454,7 +458,7 @@ func TestRebootPollsPreserveSafetyAuthority(t *testing.T) {
 // here, since ClearPendingMutation had just changed those fields locally while durable storage still
 // held the original pending authority (the attempt never reached CompleteMutation, so nothing else
 // cleared it durably first). That check has been narrowed to CurrentPoint and the accounting cursor
-// only, matching QuarantineMutation's pattern; the real "is this genuinely the attempt's own pending
+// only; the real "is this genuinely the attempt's own pending
 // authority" invariant is enforced separately, against durable and attempt.Kind/TargetPoint. See
 // applyFailMutation's comment in lib/state.go for the full reasoning.
 func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T) {
@@ -487,8 +491,7 @@ func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T)
 	result := mutationResult{
 		attemptID: attemptID, macAddr: state.MacAddr, hostname: state.Hostname,
 		kind: lib.MutationOperatingPoint, point: target,
-		failureStage:        lib.MutationFailurePreflight,
-		readbackUnavailable: false,
+		failureStage: lib.MutationFailurePreflight,
 	}
 	if err := coordinator.handleTerminalMutationFailureLocked(result, attempts[0]); err != nil {
 		t.Fatal(err)
@@ -503,6 +506,48 @@ func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T)
 	closed, err := store.ListMutationAttempts(state.MacAddr)
 	if err != nil || len(closed) != 1 || closed[0].FailureStage != lib.MutationFailurePreflight {
 		t.Fatalf("closed operating-point attempt = %+v, %v", closed, err)
+	}
+}
+
+func TestIncompleteMiningWorkerLeavesAttemptRetryable(t *testing.T) {
+	store, _, state, now := newRootMutationStore(t)
+	state.MiningPending = true
+	if result, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
+		t.Fatal(err)
+	} else {
+		state = result.State
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: lib.MutationMiningConfiguration,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		IntentCreatedAt: now, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	attemptID, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := newMutationCoordinator(
+		nil, store, lib.SettingsFile{}, nil, nil, "", nil, nil,
+		log.New(io.Discard, "", 0), nil,
+	)
+	coordinator.active[state.MacAddr] = &activeMutation{
+		id: 1, attemptID: attemptID, kind: lib.MutationMiningConfiguration,
+		normal: true, cancel: func() {},
+	}
+	coordinator.normalActive = state.MacAddr
+	coordinator.results <- mutationResult{
+		id: 1, attemptID: attemptID, macAddr: state.MacAddr, hostname: state.Hostname,
+		kind: lib.MutationMiningConfiguration, err: context.DeadlineExceeded,
+	}
+	if processed, err := coordinator.applyResultsLocked(); err != nil || !processed {
+		t.Fatalf("apply incomplete result = processed:%t err:%v", processed, err)
+	}
+	if coordinator.startupBlocked != "" {
+		t.Fatalf("retryable mining worker blocked startup as %q", coordinator.startupBlocked)
+	}
+	stored, unfinished, err := store.UnfinishedMutationAttempt(state.MacAddr)
+	if err != nil || !unfinished || stored.ID != attemptID || stored.FailureStage != "" {
+		t.Fatalf("retryable attempt = %+v unfinished:%t err:%v", stored, unfinished, err)
 	}
 }
 
@@ -946,7 +991,7 @@ func TestFirmwareEvidenceWinsOverUnsupportedGrid(t *testing.T) {
 		t.Fatalf("unsupported-grid firmware handling = handled:%t err:%v", handled, err)
 	}
 	loaded, err := store.LoadMiner(state.MacAddr)
-	if err != nil || loaded.Phase != lib.PhaseOverheat || loaded.SafetyReason != lib.SafetyReasonFirmwareOverheat {
+	if err != nil || loaded.Phase != lib.PhaseEmergency || loaded.SafetyReason != lib.SafetyReasonFirmwareOverheat {
 		t.Fatalf("unsupported-grid firmware state = %+v, %v", loaded, err)
 	}
 }
@@ -955,18 +1000,18 @@ func TestUnreadableSafetySupersessionPreservesFirmwareCause(t *testing.T) {
 	store, settings, state, now := newRootMutationStore(t)
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
-	state.Phase = lib.PhaseOverheat
+	state.Phase = lib.PhaseEmergency
 	state.HoldReason = ""
 	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonFirmwareOverheat
-	state.SetPendingMutation(lib.MutationOverheatRecovery, minimum, now)
+	state.SetPendingMutation(lib.MutationFirmwareRecovery, minimum, now)
 	if result, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
 	} else {
 		state = result.State
 	}
 	attempt := lib.MutationAttempt{
-		MacAddr: state.MacAddr, Kind: lib.MutationOverheatRecovery, Reason: state.SafetyReason,
+		MacAddr: state.MacAddr, Kind: lib.MutationFirmwareRecovery, Reason: state.SafetyReason,
 		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
 		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
 		IntentCreatedAt: state.PendingSince, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
@@ -985,12 +1030,14 @@ func TestUnreadableSafetySupersessionPreservesFirmwareCause(t *testing.T) {
 		attemptID: id, macAddr: state.MacAddr, kind: attempt.Kind,
 		point: minimum, settings: settings, attempt: attempt,
 	}
-	if err := coordinator.supersedeReadback(request, rootTestInfo(minimum, 100), offGridASIC()); err != nil {
+	observed := rootTestInfo(minimum, 100)
+	observed.OverHeatMode = 1
+	if err := coordinator.supersedeReadback(request, observed, offGridASIC()); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadMiner(state.MacAddr)
 	if err != nil || loaded.SafetyReason != lib.SafetyReasonFirmwareOverheat ||
-		loaded.Phase != lib.PhaseOverheat || loaded.PendingKind != "" {
+		loaded.Phase != lib.PhaseEmergency || loaded.PendingKind != "" {
 		t.Fatalf("unreadable supersession downgraded firmware cause: %+v, %v", loaded, err)
 	}
 }
@@ -1020,7 +1067,7 @@ func TestUnsupportedGridWithUnsafeTelemetryEscalatesOnThatSamePoll(t *testing.T)
 			t.Fatalf("priorCount=%d: unsafe-telemetry handling = handled:%t err:%v", priorCount, handled, err)
 		}
 		loaded, err := store.LoadMiner(state.MacAddr)
-		if err != nil || loaded.Phase != lib.PhaseOverheat || loaded.SafetyReason != lib.SafetyReasonMutationUncertain {
+		if err != nil || loaded.Phase != lib.PhaseEmergency || loaded.SafetyReason != lib.SafetyReasonASICLimit {
 			t.Fatalf("priorCount=%d: unsafe-telemetry state = %+v, %v", priorCount, loaded, err)
 		}
 		if loaded.UnreadablePollCount != 0 {
@@ -1072,7 +1119,7 @@ func TestUnreadablePollLimitEscalatesAfterTwelveConsecutivePolls(t *testing.T) {
 		}
 	}
 	loaded, err := store.LoadMiner(state.MacAddr)
-	if err != nil || loaded.UnreadablePollCount != limit-1 || loaded.Phase == lib.PhaseOverheat {
+	if err != nil || loaded.UnreadablePollCount != limit-1 || loaded.Phase == lib.PhaseEmergency {
 		t.Fatalf("after %d unreadable polls: state = %+v, %v", limit-1, loaded, err)
 	}
 	handled, err := controller.enforceMinerSafety(context.Background(), &state, info, offGridASIC(), settings, now.Add(time.Duration(limit)*settings.MetricsTime))
@@ -1080,7 +1127,7 @@ func TestUnreadablePollLimitEscalatesAfterTwelveConsecutivePolls(t *testing.T) {
 		t.Fatalf("escalating poll: handling = handled:%t err:%v", handled, err)
 	}
 	loaded, err = store.LoadMiner(state.MacAddr)
-	if err != nil || loaded.Phase != lib.PhaseOverheat || loaded.SafetyReason != lib.SafetyReasonMutationUncertain || loaded.UnreadablePollCount != 0 {
+	if err != nil || loaded.Phase != lib.PhaseEmergency || loaded.SafetyReason != lib.SafetyReasonTelemetryUnavailable || loaded.UnreadablePollCount != 0 {
 		t.Fatalf("twelfth unreadable poll did not escalate: %+v, %v", loaded, err)
 	}
 }

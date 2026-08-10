@@ -107,17 +107,34 @@ type mutationRequest struct {
 }
 
 type mutationResult struct {
-	id                  uint64
-	attemptID           int64
-	macAddr             string
-	hostname            string
-	kind                lib.MutationKind
-	point               lib.OperatingPoint
-	miner               lib.DiscoveredMiner
-	err                 error
-	failureStage        lib.MutationFailureStage
-	readbackUnavailable bool
-	stateReconciled     bool
+	id              uint64
+	attemptID       int64
+	macAddr         string
+	hostname        string
+	kind            lib.MutationKind
+	point           lib.OperatingPoint
+	miner           lib.DiscoveredMiner
+	err             error
+	failureStage    lib.MutationFailureStage
+	stateReconciled bool
+}
+
+type rebootReadbackDisposition uint8
+
+const (
+	rebootReadbackVerified rebootReadbackDisposition = iota + 1
+	rebootReadbackUnsafe
+	rebootReadbackFirmwareReduction
+	rebootReadbackExternalPoint
+)
+
+// rebootReadback is the closed result of post-boot verification. An ordinary
+// error means that verification remains incomplete and the durable attempt
+// must stay open; only one of these dispositions may consume its authority.
+type rebootReadback struct {
+	miner       lib.DiscoveredMiner
+	asic        lib.ASICSettings
+	disposition rebootReadbackDisposition
 }
 
 type mutationResumeHealth struct {
@@ -283,9 +300,9 @@ func (coordinator *mutationCoordinator) Advance(
 				continue
 			}
 		}
-		if state.Phase == lib.PhaseOverheat || state.Phase == lib.PhaseCooldown ||
+		if state.Phase == lib.PhaseEmergency || state.Phase == lib.PhaseCooldown ||
 			state.PendingKind == lib.MutationSafetyRollback ||
-			state.PendingKind == lib.MutationOverheatRecovery {
+			state.PendingKind == lib.MutationFirmwareRecovery {
 			safetyBlocked = true
 		}
 		if observations[macAddr] == nil &&
@@ -299,7 +316,7 @@ func (coordinator *mutationCoordinator) Advance(
 		}
 	}
 	for _, kind := range []lib.MutationKind{
-		lib.MutationOverheatRecovery,
+		lib.MutationFirmwareRecovery,
 		lib.MutationSafetyRollback,
 	} {
 		for _, macAddr := range sortedObservationMACs(observations) {
@@ -614,7 +631,7 @@ func (coordinator *mutationCoordinator) handleMutationResumeFailureLocked(
 			}
 		}
 	}
-	if attempt.Kind == lib.MutationSafetyRollback || attempt.Kind == lib.MutationOverheatRecovery {
+	if attempt.Kind == lib.MutationSafetyRollback || attempt.Kind == lib.MutationFirmwareRecovery {
 		state.ClearPendingMutation()
 		state.SetFallbackPoint(lib.OperatingPoint{})
 		state.Phase = lib.PhaseCooldown
@@ -722,7 +739,7 @@ func (coordinator *mutationCoordinator) advanceStartupLocked(
 	}
 
 	// Ramp completion is now a settled-sample count against the miner's open evidence epoch rather
-	// than a wall-clock deadline. A miner with no open epoch (e.g. HOLD/OVERHEAT at startup) has
+	// than a wall-clock deadline. A miner with no open epoch (e.g. HOLD/EMERGENCY at startup) has
 	// nothing to ramp toward, so it is not held back here.
 	rampIncomplete := false
 	if epoch, open, err := coordinator.states.OpenEvidenceEpochFor(macAddr); err != nil {
@@ -851,7 +868,7 @@ func (coordinator *mutationCoordinator) canStartLocked(
 		}
 	}
 	if kind == lib.MutationOperatingPoint || kind == lib.MutationMiningConfiguration ||
-		kind == lib.MutationSafetyRollback || kind == lib.MutationOverheatRecovery {
+		kind == lib.MutationSafetyRollback || kind == lib.MutationFirmwareRecovery {
 		if canonicalASICGrid(observation.asic) != nil {
 			return false
 		}
@@ -860,13 +877,19 @@ func (coordinator *mutationCoordinator) canStartLocked(
 	if err != nil {
 		return false
 	}
-	if validateKindSafety(observation.info, observation.settings, observation.state, minimum) != nil {
-		if kind != lib.MutationSafetyRollback && kind != lib.MutationOverheatRecovery {
+	if validateKindSafety(observation.info, observation.settings, observation.state, observation.asic, minimum) != nil {
+		if kind != lib.MutationSafetyRollback && kind != lib.MutationFirmwareRecovery {
 			return false
 		}
+		request := mutationRequest{
+			macAddr: observation.state.MacAddr, kind: kind,
+			point: observation.state.PendingPoint(), settings: observation.settings,
+		}
+		if coordinator.safetyIntentAlreadySatisfied(request, observation.info, observation.asic) {
+			return true
+		}
 		return coordinator.preflightNeedsSafetySupersession(
-			mutationRequest{kind: kind, settings: observation.settings},
-			observation.state,
+			request,
 			observation.info,
 			observation.asic,
 		)
@@ -908,7 +931,7 @@ func (coordinator *mutationCoordinator) startLocked(
 	} else {
 		from := observation.info.Frequency
 		fromVoltage := observation.info.CoreVoltage
-		if kind == lib.MutationSafetyRollback || kind == lib.MutationOverheatRecovery {
+		if kind == lib.MutationSafetyRollback || kind == lib.MutationFirmwareRecovery {
 			from = observation.state.CurrentFrequency
 			fromVoltage = observation.state.CurrentCoreVoltage
 			if !validLivePoint(lib.OperatingPoint{Frequency: from, CoreVoltage: fromVoltage}) || from == 50 {
@@ -987,11 +1010,8 @@ func (coordinator *mutationCoordinator) startLocked(
 }
 
 func mutationReason(state lib.MinerState, kind lib.MutationKind) lib.SafetyReason {
-	if kind == lib.MutationSafetyRollback || kind == lib.MutationOverheatRecovery {
-		if state.SafetyReason != "" {
-			return state.SafetyReason
-		}
-		return lib.SafetyReasonMutationUncertain
+	if kind == lib.MutationSafetyRollback || kind == lib.MutationFirmwareRecovery {
+		return state.SafetyReason
 	}
 	return ""
 }
@@ -1026,21 +1046,18 @@ func (coordinator *mutationCoordinator) execute(
 	}
 
 	var asic lib.ASICSettings
-	// Once PATCH is durable, preflight is complete. The device may be
-	// unavailable while configured readback or the already-issued restart is
-	// reconciled, so each durable stage must own its absolute deadline.
+	// Once PATCH is durable, preflight is complete. Later workers resume the
+	// recorded milestone without replaying hardware; their deadlines bound
+	// execution only and never become durable state authority.
 	prePatchStage := request.attempt.PatchRequestedAt.IsZero()
-	if prePatchStage && (request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery) {
+	if prePatchStage && (request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationFirmwareRecovery) {
 		var err error
 		asic, err = coordinator.devices.GetASICSettings(ctx, request.ip)
 		if err != nil {
-			if coordinator.entryPreflightExpired(request) {
-				return terminal(lib.MutationFailurePreflight, fmt.Errorf("entry preflight deadline expired: %w", err))
-			}
 			return open(lib.MutationFailurePreflight, fmt.Errorf("read advertised operating points: %w", err))
 		}
 		if err := canonicalASICGrid(asic); err != nil {
-			return terminal(lib.MutationFailurePreflight, err)
+			return open(lib.MutationFailurePreflight, err)
 		}
 		if !operatingPointAdvertised(asic, request.point) {
 			return terminal(lib.MutationFailurePreflight, fmt.Errorf("pending operating point is not advertised by the supported ASIC"))
@@ -1049,13 +1066,10 @@ func (coordinator *mutationCoordinator) execute(
 	if prePatchStage {
 		preflight, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
 		if err != nil {
-			if coordinator.entryPreflightExpired(request) {
-				return terminal(lib.MutationFailurePreflight, fmt.Errorf("entry preflight deadline expired: %w", err))
-			}
 			return open(lib.MutationFailurePreflight, fmt.Errorf("pre-PATCH information read failed: %w", err))
 		}
 		if err := validateMutationIdentity(preflight, request.macAddr); err != nil {
-			return terminal(lib.MutationFailurePreflight, err)
+			return open(lib.MutationFailurePreflight, err)
 		}
 		current, err := coordinator.states.LoadMiner(request.macAddr)
 		if err != nil {
@@ -1068,10 +1082,23 @@ func (coordinator *mutationCoordinator) execute(
 			return terminal(lib.MutationFailurePreflight, fmt.Errorf("readable mining settings changed before PATCH"))
 		}
 		if err := coordinator.validateMutationPreflight(preflight, request.settings, current, asic); err != nil {
-			if coordinator.preflightNeedsSafetySupersession(request, current, preflight, asic) {
+			if coordinator.safetyIntentAlreadySatisfied(request, preflight, asic) {
+				if reconcileErr := coordinator.reconcileSatisfiedSafetyIntent(request, current, preflight); reconcileErr != nil {
+					return open(lib.MutationFailurePreflight, fmt.Errorf("reconcile satisfied safety intent: %w", reconcileErr))
+				}
+				result.stateReconciled = true
+				result.miner = lib.DiscoveredMiner{IP: request.ip, Info: preflight}
+				return terminal(lib.MutationFailurePreflight, fmt.Errorf("safety intent was already satisfied without hardware mutation"))
+			}
+			if coordinator.preflightNeedsSafetySupersession(request, preflight, asic) {
 				if safetyErr := coordinator.supersedeReadback(request, preflight, asic); safetyErr != nil {
 					return open(lib.MutationFailurePreflight, fmt.Errorf("persist preflight safety supersession: %w", safetyErr))
 				}
+			}
+			if !completeSafetyTelemetry(preflight) || !supportedSafetyIdentity(preflight) ||
+				((request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationFirmwareRecovery) &&
+					!safeToRecover(preflight, request.settings)) {
+				return open(lib.MutationFailurePreflight, err)
 			}
 			return terminal(lib.MutationFailurePreflight, err)
 		}
@@ -1093,6 +1120,7 @@ func (coordinator *mutationCoordinator) execute(
 				}
 				if _, err := coordinator.states.Apply(lib.AdoptExternalPoint{
 					State: current, Point: operatingPointFromInfo(preflight), AttemptID: request.attemptID,
+					Stage: lib.MutationFailurePreflight,
 				}, coordinator.now()); err != nil {
 					return open(lib.MutationFailurePreflight, fmt.Errorf("adopt external operating point: %w", err))
 				}
@@ -1115,8 +1143,8 @@ func (coordinator *mutationCoordinator) execute(
 		switch request.kind {
 		case lib.MutationOperatingPoint, lib.MutationSafetyRollback:
 			patchErr = coordinator.devices.PatchOperatingPoint(ctx, request.point, request.ip)
-		case lib.MutationOverheatRecovery:
-			patchErr = coordinator.devices.PatchOverheatRecovery(ctx, request.point, request.ip)
+		case lib.MutationFirmwareRecovery:
+			patchErr = coordinator.devices.PatchFirmwareRecovery(ctx, request.point, request.ip)
 		case lib.MutationMiningConfiguration:
 			patchErr = coordinator.devices.PatchMiningConfiguration(ctx, request.settings.Mining, request.primaryPassword, request.fallbackPassword, request.ip)
 		default:
@@ -1128,10 +1156,9 @@ func (coordinator *mutationCoordinator) execute(
 	}
 
 	if request.attempt.ConfiguredVerifiedAt.IsZero() {
-		configured, terminalReadback, err := coordinator.waitForConfiguredReadback(ctx, request, request.attempt.PatchRequestedAt)
+		configured, unsafeReadback, err := coordinator.waitForConfiguredReadback(ctx, request)
 		if err != nil {
-			if terminalReadback {
-				result.readbackUnavailable = configured.MacAddr == "" || configured.MacAddr != request.macAddr
+			if unsafeReadback {
 				if coordinator.readbackNeedsSafetySupersession(request, configured, asic) {
 					if safetyErr := coordinator.supersedeReadback(request, configured, asic); safetyErr != nil {
 						return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist configured safety supersession: %w", safetyErr))
@@ -1150,10 +1177,9 @@ func (coordinator *mutationCoordinator) execute(
 		request.info = configured
 	}
 	if request.attempt.RestartRequestedAt.IsZero() {
-		final, terminalReadback, err := coordinator.waitForConfiguredReadback(ctx, request, request.attempt.ConfiguredVerifiedAt)
+		final, unsafeReadback, err := coordinator.waitForConfiguredReadback(ctx, request)
 		if err != nil {
-			if terminalReadback {
-				result.readbackUnavailable = final.MacAddr == "" || final.MacAddr != request.macAddr
+			if unsafeReadback {
 				if coordinator.readbackNeedsSafetySupersession(request, final, asic) {
 					if safetyErr := coordinator.supersedeReadback(request, final, asic); safetyErr != nil {
 						return open(lib.MutationFailureConfiguredVerification, fmt.Errorf("persist final safety supersession: %w", safetyErr))
@@ -1173,40 +1199,54 @@ func (coordinator *mutationCoordinator) execute(
 			return open(lib.MutationFailureRebootVerification, err)
 		}
 	}
-	miner, rediscoveredASIC, err := coordinator.waitForVerifiedBoot(ctx, request, request.attempt.ConfiguredVerifiedUptimeSeconds, request.attempt.ConfiguredVerifiedAt, request.attempt.RestartRequestedAt)
+	readback, err := coordinator.waitForVerifiedBoot(ctx, request, request.attempt.ConfiguredVerifiedUptimeSeconds, request.attempt.ConfiguredVerifiedAt)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return open(lib.MutationFailureRebootVerification, err)
+		return open(lib.MutationFailureRebootVerification, err)
+	}
+	switch readback.disposition {
+	case rebootReadbackUnsafe:
+		safetyRequest := request
+		safetyRequest.ip = readback.miner.IP
+		if safetyErr := coordinator.supersedeReadback(safetyRequest, readback.miner.Info, readback.asic); safetyErr != nil {
+			return open(lib.MutationFailureRebootVerification, fmt.Errorf("persist reboot safety supersession: %w", safetyErr))
 		}
-		result.readbackUnavailable = miner.Info.MacAddr == "" || miner.Info.MacAddr != request.macAddr
-		if coordinator.readbackNeedsSafetySupersession(request, miner.Info, rediscoveredASIC) {
-			if safetyErr := coordinator.supersedeReadback(request, miner.Info, rediscoveredASIC); safetyErr != nil {
-				return open(lib.MutationFailureRebootVerification, fmt.Errorf("persist reboot safety supersession: %w", safetyErr))
-			}
+		result.stateReconciled = true
+		result.miner = readback.miner
+		return terminal(lib.MutationFailureRebootVerification, fmt.Errorf("post-boot readback proved an unsafe device state"))
+	case rebootReadbackFirmwareReduction:
+		if reconcileErr := coordinator.reconcileFirmwareReduction(request, readback); reconcileErr != nil {
+			return open(lib.MutationFailureRebootVerification, fmt.Errorf("reconcile AxeOS firmware reduction: %w", reconcileErr))
 		}
-		return terminal(lib.MutationFailureRebootVerification, err)
+		result.stateReconciled = true
+		result.miner = readback.miner
+		return terminal(lib.MutationFailureRebootVerification, fmt.Errorf("AxeOS firmware reduction superseded the requested point"))
+	case rebootReadbackExternalPoint:
+		state, loadErr := coordinator.states.LoadMiner(request.macAddr)
+		if loadErr != nil {
+			return open(lib.MutationFailureRebootVerification, fmt.Errorf("load external-point state: %w", loadErr))
+		}
+		state.IP = readback.miner.IP
+		if _, adoptErr := coordinator.states.Apply(lib.AdoptExternalPoint{
+			State: state, Point: operatingPointFromInfo(readback.miner.Info), AttemptID: request.attemptID,
+			Stage: lib.MutationFailureRebootVerification,
+		}, coordinator.now()); adoptErr != nil {
+			return open(lib.MutationFailureRebootVerification, fmt.Errorf("adopt post-boot external operating point: %w", adoptErr))
+		}
+		result.stateReconciled = true
+		result.miner = readback.miner
+		return terminal(lib.MutationFailureRebootVerification, fmt.Errorf("stable post-boot external operating point was adopted"))
+	case rebootReadbackVerified:
+		// Continue into the durable reboot milestone below.
+	default:
+		return open(lib.MutationFailureRebootVerification, fmt.Errorf("post-boot verification returned an invalid disposition"))
 	}
 	if request.attempt.RebootVerifiedAt.IsZero() {
 		if err := coordinator.states.AdvanceMutationAttempt(request.attemptID, lib.MutationMilestoneRebootVerified, coordinator.now()); err != nil {
 			return open(lib.MutationFailureRebootVerification, fmt.Errorf("persist reboot verification: %w", err))
 		}
 	}
-	result.miner = miner
+	result.miner = readback.miner
 	return result
-}
-
-func (coordinator *mutationCoordinator) entryPreflightExpired(request mutationRequest) bool {
-	if request.kind != lib.MutationOperatingPoint || !request.attempt.PatchRequestedAt.IsZero() ||
-		request.attempt.StartedAt.IsZero() || coordinator.now().Before(request.attempt.StartedAt.Add(defaultRebootDeadline)) {
-		return false
-	}
-	state, err := coordinator.states.LoadMiner(request.macAddr)
-	if err != nil {
-		return false
-	}
-	return (state.Phase == lib.PhaseUndervolt || state.Phase == lib.PhaseFrequencyTest || state.Phase == lib.PhaseVoltageTest) &&
-		state.PendingKind == lib.MutationOperatingPoint && state.CurrentPoint() == state.FallbackPoint() &&
-		state.PendingPoint() != state.FallbackPoint()
 }
 
 func (coordinator *mutationCoordinator) safeExternalPreflight(
@@ -1219,7 +1259,7 @@ func (coordinator *mutationCoordinator) safeExternalPreflight(
 		!validLivePoint(operatingPointFromInfo(info)) || info.Frequency == 50 ||
 		canonicalASICGrid(asic) != nil || !supportedSafetyIdentity(info) ||
 		!completeSafetyTelemetry(info) || hasPowerFault(info) || state.SafetyReason != "" ||
-		state.Phase == lib.PhaseCooldown || state.Phase == lib.PhaseOverheat {
+		state.Phase == lib.PhaseCooldown || state.Phase == lib.PhaseEmergency {
 		return false
 	}
 	minimum, err := minimumAdvertisedPoint(asic)
@@ -1232,36 +1272,45 @@ func (coordinator *mutationCoordinator) safeExternalPreflight(
 func (coordinator *mutationCoordinator) waitForConfiguredReadback(
 	ctx context.Context,
 	request mutationRequest,
-	startedAt time.Time,
 ) (lib.Info, bool, error) {
-	deadline := startedAt.Add(defaultRebootDeadline)
+	// This deadline bounds one worker invocation; it is not state authority.
+	// A later coordinator pass resumes the same persisted milestone without
+	// replaying PATCH, so temporary telemetry gaps cannot become a fabricated
+	// terminal mutation failure merely because wall time elapsed.
+	deadline := coordinator.now().Add(defaultRebootDeadline)
 	var lastErr error
+	var lastInfo lib.Info
 	for {
 		if err := ctx.Err(); err != nil {
 			return lib.Info{}, false, err
 		}
 		if !coordinator.now().Before(deadline) {
 			if lastErr != nil {
-				return lib.Info{}, true, fmt.Errorf("configured readback deadline expired: %w", lastErr)
+				return lastInfo, false, fmt.Errorf("configured readback worker deadline expired: %w", lastErr)
 			}
-			return lib.Info{}, true, fmt.Errorf("configured readback deadline expired")
+			return lastInfo, false, fmt.Errorf("configured readback worker deadline expired")
 		}
 		info, err := coordinator.devices.GetSystemInfo(ctx, request.ip)
 		if err == nil {
+			lastInfo = info
 			if !coordinator.now().Before(deadline) {
-				return info, true, fmt.Errorf("configured readback deadline expired after response")
+				return info, false, fmt.Errorf("configured readback worker deadline expired after response")
 			}
 			if identityErr := validateMutationIdentity(info, request.macAddr); identityErr != nil {
-				return info, true, identityErr
+				lastErr = identityErr
+			} else if verifyErr := verifyConfiguredReadback(request, info); verifyErr != nil {
+				if coordinator.readbackNeedsSafetySupersession(request, info, lib.ASICSettings{}) {
+					return info, true, verifyErr
+				}
+				lastErr = verifyErr
+			} else {
+				return info, false, nil
 			}
-			if verifyErr := verifyConfiguredReadback(request, info); verifyErr != nil {
-				return info, true, verifyErr
-			}
-			return info, true, nil
+		} else {
+			lastErr = err
 		}
-		lastErr = err
 		if !coordinator.now().Before(deadline) {
-			return lib.Info{}, true, fmt.Errorf("configured readback deadline expired: %w", lastErr)
+			return lastInfo, false, fmt.Errorf("configured readback worker deadline expired: %w", lastErr)
 		}
 		if err := coordinator.waitMutationRetry(ctx); err != nil {
 			return lib.Info{}, false, err
@@ -1306,9 +1355,9 @@ func verifyConfiguredReadback(request mutationRequest, info lib.Info) error {
 		if info.OverHeatMode != 0 || info.Frequency == 50 || knownFirmwareTripExceeded(info) {
 			return fmt.Errorf("configured safety rollback readback is not safety-continuable")
 		}
-	case lib.MutationOverheatRecovery:
+	case lib.MutationFirmwareRecovery:
 		if operatingPointFromInfo(info) != request.point || info.OverHeatMode != 0 || info.Frequency == 50 || !safeToRecover(info, request.settings) {
-			return fmt.Errorf("configured overheat recovery readback is not recovery-safe")
+			return fmt.Errorf("configured firmware recovery readback is not recovery-safe")
 		}
 	case lib.MutationMiningConfiguration:
 		if operatingPointFromInfo(info) != operatingPointFromInfo(request.info) ||
@@ -1329,39 +1378,39 @@ func (coordinator *mutationCoordinator) readbackNeedsSafetySupersession(
 	observed lib.Info,
 	asic lib.ASICSettings,
 ) bool {
+	_, unsafe := provenUnsafeReadback(request, observed, asic)
+	return unsafe
+}
+
+func provenUnsafeReadback(
+	request mutationRequest,
+	observed lib.Info,
+	asic lib.ASICSettings,
+) (safetyAssessment, bool) {
 	if observed.MacAddr == "" || observed.MacAddr != request.macAddr {
-		// A timeout, disappearance, or malformed empty response is an
-		// unavailable verification boundary, not readable unsafe evidence. A
-		// different MAC is equally unusable: it cannot authorize actuation for
-		// this request.
-		return false
+		return safetyAssessment{}, false
 	}
-	switch request.kind {
-	case lib.MutationOperatingPoint:
-		return true
-	case lib.MutationMiningConfiguration:
-		if observed.MacAddr == "" {
-			return false
-		}
-		assessment := assessInstantaneousSafety(
-			observed,
-			request.settings,
-			operatingPointFromInfo(observed),
-			lib.OperatingPoint{},
-		)
-		return assessment.action != safetyNormal && assessment.action != safetyUnavailable
-	case lib.MutationSafetyRollback, lib.MutationOverheatRecovery:
-		if observed.MacAddr == "" || canonicalASICGrid(asic) != nil || !supportedSafetyIdentity(observed) ||
-			!completeSafetyTelemetry(observed) || hasPowerFault(observed) {
-			return observed.MacAddr != ""
-		}
-		if observed.OverHeatMode != 0 || observed.Frequency == 50 {
-			return request.kind == lib.MutationSafetyRollback
-		}
-		return knownFirmwareTripExceeded(observed) ||
-			assessInstantaneousSafety(observed, request.settings, operatingPointFromInfo(observed), lib.OperatingPoint{}).action == safetyEmergencyHold
+	if hasPowerFault(observed) {
+		return safetyAssessment{
+			action:  safetyEmergencyHold,
+			failure: safetyFailure{status: string(lib.PointPower), reason: "device reports a power fault"},
+		}, true
+	}
+	minimum := lib.OperatingPoint{}
+	if canonicalASICGrid(asic) == nil {
+		minimum, _ = minimumAdvertisedPoint(asic)
+	}
+	assessment := assessInstantaneousSafety(
+		observed,
+		request.settings,
+		operatingPointFromInfo(observed),
+		minimum,
+	)
+	switch assessment.action {
+	case safetyRollback, safetyHostContainment, safetyFirmwareRecovery, safetyEmergencyHold:
+		return assessment, true
 	default:
-		return true
+		return assessment, false
 	}
 }
 
@@ -1370,46 +1419,46 @@ func (coordinator *mutationCoordinator) waitForVerifiedBoot(
 	request mutationRequest,
 	configuredUptime int,
 	configuredAt time.Time,
-	restartAt time.Time,
-) (lib.DiscoveredMiner, lib.ASICSettings, error) {
-	deadline := restartAt.Add(coordinator.rebootDeadline)
+) (rebootReadback, error) {
+	deadline := coordinator.now().Add(coordinator.rebootDeadline)
 	var lastErr error
 	var lastMiner lib.DiscoveredMiner
 	var lastASIC lib.ASICSettings
+	var mismatch lib.OperatingPoint
+	mismatchCount := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return lib.DiscoveredMiner{}, lib.ASICSettings{}, err
+			return rebootReadback{}, err
 		}
 		if !coordinator.now().Before(deadline) {
 			if lastErr != nil {
-				return lastMiner, lastASIC, fmt.Errorf("reboot verification deadline expired: %w", lastErr)
+				return rebootReadback{miner: lastMiner, asic: lastASIC}, fmt.Errorf("reboot verification worker deadline expired: %w", lastErr)
 			}
-			return lastMiner, lastASIC, fmt.Errorf("reboot verification deadline expired")
+			return rebootReadback{miner: lastMiner, asic: lastASIC}, fmt.Errorf("reboot verification worker deadline expired")
 		}
 		miner, err := coordinator.discover(ctx, request.macAddr)
 		if err == nil {
 			lastMiner = miner
-			if identityErr := validateMutationIdentity(miner.Info, request.macAddr); identityErr != nil {
-				return miner, lib.ASICSettings{}, identityErr
+			if _, unsafe := provenUnsafeReadback(request, miner.Info, lastASIC); unsafe {
+				return rebootReadback{miner: miner, asic: lastASIC, disposition: rebootReadbackUnsafe}, nil
 			}
-			if request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationOverheatRecovery {
+			if identityErr := validateMutationIdentity(miner.Info, request.macAddr); identityErr != nil {
+				lastErr = identityErr
+				goto retry
+			}
+			if request.kind == lib.MutationOperatingPoint || request.kind == lib.MutationSafetyRollback || request.kind == lib.MutationFirmwareRecovery {
 				rediscoveredASIC, asicErr := coordinator.devices.GetASICSettings(ctx, miner.IP)
 				if asicErr != nil {
 					lastErr = fmt.Errorf("read advertised operating points after rediscovery: %w", asicErr)
-					if !coordinator.now().Before(deadline) {
-						return lib.DiscoveredMiner{}, lib.ASICSettings{}, fmt.Errorf("reboot verification deadline expired: %w", lastErr)
-					}
-					if err := coordinator.waitMutationRetry(ctx); err != nil {
-						return lib.DiscoveredMiner{}, lib.ASICSettings{}, err
-					}
-					continue
+					goto retry
 				}
 				lastASIC = rediscoveredASIC
-				if err := canonicalASICGrid(rediscoveredASIC); err != nil {
-					return miner, rediscoveredASIC, fmt.Errorf("rediscovered ASIC grid is unsupported: %w", err)
+				if _, unsafe := provenUnsafeReadback(request, miner.Info, lastASIC); unsafe {
+					return rebootReadback{miner: miner, asic: lastASIC, disposition: rebootReadbackUnsafe}, nil
 				}
-				if !operatingPointAdvertised(rediscoveredASIC, request.point) {
-					return miner, rediscoveredASIC, fmt.Errorf("rediscovered target operating point is no longer advertised")
+				if err := canonicalASICGrid(rediscoveredASIC); err != nil {
+					lastErr = fmt.Errorf("rediscovered ASIC grid is unsupported: %w", err)
+					goto retry
 				}
 			}
 			elapsed := coordinator.now().Sub(configuredAt)
@@ -1422,27 +1471,147 @@ func (coordinator *mutationCoordinator) waitForVerifiedBoot(
 			}
 			if booted {
 				if !coordinator.now().Before(deadline) {
-					return miner, lastASIC, fmt.Errorf("reboot verification deadline expired after boot proof")
+					return rebootReadback{miner: miner, asic: lastASIC}, fmt.Errorf("reboot verification worker deadline expired after boot proof")
 				}
 				if verifyErr := verifyConfiguredReadback(request, miner.Info); verifyErr != nil {
-					return miner, lastASIC, verifyErr
+					lastErr = verifyErr
+					if !completeSafetyTelemetry(miner.Info) || hasPowerFault(miner.Info) ||
+						!validLivePoint(operatingPointFromInfo(miner.Info)) {
+						goto retry
+					}
+					assessment := assessInstantaneousSafety(
+						miner.Info, request.settings, operatingPointFromInfo(miner.Info), lib.OperatingPoint{},
+					)
+					if assessment.action != safetyNormal {
+						goto retry
+					}
+					observed := operatingPointFromInfo(miner.Info)
+					if observed == mismatch {
+						mismatchCount++
+					} else {
+						mismatch = observed
+						mismatchCount = 1
+					}
+					if mismatchCount >= manualConfirmationPolls && request.kind == lib.MutationOperatingPoint {
+						disposition := rebootReadbackExternalPoint
+						if axeOSReducedPoint(request.point, observed) {
+							disposition = rebootReadbackFirmwareReduction
+						}
+						return rebootReadback{miner: miner, asic: lastASIC, disposition: disposition}, nil
+					}
+					goto retry
 				}
 				if !coordinator.now().Before(deadline) {
-					return miner, lastASIC, fmt.Errorf("reboot verification deadline expired after readback")
+					return rebootReadback{miner: miner, asic: lastASIC}, fmt.Errorf("reboot verification worker deadline expired after readback")
 				}
-				return miner, lastASIC, nil
+				return rebootReadback{miner: miner, asic: lastASIC, disposition: rebootReadbackVerified}, nil
 			}
 			lastErr = fmt.Errorf("new boot proof is not established")
 		} else {
 			lastErr = err
 		}
+	retry:
 		if !coordinator.now().Before(deadline) {
-			return lastMiner, lastASIC, fmt.Errorf("reboot verification deadline expired: %w", lastErr)
+			return rebootReadback{miner: lastMiner, asic: lastASIC}, fmt.Errorf("reboot verification worker deadline expired: %w", lastErr)
 		}
 		if err := coordinator.waitMutationRetry(ctx); err != nil {
-			return lib.DiscoveredMiner{}, lib.ASICSettings{}, err
+			return rebootReadback{}, err
 		}
 	}
+}
+
+func axeOSReducedPoint(requested, observed lib.OperatingPoint) bool {
+	const reduction = 100
+	return requested.Frequency > reduction && requested.CoreVoltage > reduction &&
+		observed.Frequency == requested.Frequency-reduction &&
+		observed.CoreVoltage == requested.CoreVoltage-reduction
+}
+
+// firmwareRecoveryTarget normalizes AxeOS's autonomous paired reduction onto
+// the advertised complete-pair grid without increasing either component when
+// a dominated advertised pair exists. The exact minimum is the only safe
+// fallback when the firmware reduced below every advertised component.
+func firmwareRecoveryTarget(
+	asic lib.ASICSettings,
+	reduced lib.OperatingPoint,
+) (lib.OperatingPoint, error) {
+	if err := canonicalASICGrid(asic); err != nil {
+		return lib.OperatingPoint{}, err
+	}
+	if operatingPointAdvertised(asic, reduced) {
+		return reduced, nil
+	}
+	frequency, frequencyOK := floorAdvertisedOption(asic.FrequencyOptions, reduced.Frequency)
+	voltage, voltageOK := floorAdvertisedOption(asic.VoltageOptions, reduced.CoreVoltage)
+	if frequencyOK && voltageOK {
+		return lib.OperatingPoint{Frequency: frequency, CoreVoltage: voltage}, nil
+	}
+	return minimumAdvertisedPoint(asic)
+}
+
+func floorAdvertisedOption(options []int, maximum int) (int, bool) {
+	index := sort.Search(len(options), func(index int) bool { return options[index] > maximum })
+	if index == 0 {
+		return 0, false
+	}
+	return options[index-1], true
+}
+
+func (coordinator *mutationCoordinator) reconcileFirmwareReduction(
+	request mutationRequest,
+	readback rebootReadback,
+) error {
+	observed := operatingPointFromInfo(readback.miner.Info)
+	if request.kind != lib.MutationOperatingPoint ||
+		readback.miner.Info.MacAddr != request.macAddr ||
+		readback.miner.Info.OverHeatMode != 0 ||
+		!axeOSReducedPoint(request.point, observed) ||
+		!completeSafetyTelemetry(readback.miner.Info) || hasPowerFault(readback.miner.Info) {
+		return fmt.Errorf("post-boot readback is not a safe AxeOS paired reduction")
+	}
+	if assessment := assessInstantaneousSafety(
+		readback.miner.Info, request.settings, observed, lib.OperatingPoint{},
+	); assessment.action != safetyNormal {
+		return fmt.Errorf("post-boot AxeOS reduction is not inside normal safety limits")
+	}
+	target, err := firmwareRecoveryTarget(readback.asic, observed)
+	if err != nil {
+		return fmt.Errorf("select advertised firmware recovery pair: %w", err)
+	}
+	state, err := coordinator.states.LoadMiner(request.macAddr)
+	if err != nil {
+		return err
+	}
+	expected := state
+	now := coordinator.now()
+	if readback.miner.IP != "" {
+		state.IP = readback.miner.IP
+	}
+	if state.Phase != lib.PhaseEmergency {
+		state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
+	}
+	state.SetCurrentPoint(observed)
+	state.SetFallbackPoint(lib.OperatingPoint{})
+	state.ClearPendingMutation()
+	state.Phase = lib.PhaseEmergency
+	state.PhaseStartedAt = now
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
+	state.SafetyReason = lib.SafetyReasonFirmwareOverheat
+	state.RecoveryHealthyCount = 0
+	state.UnreadablePollCount = 0
+	state.ObservedFrequency = 0
+	state.ObservedCoreVoltage = 0
+	state.ObservedCount = 0
+	if target == observed {
+		state.Phase = lib.PhaseCooldown
+	} else if safeToRecover(readback.miner.Info, request.settings) {
+		state.SetPendingMutation(lib.MutationFirmwareRecovery, target, now)
+	}
+	_, err = coordinator.states.Apply(lib.SupersedeMutation{
+		Expected: expected, State: state, AttemptID: request.attemptID,
+	}, now)
+	return err
 }
 
 func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
@@ -1474,6 +1643,9 @@ func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
 			if storedAttempt.ID == 0 {
 				return processed, fmt.Errorf("mutation result references missing attempt %d", result.attemptID)
 			}
+			if result.stateReconciled && result.miner.IP != "" {
+				coordinator.routes[result.macAddr] = result.miner
+			}
 			if storedAttempt.FailureStage == lib.MutationFailureSafetySuperseded {
 				// Safety arbitration already consumed this worker's authority. Its late result is the
 				// same terminal fact, not a second mutation failure and not an operator-facing error.
@@ -1485,17 +1657,26 @@ func (coordinator *mutationCoordinator) applyResultsLocked() (bool, error) {
 						return processed, terminalErr
 					}
 				}
-				if result.kind == lib.MutationMiningConfiguration &&
+				if result.kind == lib.MutationMiningConfiguration && result.failureStage != "" &&
 					!errors.Is(result.err, context.Canceled) {
 					coordinator.startupBlocked = result.hostname
 				}
 				if !errors.Is(result.err, context.Canceled) {
-					coordinator.logger.Printf(
-						"Mutation %s failed for %s: %s",
-						result.kind,
-						result.hostname,
-						result.err,
-					)
+					if result.failureStage == "" {
+						coordinator.logger.Printf(
+							"Mutation %s remains incomplete for %s and will retry: %s",
+							result.kind,
+							result.hostname,
+							result.err,
+						)
+					} else {
+						coordinator.logger.Printf(
+							"Mutation %s failed for %s: %s",
+							result.kind,
+							result.hostname,
+							result.err,
+						)
+					}
 				}
 				continue
 			}
@@ -1515,33 +1696,6 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 	result mutationResult,
 	attempt lib.MutationAttempt,
 ) error {
-	if result.readbackUnavailable &&
-		result.kind != lib.MutationSafetyRollback && result.kind != lib.MutationOverheatRecovery {
-		state, err := coordinator.states.LoadMiner(result.macAddr)
-		if err != nil {
-			return err
-		}
-		if _, err := coordinator.settings.ForHost(state.Hostname); err != nil {
-			return err
-		}
-		if state.Phase != lib.PhaseOverheat {
-			state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-			state.PhaseStartedAt = coordinator.now()
-		}
-		state.ClearPendingMutation()
-		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.Phase = lib.PhaseOverheat
-		state.HoldReason = ""
-		state.SettledAt = time.Time{}
-		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-		// See optimizer.go's matching resets: a COOLDOWN dwell in progress before this escalation
-		// proved recovery from a different failure and must not carry over into this one.
-		state.RecoveryHealthyCount = 0
-		_, err = coordinator.states.Apply(lib.QuarantineMutation{
-			State: state, AttemptID: result.attemptID, Stage: result.failureStage,
-		}, coordinator.now())
-		return err
-	}
 	state, err := coordinator.states.LoadMiner(result.macAddr)
 	if err != nil {
 		return err
@@ -1592,7 +1746,7 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 		_, err := coordinator.states.Apply(lib.FailMutation{State: state, AttemptID: result.attemptID, Stage: result.failureStage}, now)
 		return err
 	}
-	if result.kind == lib.MutationSafetyRollback || result.kind == lib.MutationOverheatRecovery {
+	if result.kind == lib.MutationSafetyRollback || result.kind == lib.MutationFirmwareRecovery {
 		// A safety attempt that reaches a readable same-obligation mismatch or
 		// an availability deadline keeps its typed safety intent. The failed
 		// history row is terminal, but a later coordinator pass may create the
@@ -1605,28 +1759,13 @@ func (coordinator *mutationCoordinator) handleTerminalMutationFailureLocked(
 	}
 	state.ClearPendingMutation()
 	state.SetFallbackPoint(lib.OperatingPoint{})
-	if result.kind == lib.MutationSafetyRollback || result.kind == lib.MutationOverheatRecovery {
-		if state.Phase != lib.PhaseOverheat {
-			state.Phase = lib.PhaseCooldown
-		}
-		state.HoldReason = ""
-	} else {
-		// The mutation pipeline itself failed (preflight, PATCH, restart, or rediscovery) before ever
-		// reaching CompleteMutation, so hardware was never confirmed running the target
-		// configuration at all — the textbook "never got its patch/restart to complete" shape. That
-		// reads as starvation, but this commit deliberately still classifies it HoldRejected: the
-		// starved/probation exit this commit wires (see optimizer.go's starveBaseline/closeProbation)
-		// only knows how to resume a starved BASELINE epoch, because EpochPurpose is coarser than
-		// OptimizerPhase (trial's three sub-phases, hold_validation's Optimized/Manual sub-reason)
-		// and there is no durable epoch here at all to recover that context from. Giving this site
-		// HoldStarved without a working, correctly-targeted resume would recreate exactly the
-		// mislabeled-but-still-permanently-absorbing trap this file's own history warned against
-		// when the starved close was first deferred. See this commit's report for the full
-		// reasoning.
-		state.Phase = lib.PhaseHold
-		state.HoldReason = lib.HoldRejected
-		state.SettledAt = time.Time{}
-	}
+	// Only an operating-point attempt reaches this fallback: mining and safety kinds return above.
+	// The pipeline never proved the target active, and no evidence epoch exists from which a
+	// starvation successor could reconstruct the interrupted trial phase, so this is a rejected
+	// point requiring an explicit retune.
+	state.Phase = lib.PhaseHold
+	state.HoldReason = lib.HoldRejected
+	state.SettledAt = time.Time{}
 	_, err = coordinator.states.Apply(lib.FailMutation{State: state, AttemptID: result.attemptID, Stage: result.failureStage}, now)
 	return err
 }
@@ -1780,6 +1919,7 @@ func validateKindSafety(
 	info lib.Info,
 	settings lib.Settings,
 	state lib.MinerState,
+	asic lib.ASICSettings,
 	minimum lib.OperatingPoint,
 ) error {
 	if !completeSafetyTelemetry(info) {
@@ -1819,7 +1959,7 @@ func validateKindSafety(
 			if knownFirmwareTripExceeded(info) {
 				return fmt.Errorf("telemetry exceeded a known AxeOS firmware trip boundary")
 			}
-		case lib.PhaseOverheat:
+		case lib.PhaseEmergency:
 			if info.OverHeatMode != 0 {
 				return fmt.Errorf("device is in firmware overheat mode")
 			}
@@ -1832,22 +1972,23 @@ func validateKindSafety(
 		default:
 			return fmt.Errorf("safety rollback has no durable safety phase")
 		}
-	case lib.MutationOverheatRecovery:
-		if state.Phase != lib.PhaseOverheat {
-			return fmt.Errorf("overheat recovery has no durable emergency episode")
+	case lib.MutationFirmwareRecovery:
+		if state.Phase != lib.PhaseEmergency {
+			return fmt.Errorf("firmware recovery has no durable emergency episode")
 		}
 		if state.SafetyReason != lib.SafetyReasonFirmwareOverheat {
-			return fmt.Errorf("overheat recovery has no verified firmware-overheat cause")
+			return fmt.Errorf("firmware recovery has no verified firmware-overheat cause")
 		}
-		if state.PendingPoint() != minimum {
-			return fmt.Errorf("overheat recovery target is not the exact advertised minimum")
+		target, err := firmwareRecoveryTarget(asic, state.CurrentPoint())
+		if err != nil || state.PendingPoint() != target {
+			return fmt.Errorf("firmware recovery target is not the normalized advertised pair")
 		}
 		if !safeToRecover(info, settings) {
-			return fmt.Errorf("device is not cool enough for overheat recovery")
+			return fmt.Errorf("device is not cool enough for firmware recovery")
 		}
 		if info.OverHeatMode == 0 && info.Frequency != 50 &&
-			operatingPointFromInfo(info) == minimum && state.CurrentPoint() == minimum {
-			return fmt.Errorf("overheat recovery is already complete at the advertised minimum")
+			operatingPointFromInfo(info) == target && state.CurrentPoint() == target {
+			return fmt.Errorf("firmware recovery is already complete at the advertised pair")
 		}
 	default:
 		return fmt.Errorf("unsupported mutation kind %q", kind)
@@ -1869,7 +2010,7 @@ func (coordinator *mutationCoordinator) validateMutationPreflight(
 			return err
 		}
 	}
-	if err := validateKindSafety(info, settings, state, minimum); err != nil {
+	if err := validateKindSafety(info, settings, state, asic, minimum); err != nil {
 		return err
 	}
 	if state.PendingKind != lib.MutationSafetyRollback ||
@@ -1897,33 +2038,52 @@ func (coordinator *mutationCoordinator) validateMutationPreflight(
 
 func (coordinator *mutationCoordinator) preflightNeedsSafetySupersession(
 	request mutationRequest,
-	state lib.MinerState,
 	info lib.Info,
 	asic lib.ASICSettings,
 ) bool {
-	if request.kind == lib.MutationMiningConfiguration {
+	_, unsafe := provenUnsafeReadback(request, info, asic)
+	return unsafe
+}
+
+func (coordinator *mutationCoordinator) safetyIntentAlreadySatisfied(
+	request mutationRequest,
+	info lib.Info,
+	asic lib.ASICSettings,
+) bool {
+	if request.kind != lib.MutationSafetyRollback && request.kind != lib.MutationFirmwareRecovery {
 		return false
 	}
-	if canonicalASICGrid(asic) != nil {
-		return true
+	if canonicalASICGrid(asic) != nil || operatingPointFromInfo(info) != request.point ||
+		info.OverHeatMode != 0 || info.Frequency == 50 || hasPowerFault(info) ||
+		!completeSafetyTelemetry(info) {
+		return false
 	}
-	minimum, err := minimumAdvertisedPoint(asic)
-	if err != nil {
-		return true
-	}
-	assessment := assessInstantaneousSafety(info, request.settings, operatingPointFromInfo(info), minimum)
-	redundantOverheatRecovery := request.kind == lib.MutationOverheatRecovery &&
-		assessment.action == safetyNormal &&
-		info.OverHeatMode == 0 && info.Frequency != 50 &&
-		operatingPointFromInfo(info) == minimum && state.CurrentPoint() == minimum
-	redundantSafetyRollback := request.kind == lib.MutationSafetyRollback &&
-		assessment.action == safetyNormal && state.PendingPoint() == operatingPointFromInfo(info)
-	return assessment.action == safetyRollback ||
-		assessment.action == safetyHostContainment ||
-		assessment.action == safetyFirmwareRecovery ||
-		assessment.action == safetyEmergencyHold ||
-		redundantSafetyRollback ||
-		redundantOverheatRecovery
+	assessment := assessInstantaneousSafety(info, request.settings, request.point, lib.OperatingPoint{})
+	return assessment.action == safetyNormal
+}
+
+func (coordinator *mutationCoordinator) reconcileSatisfiedSafetyIntent(
+	request mutationRequest,
+	state lib.MinerState,
+	info lib.Info,
+) error {
+	expected := state
+	now := coordinator.now()
+	state.SetCurrentPoint(operatingPointFromInfo(info))
+	state.SetFallbackPoint(lib.OperatingPoint{})
+	state.ClearPendingMutation()
+	state.Phase = lib.PhaseCooldown
+	state.PhaseStartedAt = now
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
+	state.RecoveryHealthyCount = 0
+	state.ObservedFrequency = 0
+	state.ObservedCoreVoltage = 0
+	state.ObservedCount = 0
+	_, err := coordinator.states.Apply(lib.SupersedeMutation{
+		Expected: expected, State: state, AttemptID: request.attemptID,
+	}, now)
+	return err
 }
 
 func (coordinator *mutationCoordinator) supersedeReadback(
@@ -1941,37 +2101,30 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 	expected := state
 	now := coordinator.now()
 	settings := request.settings
-	if observed.MacAddr == "" || canonicalASICGrid(asic) != nil {
+	if request.ip != "" {
+		state.IP = request.ip
+	}
+	assessment, unsafe := provenUnsafeReadback(request, observed, asic)
+	if !unsafe {
+		return fmt.Errorf("readback does not prove an unsafe device state")
+	}
+	minimum, minimumErr := minimumAdvertisedPoint(asic)
+	if canonicalASICGrid(asic) != nil || minimumErr != nil || !supportedSafetyIdentity(observed) ||
+		!operatingPointAdvertised(asic, minimum) {
 		state.ClearPendingMutation()
 		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.Phase = lib.PhaseOverheat
-		state.HoldReason = ""
-		state.SettledAt = time.Time{}
-		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-		state.RecoveryHealthyCount = 0
-		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
-		return err
-	}
-	minimum, err := minimumAdvertisedPoint(asic)
-	if err != nil || !supportedSafetyIdentity(observed) || !operatingPointAdvertised(asic, minimum) {
-		state.ClearPendingMutation()
-		state.SetFallbackPoint(lib.OperatingPoint{})
-		state.Phase = lib.PhaseOverheat
-		state.HoldReason = ""
-		state.SettledAt = time.Time{}
-		state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-		state.RecoveryHealthyCount = 0
-		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
-		return err
-	}
-	assessment := assessInstantaneousSafety(observed, settings, operatingPointFromInfo(observed), minimum)
-	if assessment.action == safetyNormal || assessment.action == safetyUnavailable {
-		assessment = safetyAssessment{
-			action:  safetyEmergencyHold,
-			failure: safetyFailure{status: string(lib.PointThermal), reason: "mutation configuration became uncertain"},
+		if state.Phase != lib.PhaseEmergency {
+			state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
+			state.PhaseStartedAt = now
 		}
+		state.Phase = lib.PhaseEmergency
+		state.HoldReason = ""
+		state.SettledAt = time.Time{}
+		state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(assessment.failure))
+		state.RecoveryHealthyCount = 0
+		state.UnreadablePollCount = 0
+		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
+		return err
 	}
 	if assessment.action == safetyRollback {
 		target := minimum
@@ -1979,12 +2132,9 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		if listErr != nil {
 			return fmt.Errorf("read safety supersession evidence: %w", listErr)
 		}
-		failed := request.attempt.FromPoint()
-		for _, record := range records {
-			if rollbackRecordEligible(record, failed, asic, settings) &&
-				(target == minimum || record.MedianHash > pointHash(records, target)) {
-				target = record.Point()
-			}
+		failed := operatingPointFromInfo(observed)
+		if selected, found := selectRollbackPoint(records, failed, asic, settings); found {
+			target = selected
 		}
 		state.ClearPendingMutation()
 		state.SetFallbackPoint(lib.OperatingPoint{})
@@ -1993,12 +2143,7 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
 		state.RecoveryHealthyCount = 0
-		if target == operatingPointFromInfo(observed) {
-			state.Phase = lib.PhaseOverheat
-			state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-		} else {
-			state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
-		}
+		state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 		_, err := coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
 		return err
 	}
@@ -2007,15 +2152,6 @@ func (coordinator *mutationCoordinator) supersedeReadback(
 	}
 	_, err = coordinator.states.Apply(lib.SupersedeMutation{Expected: expected, State: state, AttemptID: request.attemptID}, now)
 	return err
-}
-
-func pointHash(records []lib.OperatingPointRecord, point lib.OperatingPoint) float64 {
-	for _, record := range records {
-		if record.Point() == point {
-			return record.MedianHash
-		}
-	}
-	return -1
 }
 
 func mutationStillPending(state lib.MinerState, request mutationRequest) bool {

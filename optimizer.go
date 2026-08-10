@@ -112,7 +112,7 @@ type minerRuntime struct {
 }
 
 // recoverySample is logRecoveryInstrumentation's in-memory-only memory of the previous
-// COOLDOWN/OVERHEAT poll, never persisted or acted upon: it exists purely to log a safeToRecover
+// COOLDOWN/EMERGENCY poll, never persisted or acted upon: it exists purely to log a safeToRecover
 // transition or a temperature slope. The durable recovery predicate itself is
 // recoveryHealthyPolls/RecoveryHealthyCount in controlMinerAfterSafety, a separate mechanism.
 type recoverySample struct {
@@ -249,9 +249,8 @@ func (minerController *controller) controlMiner(
 	}
 	poll, ok := newReadablePoll(info, asic)
 	if !ok {
-		// An unreadable poll is a non-event for the optimizer: no phase transition, no epoch
-		// progress, no state save. The full unreadable_poll_count escalation machinery is commit
-		// 3's job; for this commit, simply not advancing anything is the complete, correct behavior.
+		// enforceMinerSafety owns unreadable-poll accounting. Anything still rejected here is a
+		// non-event for evidence: it cannot advance a phase or an epoch.
 		return nil
 	}
 	return minerController.controlMinerAfterSafety(ctx, state, poll, settings, now, true)
@@ -288,11 +287,11 @@ func (minerController *controller) enforceMinerSafety(
 			state.SetFallbackPoint(lib.OperatingPoint{})
 			state.SettledAt = time.Time{}
 			if firmwareOverheat || firmwareTrip {
-				if state.Phase != lib.PhaseOverheat {
-					state.OverheatCount = incrementOverheatCount(state.OverheatCount)
+				if state.Phase != lib.PhaseEmergency {
+					state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
 					state.PhaseStartedAt = now
 				}
-				state.Phase = lib.PhaseOverheat
+				state.Phase = lib.PhaseEmergency
 				state.HoldReason = ""
 				if firmwareOverheat {
 					state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonFirmwareOverheat)
@@ -300,13 +299,16 @@ func (minerController *controller) enforceMinerSafety(
 					state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonFirmwareTrip)
 				}
 			} else {
-				state.Phase = lib.PhaseOverheat
+				if state.Phase != lib.PhaseEmergency {
+					state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
+					state.PhaseStartedAt = now
+				}
+				state.Phase = lib.PhaseEmergency
 				state.HoldReason = ""
-				state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
-				state.OverheatCount = incrementOverheatCount(state.OverheatCount)
+				state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(assessment.failure))
 			}
 			state.UnreadablePollCount = 0
-			// A fresh or continuing OVERHEAT episode never carries a COOLDOWN dwell count forward:
+			// A fresh or continuing EMERGENCY episode never carries a COOLDOWN dwell count forward:
 			// RecoveryHealthyCount only advances while Phase is COOLDOWN, so any nonzero value here
 			// belongs to a dwell this new emergency has already invalidated, not to this episode.
 			state.RecoveryHealthyCount = 0
@@ -354,14 +356,14 @@ func (minerController *controller) enforceMinerSafety(
 		return true, nil
 	}
 	if assessment.action == safetyNormal &&
-		(state.PendingKind == lib.MutationSafetyRollback || state.PendingKind == lib.MutationOverheatRecovery) {
+		(state.PendingKind == lib.MutationSafetyRollback || state.PendingKind == lib.MutationFirmwareRecovery) {
 		if _, unfinished, err := minerController.states.UnfinishedMutationAttempt(state.MacAddr); err != nil {
 			return true, fmt.Errorf("preserve neutral safety mutation: %w", err)
 		} else if unfinished {
 			return true, nil
 		}
 	}
-	if state.Phase == lib.PhaseOverheat ||
+	if state.Phase == lib.PhaseEmergency ||
 		assessment.action == safetyHostContainment ||
 		assessment.action == safetyFirmwareRecovery ||
 		assessment.action == safetyEmergencyHold {
@@ -443,13 +445,13 @@ func (minerController *controller) recordUnreadablePoll(
 	state.ClearPendingMutation()
 	state.SetFallbackPoint(lib.OperatingPoint{})
 	state.SettledAt = time.Time{}
-	if state.Phase != lib.PhaseOverheat {
-		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
+	if state.Phase != lib.PhaseEmergency {
+		state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
 		state.PhaseStartedAt = now
 	}
-	state.Phase = lib.PhaseOverheat
+	state.Phase = lib.PhaseEmergency
 	state.HoldReason = ""
-	state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonMutationUncertain)
+	state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonTelemetryUnavailable)
 	state.UnreadablePollCount = 0
 	// See the matching reset in enforceMinerSafety: a dwell count from a prior COOLDOWN belongs to
 	// that episode, not this new escalation.
@@ -475,10 +477,9 @@ func (minerController *controller) recordUnreadablePoll(
 	return nil
 }
 
-// controlMinerAfterSafety implements the per-poll evidence-epoch lifecycle. Ordering: live-point
-// reconciliation, then phase/recovery handling, then the epoch lifecycle. Commit 5 (not in this
-// commit's scope) moves reconciliation after phase handling; this commit keeps today's existing
-// order, adapted to the epoch machinery.
+// controlMinerAfterSafety implements the per-poll evidence-epoch lifecycle. Safety-owned phases
+// and pending authority are handled before live-point drift; ordinary reconciliation then precedes
+// the shared evidence-epoch lifecycle.
 func (minerController *controller) controlMinerAfterSafety(
 	ctx context.Context,
 	state *lib.MinerState,
@@ -542,7 +543,7 @@ func (minerController *controller) controlMinerAfterSafety(
 	if state.PendingKind != "" || state.MiningPending {
 		return nil
 	}
-	if state.Phase == lib.PhaseOverheat {
+	if state.Phase == lib.PhaseEmergency {
 		return nil
 	}
 	// COOLDOWN's exit predicate is a durable count of consecutive polls proving safeToRecover holds
@@ -649,15 +650,20 @@ func (minerController *controller) controlMinerAfterSafety(
 		progress.ObserveSample(missedSincePrevious)
 		return minerController.advanceEpoch(state, epoch, progress, now)
 	}
-	// Startup must be able to accumulate ramp proof while the fleet gate is closed, but baseline
-	// and trial evaluation can reserve a normal hardware mutation. Pause those windows after ramp
-	// until the coordinator authorizes normal work. Safety validation, hold validation, and
-	// starvation probation never create a frontier mutation and continue independently.
-	if !allowOptimization && (epoch.Purpose == lib.EpochBaseline || epoch.Purpose == lib.EpochTrial) {
-		// The paused interval is coordinator policy, not missing telemetry inside an evaluation
-		// window. Drop only the in-memory partial window so resumption starts with a clean gap budget.
-		minerController.resetRuntime(state.MacAddr)
-		return nil
+	// The fleet gate blocks normal mutation authority, not evidence itself. A baseline may durably
+	// close its first of two windows while another miner owns emergency recovery; it pauses before
+	// the second window whose completion can admit a candidate. Trials pause immediately because
+	// even their first window may trigger an early return mutation. Safety and hold evidence never
+	// creates frontier authority and remains independent of this gate.
+	if !allowOptimization {
+		pause := epoch.Purpose == lib.EpochTrial ||
+			epoch.Purpose == lib.EpochBaseline && epoch.Progress.ClosedWindows()+1 >= epoch.RequiredWindows
+		if pause {
+			// The paused interval is coordinator policy, not missing telemetry inside an evaluation
+			// window. Drop only the in-memory partial window so resumption starts with a clean gap budget.
+			minerController.resetRuntime(state.MacAddr)
+			return nil
+		}
 	}
 
 	window, closedWindow := minerController.addSample(poll, *state, settings, now)
@@ -776,7 +782,7 @@ func (minerController *controller) observeExternalPoint(
 	if !validLivePoint(livePoint) || livePoint.Frequency == 50 {
 		return fmt.Errorf("%s reported invalid external operating point %d MHz/%d mV", state.Hostname, livePoint.Frequency, livePoint.CoreVoltage)
 	}
-	if state.Phase == lib.PhaseOverheat || state.Phase == lib.PhaseCooldown ||
+	if state.Phase == lib.PhaseEmergency || state.Phase == lib.PhaseCooldown ||
 		state.SafetyReason != "" || state.PendingKind != "" {
 		return nil
 	}
@@ -850,7 +856,7 @@ func (minerController *controller) observeExternalPoint(
 // This does NOT, by itself, cover mineira's actual scenario. observeExternalPoint's own guard
 // refuses to run at all while SafetyReason is non-empty, and every automated safety-recovery
 // completion path (deriveCompletedMutationState, backing MutationSafetyRollback and
-// MutationOverheatRecovery) leaves SafetyReason set while the mutation itself resolves. SafetyReason
+// MutationFirmwareRecovery) leaves SafetyReason set while the mutation itself resolves. SafetyReason
 // does now clear automatically — controlMinerAfterSafety's COOLDOWN recovery predicate
 // (recoveryHealthyPolls) clears it once the device proves itself safe for enough consecutive polls
 // — but that happens in COOLDOWN's own handling, upstream of and independent from this lookup;
@@ -1337,7 +1343,7 @@ func (minerController *controller) requestOperatingPoint(
 	if !validLivePoint(target) || target.Frequency == 50 {
 		return fmt.Errorf("request operating point for %s: invalid target %d MHz/%d mV", state.Hostname, target.Frequency, target.CoreVoltage)
 	}
-	if kind != lib.MutationOperatingPoint && kind != lib.MutationSafetyRollback && kind != lib.MutationOverheatRecovery {
+	if kind != lib.MutationOperatingPoint && kind != lib.MutationSafetyRollback && kind != lib.MutationFirmwareRecovery {
 		return fmt.Errorf("request operating point for %s: invalid mutation kind %q", state.Hostname, kind)
 	}
 	state.SetPendingMutation(kind, target, now)
@@ -1496,21 +1502,78 @@ func (minerController *controller) bestRollbackPoint(
 	if err != nil {
 		return lib.OperatingPoint{}, err
 	}
-	best := lib.OperatingPoint{}
-	bestHash := -1.0
+	if target, found := selectRollbackPoint(records, failedPoint, asic, settings); found {
+		return target, nil
+	}
+	return minimumAdvertisedPoint(asic)
+}
+
+// selectRollbackPoint chooses the closest already-validated complete pair
+// with full thermal, VR, power, and quality headroom. A point lowering both
+// components is preferred whenever one exists; no unmeasured adjacent pair is
+// ever promoted into safety authority.
+func selectRollbackPoint(
+	records []lib.OperatingPointRecord,
+	failedPoint lib.OperatingPoint,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+) (lib.OperatingPoint, bool) {
+	type candidate struct {
+		record     lib.OperatingPointRecord
+		steps      int
+		lowersBoth bool
+	}
+	var selected candidate
+	found := false
 	for _, record := range records {
 		if !rollbackRecordEligible(record, failedPoint, asic, settings) {
 			continue
 		}
-		if record.MedianHash > bestHash || (record.MedianHash == bestHash && record.P95Temp < pointTemperature(records, best)) {
-			best = record.Point()
-			bestHash = record.MedianHash
+		point := record.Point()
+		current := candidate{
+			record: record,
+			steps: optionStepDistance(asic.FrequencyOptions, failedPoint.Frequency, point.Frequency) +
+				optionStepDistance(asic.VoltageOptions, failedPoint.CoreVoltage, point.CoreVoltage),
+			lowersBoth: point.Frequency < failedPoint.Frequency && point.CoreVoltage < failedPoint.CoreVoltage,
+		}
+		if !found || rollbackCandidateCloser(current, selected) {
+			selected = current
+			found = true
 		}
 	}
-	if validLivePoint(best) {
-		return best, nil
+	if !found {
+		return lib.OperatingPoint{}, false
 	}
-	return minimumAdvertisedPoint(asic)
+	return selected.record.Point(), true
+}
+
+func optionStepDistance(options []int, from, to int) int {
+	fromIndex := sort.Search(len(options), func(index int) bool { return options[index] > from }) - 1
+	toIndex := sort.SearchInts(options, to)
+	return max(0, fromIndex-toIndex)
+}
+
+func rollbackCandidateCloser(left, right struct {
+	record     lib.OperatingPointRecord
+	steps      int
+	lowersBoth bool
+}) bool {
+	leftPoint := left.record.Point()
+	rightPoint := right.record.Point()
+	switch {
+	case left.lowersBoth != right.lowersBoth:
+		return left.lowersBoth
+	case left.steps != right.steps:
+		return left.steps < right.steps
+	case leftPoint.Frequency != rightPoint.Frequency:
+		return leftPoint.Frequency > rightPoint.Frequency
+	case leftPoint.CoreVoltage != rightPoint.CoreVoltage:
+		return leftPoint.CoreVoltage > rightPoint.CoreVoltage
+	case left.record.MedianHash != right.record.MedianHash:
+		return left.record.MedianHash > right.record.MedianHash
+	default:
+		return left.record.P95Temp < right.record.P95Temp
+	}
 }
 
 func (minerController *controller) handleEmergency(
@@ -1541,11 +1604,11 @@ func (minerController *controller) handleEmergency(
 	}
 	result, err := minerController.states.Apply(lib.SafetyTransition{Expected: expected, State: *state, Record: safetyRecord}, now)
 	if err != nil {
-		return fmt.Errorf("persist overheat episode for %s: %w", state.Hostname, err)
+		return fmt.Errorf("persist emergency episode for %s: %w", state.Hostname, err)
 	}
 	*state = result.State
 	if event == "started" {
-		minerController.logf("OVERHEAT episode started on %s; preserving optimizer history", state.Hostname)
+		minerController.logf("EMERGENCY episode started on %s; preserving optimizer history", state.Hostname)
 	}
 	return nil
 }
@@ -1554,9 +1617,9 @@ func (minerController *controller) handleEmergency(
 // does not touch a durable cooldown-expiry clock — that column and the wall-clock cooldown
 // (overheatCooldown/Settings.OverheatCooldownMins) it fed were both deleted; COOLDOWN's exit is a
 // durable count of consecutive healthy polls instead (see recoveryHealthyPolls in
-// controlMinerAfterSafety). Live firmware evidence and agreement between the live and durable exact
-// minimum decide whether hardware work still exists; SafetyReason retains the strongest observed
-// cause but cannot manufacture a redundant same-pair rollback. OverheatCount still increments here
+// controlMinerAfterSafety). Stable live firmware evidence decides whether the reduced pair can be
+// adopted directly or must be normalized downward onto the advertised grid; SafetyReason retains
+// the strongest observed cause but cannot manufacture a redundant same-pair rollback. EmergencyCount still increments here
 // — it remains a durable diagnostic — but nothing computes or stores a cooldown duration from it.
 func transitionEmergencyState(
 	state *lib.MinerState,
@@ -1570,10 +1633,10 @@ func transitionEmergencyState(
 	if err != nil {
 		return "", err
 	}
-	newEpisode := state.Phase != lib.PhaseOverheat
+	newEpisode := state.Phase != lib.PhaseEmergency
 	if newEpisode {
-		state.OverheatCount = incrementOverheatCount(state.OverheatCount)
-		state.Phase = lib.PhaseOverheat
+		state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
+		state.Phase = lib.PhaseEmergency
 		state.PhaseStartedAt = now
 		state.HoldReason = ""
 		state.SettledAt = time.Time{}
@@ -1583,23 +1646,77 @@ func transitionEmergencyState(
 		state.RecoveryHealthyCount = 0
 	}
 	priorReason := state.SafetyReason
-	reason := reasonForSafetyFailure(assessment.failure)
-	state.SafetyReason = escalateSafetyReason(state.SafetyReason, reason)
+	if assessment.failure.reason != "" || assessment.failure.status != "" {
+		state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(assessment.failure))
+	}
 	live := operatingPointFromInfo(info)
-	firmware := info.OverHeatMode != 0 || live.Frequency == 50 || assessment.action == safetyFirmwareRecovery
+	firmwareActive := info.OverHeatMode != 0 || live.Frequency == 50 || assessment.action == safetyFirmwareRecovery
 	recovered := safeToRecover(info, settings)
-	setPending := func(kind lib.MutationKind) {
+	setPending := func(kind lib.MutationKind, target lib.OperatingPoint) {
 		// Re-observing the same disposition is not a new authority. Keeping PendingSince stable lets
 		// the mutation attempt and the pending state remain one identity across ordinary poll ticks.
-		if state.PendingKind == kind && state.PendingPoint() == minimum && priorReason == state.SafetyReason {
+		if state.PendingKind == kind && state.PendingPoint() == target && priorReason == state.SafetyReason {
 			return
 		}
-		state.SetPendingMutation(kind, minimum, now)
+		state.SetPendingMutation(kind, target, now)
+	}
+	confirmLive := func() bool {
+		if state.CurrentPoint() == live {
+			state.ObservedFrequency = 0
+			state.ObservedCoreVoltage = 0
+			state.ObservedCount = 0
+			return true
+		}
+		if state.ObservedFrequency == live.Frequency && state.ObservedCoreVoltage == live.CoreVoltage {
+			state.ObservedCount++
+		} else {
+			state.ObservedFrequency = live.Frequency
+			state.ObservedCoreVoltage = live.CoreVoltage
+			state.ObservedCount = 1
+		}
+		if state.ObservedCount < manualConfirmationPolls {
+			return false
+		}
+		state.SetCurrentPoint(live)
+		state.ObservedFrequency = 0
+		state.ObservedCoreVoltage = 0
+		state.ObservedCount = 0
+		return true
 	}
 	switch {
-	case firmware:
-		if recovered {
-			setPending(lib.MutationOverheatRecovery)
+	case firmwareActive:
+		// AxeOS owns its powered-down cooling loop and paired reduction. Host-side PATCH/restart while
+		// that loop is active would race firmware NVS writes, so observation is the only legal action.
+		state.ClearPendingMutation()
+		state.ObservedFrequency = 0
+		state.ObservedCoreVoltage = 0
+		state.ObservedCount = 0
+	case state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
+		if !validLivePoint(live) || !completeSafetyTelemetry(info) || hasPowerFault(info) ||
+			assessInstantaneousSafety(info, settings, live, minimum).action != safetyNormal || !confirmLive() {
+			state.ClearPendingMutation()
+			break
+		}
+		target, targetErr := firmwareRecoveryTarget(asic, live)
+		if targetErr != nil {
+			return "", targetErr
+		}
+		if target == live {
+			state.ClearPendingMutation()
+			state.Phase = lib.PhaseCooldown
+			state.PhaseStartedAt = now
+		} else if recovered {
+			setPending(lib.MutationFirmwareRecovery, target)
+		} else {
+			state.ClearPendingMutation()
+		}
+	case state.SafetyReason == lib.SafetyReasonTelemetryUnavailable && assessment.action == safetyNormal:
+		// Verification uncertainty never authorizes containment. Once two complete safe reads agree
+		// on an advertised pair, adopt the fact and let the ordinary recovery proof rebaseline it.
+		if operatingPointAdvertised(asic, live) && confirmLive() {
+			state.ClearPendingMutation()
+			state.Phase = lib.PhaseCooldown
+			state.PhaseStartedAt = now
 		} else {
 			state.ClearPendingMutation()
 		}
@@ -1612,13 +1729,11 @@ func transitionEmergencyState(
 	case knownFirmwareTripExceeded(info):
 		state.ClearPendingMutation()
 	case assessment.action == safetyHostContainment || assessment.action == safetyRollback:
-		setPending(lib.MutationSafetyRollback)
+		setPending(lib.MutationSafetyRollback, minimum)
 	case !recovered:
 		state.ClearPendingMutation()
-	case state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
-		setPending(lib.MutationOverheatRecovery)
 	default:
-		setPending(lib.MutationSafetyRollback)
+		setPending(lib.MutationSafetyRollback, minimum)
 	}
 	return map[bool]string{true: "started", false: ""}[newEpisode], nil
 }
@@ -1774,17 +1889,24 @@ func (minerController *controller) resetRuntime(macAddr string) {
 }
 
 func (minerController *controller) formatWindow(state lib.MinerState, settings lib.Settings, now time.Time) string {
-	if state.Phase == lib.PhaseOverheat {
-		switch state.PendingKind {
-		case lib.MutationSafetyRollback:
-			return fmt.Sprintf("contain %s %s", formatOperatingPoint(state.PendingPoint()), formatStateAge(state.PendingSince, now))
-		case lib.MutationOverheatRecovery:
-			return fmt.Sprintf("wait cool %s", formatStateAge(state.PhaseStartedAt, now))
+	if state.Phase == lib.PhaseEmergency {
+		switch {
+		case state.PendingKind == lib.MutationSafetyRollback:
+			return fmt.Sprintf("minimum %s %s", formatOperatingPoint(state.PendingPoint()), formatStateAge(state.PendingSince, now))
+		case state.PendingKind == lib.MutationFirmwareRecovery:
+			return fmt.Sprintf("normalize %s %s", formatOperatingPoint(state.PendingPoint()), formatStateAge(state.PendingSince, now))
+		case state.SafetyReason == lib.SafetyReasonTelemetryUnavailable:
+			return fmt.Sprintf("verify %s", formatStateAge(state.PhaseStartedAt, now))
+		case state.SafetyReason == lib.SafetyReasonFirmwareOverheat:
+			return fmt.Sprintf("firmware cool %s", formatStateAge(state.PhaseStartedAt, now))
 		default:
-			return fmt.Sprintf("wait cool %s", formatStateAge(state.PhaseStartedAt, now))
+			return fmt.Sprintf("contain %s", formatStateAge(state.PhaseStartedAt, now))
 		}
 	}
 	if state.PendingKind != "" {
+		if state.PendingKind == lib.MutationSafetyRollback {
+			return fmt.Sprintf("backoff %s %s", formatOperatingPoint(state.PendingPoint()), formatStateAge(state.PendingSince, now))
+		}
 		return fmt.Sprintf("%s %s", formatOperatingPoint(state.PendingPoint()), formatStateAge(state.PendingSince, now))
 	}
 	if state.MiningPending {
@@ -1806,6 +1928,9 @@ func (minerController *controller) formatWindow(state lib.MinerState, settings l
 		count = len(runtime.samples)
 	}
 	minerController.runtimeMu.Unlock()
+	if epoch.Progress.ClosedWindows() > 0 {
+		return fmt.Sprintf("%d/%d %d/%d", epoch.Progress.ClosedWindows(), epoch.RequiredWindows, count, targetSampleCount(settings))
+	}
 	return fmt.Sprintf("%d/%d", count, targetSampleCount(settings))
 }
 
@@ -2110,7 +2235,7 @@ func targetSampleCount(settings lib.Settings) int {
 }
 
 // logRecoveryInstrumentation logs safeToRecover transitions and temperature slope on every poll
-// while a miner is in COOLDOWN or OVERHEAT, purely for operator visibility; it influences no
+// while a miner is in COOLDOWN or EMERGENCY, purely for operator visibility; it influences no
 // decision and duplicates none of controlMinerAfterSafety's own recoveryHealthyPolls bookkeeping —
 // that durable counter is the actual recovery predicate, this is only a human-readable log of the
 // same safeToRecover signal it consults. It is credential-free: only a hostname, a phase name, a
@@ -2121,7 +2246,7 @@ func (minerController *controller) logRecoveryInstrumentation(
 	settings lib.Settings,
 	now time.Time,
 ) {
-	if state.Phase != lib.PhaseCooldown && state.Phase != lib.PhaseOverheat {
+	if state.Phase != lib.PhaseCooldown && state.Phase != lib.PhaseEmergency {
 		return
 	}
 	if !finitePositive(info.Temp) {
@@ -2167,7 +2292,7 @@ func knownFirmwareTripExceeded(info lib.Info) bool {
 	return info.Temp > axeOSASICTripTemp || info.VRTemp > axeOSVRTripTemp
 }
 
-func incrementOverheatCount(count int) int {
+func incrementEmergencyCount(count int) int {
 	const maximum = 1_000_000
 	if count < 0 {
 		return 1
@@ -2180,7 +2305,7 @@ func incrementOverheatCount(count int) int {
 
 func reasonForSafetyFailure(failure safetyFailure) lib.SafetyReason {
 	if strings.Contains(failure.reason, "uncertain") {
-		return lib.SafetyReasonMutationUncertain
+		return lib.SafetyReasonTelemetryUnavailable
 	}
 	if strings.Contains(failure.reason, "firmware overheat") {
 		return lib.SafetyReasonFirmwareOverheat
@@ -2199,13 +2324,13 @@ func reasonForSafetyFailure(failure safetyFailure) lib.SafetyReason {
 	case string(lib.PointVRHot):
 		return lib.SafetyReasonVRLimit
 	default:
-		return lib.SafetyReasonMutationUncertain
+		return lib.SafetyReasonTelemetryUnavailable
 	}
 }
 
 func safetyReasonRank(reason lib.SafetyReason) int {
 	switch reason {
-	case lib.SafetyReasonMutationUncertain:
+	case lib.SafetyReasonTelemetryUnavailable:
 		return 1
 	case lib.SafetyReasonASICLimit, lib.SafetyReasonPowerLimit, lib.SafetyReasonVRLimit:
 		return 2
@@ -2308,13 +2433,6 @@ func betterTie(left, right lib.OperatingPointRecord) bool {
 		}
 	}
 	return false
-}
-
-func pointTemperature(records []lib.OperatingPointRecord, point lib.OperatingPoint) float64 {
-	if record, ok := findRecord(records, point); ok {
-		return record.P95Temp
-	}
-	return math.MaxFloat64
 }
 
 func maxTime(left, right time.Time) time.Time {

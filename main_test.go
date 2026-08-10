@@ -104,6 +104,43 @@ func TestCanonicalFrontierHasExactStructuralRestartBound(t *testing.T) {
 	}
 }
 
+func TestSafetyRenderingDistinguishesFirmwareContainmentAndVerification(t *testing.T) {
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	settings := rootTestSettings(t)
+	controller := &controller{}
+	state := lib.MinerState{Phase: lib.PhaseEmergency, PhaseStartedAt: now.Add(-time.Minute)}
+	info := rootTestInfo(lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}, 100)
+	tests := []struct {
+		name       string
+		reason     lib.SafetyReason
+		pending    lib.MutationKind
+		phase      lib.OptimizerPhase
+		wantState  string
+		wantWindow string
+	}{
+		{name: "firmware", reason: lib.SafetyReasonFirmwareOverheat, phase: lib.PhaseEmergency, wantState: "AXEOS", wantWindow: "firmware cool"},
+		{name: "containment", reason: lib.SafetyReasonHostCutoff, pending: lib.MutationSafetyRollback, phase: lib.PhaseEmergency, wantState: "CONTAIN", wantWindow: "minimum"},
+		{name: "verification", reason: lib.SafetyReasonTelemetryUnavailable, phase: lib.PhaseEmergency, wantState: "VERIFY", wantWindow: "verify"},
+		{name: "ordinary backoff", reason: lib.SafetyReasonASICLimit, pending: lib.MutationSafetyRollback, phase: lib.PhaseCooldown, wantState: "BACKOFF", wantWindow: "backoff"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			current := state
+			current.Phase = testCase.phase
+			current.SafetyReason = testCase.reason
+			if testCase.pending != "" {
+				current.SetPendingMutation(testCase.pending, lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}, now)
+			}
+			if got := formatState(current, info, now); !strings.Contains(got, testCase.wantState) {
+				t.Fatalf("state label = %q, want %q", got, testCase.wantState)
+			}
+			if got := controller.formatWindow(current, settings, now); !strings.Contains(got, testCase.wantWindow) {
+				t.Fatalf("window label = %q, want %q", got, testCase.wantWindow)
+			}
+		})
+	}
+}
+
 func TestSafetyThresholdsRemainDistinct(t *testing.T) {
 	settings := rootTestSettings(t)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
@@ -137,6 +174,21 @@ func TestSafetyThresholdsRemainDistinct(t *testing.T) {
 	}
 }
 
+func TestRollbackSelectsClosestValidatedPairThatLowersBothComponents(t *testing.T) {
+	settings := rootTestSettings(t)
+	failed := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1200}
+	records := []lib.OperatingPointRecord{
+		rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 625, CoreVoltage: 1150}, 130, 55, 18, 70),
+		rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 600, CoreVoltage: 1150}, 80, 55, 18, 70),
+		rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 550, CoreVoltage: 1100}, 140, 55, 18, 70),
+	}
+	want := lib.OperatingPoint{Frequency: 600, CoreVoltage: 1150}
+	got, found := selectRollbackPoint(records, failed, rootTestASIC(), settings)
+	if !found || got != want {
+		t.Fatalf("rollback target = %+v found:%t, want %+v", got, found, want)
+	}
+}
+
 func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 	settings := rootTestSettings(t)
 	asic := rootTestASIC()
@@ -152,6 +204,7 @@ func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 		live             lib.OperatingPoint
 		pending          lib.MutationKind
 		pendingSince     time.Time
+		polls            int
 		configure        func(*lib.Info)
 		wantPhase        lib.OptimizerPhase
 		wantReason       lib.SafetyReason
@@ -162,13 +215,12 @@ func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 		{
 			name: "firmware owns powered-down cooling", current: aboveMinimum, live: lib.OperatingPoint{Frequency: 50, CoreVoltage: 1000},
 			configure: func(info *lib.Info) { info.OverHeatMode, info.Temp, info.HashRate = 1, -1, 0 },
-			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
+			wantPhase: lib.PhaseEmergency, wantReason: lib.SafetyReasonFirmwareOverheat,
 		},
 		{
-			name: "safe firmware marker authorizes recovery", current: aboveMinimum, live: aboveMinimum,
+			name: "active firmware marker remains firmware-owned", current: aboveMinimum, live: aboveMinimum,
 			configure: func(info *lib.Info) { info.OverHeatMode = 1 },
-			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
-			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+			wantPhase: lib.PhaseEmergency, wantReason: lib.SafetyReasonFirmwareOverheat,
 		},
 		{
 			name: "firmware episode already canonical", reason: lib.SafetyReasonFirmwareOverheat,
@@ -176,35 +228,39 @@ func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 			wantReason: lib.SafetyReasonFirmwareOverheat,
 		},
 		{
-			name: "production uncertain state already canonical", reason: lib.SafetyReasonMutationUncertain,
+			name: "production uncertain state already canonical", reason: lib.SafetyReasonTelemetryUnavailable,
 			current: minimum, live: minimum, wantPhase: lib.PhaseCooldown,
-			wantReason: lib.SafetyReasonMutationUncertain,
+			wantReason: lib.SafetyReasonTelemetryUnavailable,
 		},
 		{
 			name: "firmware changed point behind durable state", reason: lib.SafetyReasonFirmwareOverheat,
-			current: aboveMinimum, live: minimum, wantPhase: lib.PhaseOverheat,
-			wantReason:  lib.SafetyReasonFirmwareOverheat,
-			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+			current: aboveMinimum, live: minimum, polls: 2, wantPhase: lib.PhaseCooldown,
+			wantReason: lib.SafetyReasonFirmwareOverheat,
 		},
 		{
-			name: "unsafe exact minimum is mutation free", reason: lib.SafetyReasonMutationUncertain,
+			name: "firmware reduction below grid normalizes to minimum", reason: lib.SafetyReasonFirmwareOverheat,
+			current:   lib.OperatingPoint{Frequency: 390, CoreVoltage: 900},
+			live:      lib.OperatingPoint{Frequency: 390, CoreVoltage: 900},
+			wantPhase: lib.PhaseEmergency, wantReason: lib.SafetyReasonFirmwareOverheat,
+			wantPending: lib.MutationFirmwareRecovery, wantPendingSince: now,
+		},
+		{
+			name: "unsafe exact minimum is mutation free", reason: lib.SafetyReasonTelemetryUnavailable,
 			current: minimum, live: minimum,
 			configure: func(info *lib.Info) { info.Temp = settings.TempCutoff },
-			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonHostCutoff,
+			wantPhase: lib.PhaseEmergency, wantReason: lib.SafetyReasonHostCutoff,
 		},
 		{
-			name: "unchanged rollback keeps authority identity", reason: lib.SafetyReasonMutationUncertain,
+			name: "safe verified point retires false containment authority", reason: lib.SafetyReasonTelemetryUnavailable,
 			current: aboveMinimum, live: aboveMinimum, pending: lib.MutationSafetyRollback,
-			pendingSince: priorPending, wantPhase: lib.PhaseOverheat,
-			wantReason:  lib.SafetyReasonMutationUncertain,
-			wantPending: lib.MutationSafetyRollback, wantPendingSince: priorPending,
+			pendingSince: priorPending, wantPhase: lib.PhaseCooldown,
+			wantReason: lib.SafetyReasonTelemetryUnavailable,
 		},
 		{
-			name: "firmware fact supersedes rollback", reason: lib.SafetyReasonMutationUncertain,
+			name: "firmware fact supersedes rollback", reason: lib.SafetyReasonTelemetryUnavailable,
 			current: aboveMinimum, live: aboveMinimum, pending: lib.MutationSafetyRollback,
 			pendingSince: priorPending, configure: func(info *lib.Info) { info.OverHeatMode = 1 },
-			wantPhase: lib.PhaseOverheat, wantReason: lib.SafetyReasonFirmwareOverheat,
-			wantPending: lib.MutationOverheatRecovery, wantPendingSince: now,
+			wantPhase: lib.PhaseEmergency, wantReason: lib.SafetyReasonFirmwareOverheat,
 		},
 	}
 	for _, reason := range []lib.SafetyReason{
@@ -223,8 +279,8 @@ func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			state := lib.MinerState{
-				MacAddr: rootTestMAC, Hostname: "root-test", Phase: lib.PhaseOverheat,
-				PhaseStartedAt: now.Add(-time.Hour), SafetyReason: testCase.reason, OverheatCount: 1,
+				MacAddr: rootTestMAC, Hostname: "root-test", Phase: lib.PhaseEmergency,
+				PhaseStartedAt: now.Add(-time.Hour), SafetyReason: testCase.reason, EmergencyCount: 1,
 			}
 			state.SetCurrentPoint(testCase.current)
 			if testCase.pending != "" {
@@ -234,9 +290,12 @@ func TestEmergencyDispositionUsesLiveAndDurableRecoveryAuthority(t *testing.T) {
 			if testCase.configure != nil {
 				testCase.configure(&info)
 			}
-			assessment := assessInstantaneousSafety(info, settings, testCase.live, minimum)
-			if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment); err != nil {
-				t.Fatal(err)
+			polls := max(1, testCase.polls)
+			for poll := 0; poll < polls; poll++ {
+				assessment := assessInstantaneousSafety(info, settings, testCase.live, minimum)
+				if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if state.Phase != testCase.wantPhase || state.SafetyReason != testCase.wantReason ||
 				state.PendingKind != testCase.wantPending || !state.PendingSince.Equal(testCase.wantPendingSince) {
@@ -703,7 +762,7 @@ func TestWindowClosesOnTargetSampleCountAtHealthyRate(t *testing.T) {
 	}
 }
 
-func TestFleetGatePausesFrontierDecisionAfterRamp(t *testing.T) {
+func TestFleetGatePreservesOneBaselineWindowBeforeFrontierDecision(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -730,9 +789,12 @@ func TestFleetGatePausesFrontierDecisionAfterRamp(t *testing.T) {
 		}
 	}
 	epoch := mustOpenEpoch(t, store, rootTestMAC)
-	if epoch.Progress.SettledSamples() < rampSamples(settings) || epoch.Progress.ClosedWindows() != 0 ||
+	if epoch.Progress.SettledSamples() < rampSamples(settings) || epoch.Progress.ClosedWindows() != 1 ||
 		state.PendingKind != "" {
-		t.Fatalf("closed fleet gate advanced frontier: state=%+v epoch=%+v", state, epoch)
+		t.Fatalf("closed fleet gate crossed its evidence boundary: state=%+v epoch=%+v", state, epoch)
+	}
+	if window := minerController.formatWindow(state, settings, at); !strings.HasPrefix(window, "1/2 ") {
+		t.Fatalf("paused baseline window = %q", window)
 	}
 	for index := 0; index < 2*targetSampleCount(settings); index++ {
 		at = at.Add(settings.MetricsTime)
@@ -1360,7 +1422,7 @@ func (device *scriptedMutationDevice) PatchOperatingPoint(context.Context, lib.O
 	return nil
 }
 
-func (device *scriptedMutationDevice) PatchOverheatRecovery(context.Context, lib.OperatingPoint, string) error {
+func (device *scriptedMutationDevice) PatchFirmwareRecovery(context.Context, lib.OperatingPoint, string) error {
 	return device.PatchOperatingPoint(context.Background(), lib.OperatingPoint{}, "")
 }
 
@@ -1493,7 +1555,7 @@ func TestReopenedConfiguredStageUsesItsOwnDeadline(t *testing.T) {
 	}
 }
 
-func TestReopenedPatchStageOwnsConfiguredReadbackDeadline(t *testing.T) {
+func TestReopenedConfiguredStageGetsFreshWorkerDeadline(t *testing.T) {
 	startedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	device := &scriptedMutationDevice{
@@ -1505,22 +1567,17 @@ func TestReopenedPatchStageOwnsConfiguredReadbackDeadline(t *testing.T) {
 		device, nil, lib.SettingsFile{}, nil, nil, "", nil, nil,
 		log.New(io.Discard, "", 0), nil,
 	)
-	coordinator.now = func() time.Time { return startedAt.Add(defaultRebootDeadline) }
-	result := coordinator.execute(context.Background(), mutationRequest{
+	workerStartedAt := startedAt.Add(10 * defaultRebootDeadline)
+	coordinator.now = func() time.Time { return workerStartedAt }
+	info, unsafe, err := coordinator.waitForConfiguredReadback(context.Background(), mutationRequest{
 		macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
-		point: target, settings: rootTestSettings(t), attempt: lib.MutationAttempt{
-			MacAddr: rootTestMAC, Kind: lib.MutationOperatingPoint,
-			FromFrequency: 525, FromCoreVoltage: 1150,
-			TargetFrequency: 525, TargetCoreVoltage: 1100,
-			IntentCreatedAt: startedAt, StartedAt: startedAt,
-			PatchRequestedAt: startedAt, ConfiguredVerifiedUptimeSeconds: -1,
-		},
+		point: target, settings: rootTestSettings(t),
 	})
-	if result.err == nil || result.failureStage != lib.MutationFailureConfiguredVerification {
-		t.Fatalf("expired configured stage result = %+v", result)
+	if err != nil || unsafe || operatingPointFromInfo(info) != target {
+		t.Fatalf("fresh configured worker = info:%+v unsafe:%t err:%v", info, unsafe, err)
 	}
-	if device.asicCalls != 0 || device.infoCalls != 0 {
-		t.Fatalf("expired configured stage re-ran preflight: ASIC=%d info=%d", device.asicCalls, device.infoCalls)
+	if device.infoCalls != 1 {
+		t.Fatalf("configured worker info calls = %d", device.infoCalls)
 	}
 }
 
@@ -1534,22 +1591,21 @@ func TestConfiguredReadbackAfterDeadlineIsNotAccepted(t *testing.T) {
 		devices: device,
 		now: func() time.Time {
 			nowCalls++
-			if nowCalls == 1 {
+			if nowCalls <= 2 {
 				return startedAt
 			}
 			return startedAt.Add(defaultRebootDeadline)
 		},
 	}
-	info, terminal, err := coordinator.waitForConfiguredReadback(
+	info, unsafe, err := coordinator.waitForConfiguredReadback(
 		context.Background(),
 		mutationRequest{
 			macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
 			point: target, settings: settings,
 		},
-		startedAt,
 	)
-	if err == nil || !terminal || info.MacAddr != rootTestMAC {
-		t.Fatalf("late configured readback = info:%+v terminal:%t err:%v", info, terminal, err)
+	if err == nil || unsafe || info.MacAddr != rootTestMAC {
+		t.Fatalf("late configured readback = info:%+v unsafe:%t err:%v", info, unsafe, err)
 	}
 }
 
@@ -1575,16 +1631,16 @@ func TestVerifiedBootAfterDeadlineIsNotAccepted(t *testing.T) {
 			return restartAt.Add(defaultRebootDeadline)
 		},
 	}
-	miner, _, err := coordinator.waitForVerifiedBoot(
+	readback, err := coordinator.waitForVerifiedBoot(
 		context.Background(),
 		mutationRequest{
 			macAddr: rootTestMAC, ip: "192.0.2.12", kind: lib.MutationOperatingPoint,
 			point: target, settings: settings, bootProofSameProcess: true,
 		},
-		100, configuredAt, restartAt,
+		100, configuredAt,
 	)
-	if err == nil || miner.Info.MacAddr != rootTestMAC {
-		t.Fatalf("late reboot proof = miner:%+v err:%v", miner, err)
+	if err == nil || readback.miner.Info.MacAddr != rootTestMAC {
+		t.Fatalf("late reboot proof = readback:%+v err:%v", readback, err)
 	}
 }
 
@@ -1592,10 +1648,11 @@ func TestMutationReadbackDistinguishesUnavailableFromUnsafeMismatch(t *testing.T
 	settings := rootTestSettings(t)
 	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	request := mutationRequest{
-		kind: lib.MutationOperatingPoint, point: target,
+		macAddr: rootTestMAC, kind: lib.MutationOperatingPoint, point: target,
 		settings: settings,
 	}
-	if coordinator := (&mutationCoordinator{}); coordinator.readbackNeedsSafetySupersession(request, lib.Info{}, rootTestASIC()) {
+	coordinator := &mutationCoordinator{}
+	if coordinator.readbackNeedsSafetySupersession(request, lib.Info{}, rootTestASIC()) {
 		t.Fatal("empty readback was treated as readable safety evidence")
 	}
 	wrong := rootTestInfo(lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}, 100)
@@ -1607,9 +1664,170 @@ func TestMutationReadbackDistinguishesUnavailableFromUnsafeMismatch(t *testing.T
 	if err := verifyConfiguredReadback(request, unsafe); err == nil {
 		t.Fatal("unsafe configured pair was accepted")
 	}
+	if !coordinator.readbackNeedsSafetySupersession(request, unsafe, rootTestASIC()) {
+		t.Fatal("unsafe configured pair did not supersede the mutation")
+	}
+	request.kind = lib.MutationMiningConfiguration
+	if !coordinator.preflightNeedsSafetySupersession(request, unsafe, rootTestASIC()) {
+		t.Fatal("unsafe mining preflight did not supersede the mutation")
+	}
 }
 
-func TestMutationReadbackMismatchSupersedesBeforeRestart(t *testing.T) {
+func TestPostBootReadbackRetriesIncompleteTelemetry(t *testing.T) {
+	settings := rootTestSettings(t)
+	target := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	at := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	reads := 0
+	coordinator := &mutationCoordinator{
+		devices: &scriptedMutationDevice{asic: rootTestASIC()},
+		discover: func(context.Context, string) (lib.DiscoveredMiner, error) {
+			reads++
+			info := rootTestInfo(target, 1)
+			if reads == 1 {
+				info.Temp = 0
+			}
+			return lib.DiscoveredMiner{IP: "192.0.2.12", Info: info}, nil
+		},
+		rebootDeadline: time.Minute, rediscoveryDelay: time.Millisecond,
+		now: func() time.Time { return at },
+	}
+	readback, err := coordinator.waitForVerifiedBoot(context.Background(), mutationRequest{
+		macAddr: rootTestMAC, kind: lib.MutationOperatingPoint, point: target,
+		settings: settings, bootProofSameProcess: true,
+	}, 100, at.Add(-time.Second))
+	if err != nil || readback.disposition != rebootReadbackVerified || reads != 2 {
+		t.Fatalf("post-boot retry = disposition:%d reads:%d err:%v", readback.disposition, reads, err)
+	}
+}
+
+func TestPostBootReadbackClassifiesStableSafeMismatch(t *testing.T) {
+	settings := rootTestSettings(t)
+	at := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		target   lib.OperatingPoint
+		observed lib.OperatingPoint
+		want     rebootReadbackDisposition
+	}{
+		{
+			name: "AxeOS paired reduction", target: lib.OperatingPoint{Frequency: 625, CoreVoltage: 1100},
+			observed: lib.OperatingPoint{Frequency: 525, CoreVoltage: 1000}, want: rebootReadbackFirmwareReduction,
+		},
+		{
+			name: "other safe change", target: lib.OperatingPoint{Frequency: 600, CoreVoltage: 1100},
+			observed: lib.OperatingPoint{Frequency: 550, CoreVoltage: 1060}, want: rebootReadbackExternalPoint,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			reads := 0
+			coordinator := &mutationCoordinator{
+				devices: &scriptedMutationDevice{asic: rootTestASIC()},
+				discover: func(context.Context, string) (lib.DiscoveredMiner, error) {
+					reads++
+					return lib.DiscoveredMiner{IP: "192.0.2.12", Info: rootTestInfo(testCase.observed, 1)}, nil
+				},
+				rebootDeadline: time.Minute, rediscoveryDelay: time.Millisecond,
+				now: func() time.Time { return at },
+			}
+			readback, err := coordinator.waitForVerifiedBoot(context.Background(), mutationRequest{
+				macAddr: rootTestMAC, kind: lib.MutationOperatingPoint, point: testCase.target,
+				settings: settings, bootProofSameProcess: true,
+			}, 100, at.Add(-time.Second))
+			if err != nil || readback.disposition != testCase.want || reads != manualConfirmationPolls {
+				t.Fatalf("stable mismatch = disposition:%d reads:%d err:%v", readback.disposition, reads, err)
+			}
+		})
+	}
+}
+
+func TestFirmwareRecoveryTargetFloorsCompletePair(t *testing.T) {
+	asic := rootTestASIC()
+	tests := []struct {
+		name    string
+		reduced lib.OperatingPoint
+		want    lib.OperatingPoint
+	}{
+		{name: "already advertised", reduced: lib.OperatingPoint{Frequency: 525, CoreVoltage: 1000}, want: lib.OperatingPoint{Frequency: 525, CoreVoltage: 1000}},
+		{name: "component floor", reduced: lib.OperatingPoint{Frequency: 590, CoreVoltage: 1090}, want: lib.OperatingPoint{Frequency: 550, CoreVoltage: 1060}},
+		{name: "below grid", reduced: lib.OperatingPoint{Frequency: 390, CoreVoltage: 900}, want: lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := firmwareRecoveryTarget(asic, testCase.reduced)
+			if err != nil || got != testCase.want {
+				t.Fatalf("firmware recovery target = %+v, %v; want %+v", got, err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestFirmwareReductionReconcilesToCooldownAndResumesBaseline(t *testing.T) {
+	store, settings, state, now := newRootMutationStore(t)
+	state = closeInitialBaselineEpoch(t, store, state, now)
+	target := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1100}
+	reduced := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1000}
+	state.SetPendingMutation(lib.MutationOperatingPoint, target, now)
+	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
+		t.Fatal(err)
+	}
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: lib.MutationOperatingPoint,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: target.Frequency, TargetCoreVoltage: target.CoreVoltage,
+		IntentCreatedAt: now, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	attemptID, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := newMutationCoordinator(nil, store, lib.SettingsFile{}, nil, nil, "", nil, nil, log.New(io.Discard, "", 0), nil)
+	coordinator.now = func() time.Time { return now.Add(time.Minute) }
+	request := mutationRequest{
+		attemptID: attemptID, macAddr: state.MacAddr, kind: lib.MutationOperatingPoint,
+		point: target, settings: settings,
+	}
+	readback := rebootReadback{
+		miner: lib.DiscoveredMiner{IP: state.IP, Info: rootTestInfo(reduced, 1)},
+		asic:  rootTestASIC(), disposition: rebootReadbackFirmwareReduction,
+	}
+	if err := coordinator.reconcileFirmwareReduction(request, readback); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.LoadMiner(state.MacAddr)
+	if err != nil || state.Phase != lib.PhaseCooldown || state.CurrentPoint() != reduced ||
+		state.PendingKind != "" || state.SafetyReason != lib.SafetyReasonFirmwareOverheat {
+		t.Fatalf("reconciled firmware reduction = %+v, %v", state, err)
+	}
+	attempts, err := store.ListMutationAttempts(state.MacAddr)
+	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != lib.MutationFailureSafetySuperseded {
+		t.Fatalf("superseded request = %+v, %v", attempts, err)
+	}
+
+	controller := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	info := rootTestInfo(reduced, 1)
+	info.Temp = settings.RecoveryTemp - 1
+	poll := mustReadablePoll(t, info, rootTestASIC())
+	at := now.Add(time.Minute)
+	for index := 0; index < recoveryHealthyPolls(settings)+rampSamples(settings)+targetSampleCount(settings)+2; index++ {
+		at = at.Add(settings.MetricsTime)
+		if err := controller.controlMinerAfterSafety(context.Background(), &state, poll, settings, at, true); err != nil {
+			t.Fatal(err)
+		}
+		if state.Phase == lib.PhaseBaseline {
+			break
+		}
+	}
+	if state.Phase != lib.PhaseBaseline || state.CurrentPoint() != reduced || state.SafetyReason != "" {
+		t.Fatalf("firmware recovery did not resume optimization: %+v", state)
+	}
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	if epoch.Purpose != lib.EpochBaseline || epoch.Point != reduced || epoch.RequiredWindows != 2 {
+		t.Fatalf("recovery baseline = %+v", epoch)
+	}
+}
+
+func TestSafeConfiguredMismatchRemainsRetryableBeforeRestart(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1645,13 +1863,18 @@ func TestMutationReadbackMismatchSupersedesBeforeRestart(t *testing.T) {
 		nil, log.New(io.Discard, "", 0), nil,
 	)
 	coordinator.rediscoveryDelay = time.Millisecond
+	nowCalls := 0
+	coordinator.now = func() time.Time {
+		nowCalls++
+		return now.Add(time.Duration(nowCalls) * 30 * time.Second)
+	}
 	observation := &minerObservation{miner: lib.DiscoveredMiner{IP: "192.0.2.12", Info: device.source}, info: device.source, asic: device.asic, settings: settings, state: state}
 	if err := coordinator.startLocked(context.Background(), observation, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	result := <-coordinator.results
-	if result.err == nil || result.failureStage == "" {
-		t.Fatalf("mismatch result = id=%d attempt=%d failure=%q unavailable=%t err=%v", result.id, result.attemptID, result.failureStage, result.readbackUnavailable, result.err)
+	if result.err == nil || result.failureStage != "" {
+		t.Fatalf("mismatch result = id=%d attempt=%d failure=%q err=%v", result.id, result.attemptID, result.failureStage, result.err)
 	}
 	coordinator.results <- result
 	if _, err := coordinator.applyResultsLocked(); err != nil {
@@ -1661,12 +1884,13 @@ func TestMutationReadbackMismatchSupersedesBeforeRestart(t *testing.T) {
 		t.Fatalf("mismatch issued restart count %d", device.restartCount)
 	}
 	attempts, err := store.ListMutationAttempts(rootTestMAC)
-	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != lib.MutationFailureSafetySuperseded {
+	if err != nil || len(attempts) != 1 || !attempts[0].FailedAt.IsZero() || attempts[0].PatchRequestedAt.IsZero() {
 		t.Fatalf("mismatch attempt = %+v, %v", attempts, err)
 	}
 	loaded, err := store.LoadMiner(rootTestMAC)
-	if err != nil || loaded.Phase != lib.PhaseOverheat || loaded.SafetyReason == "" {
-		t.Fatalf("mismatch safety state = %+v, %v", loaded, err)
+	if err != nil || loaded.Phase == lib.PhaseEmergency || loaded.SafetyReason != "" ||
+		loaded.PendingKind != lib.MutationOperatingPoint || loaded.PendingPoint() != wantedPoint {
+		t.Fatalf("mismatch retry state = %+v, %v", loaded, err)
 	}
 }
 
@@ -1755,7 +1979,7 @@ func TestRecordPollCycleAttributionLogsEveryCycleAndFlushesHourly(t *testing.T) 
 
 // TestRecoveryInstrumentationLogsWithoutActingOnPhase covers logRecoveryInstrumentation
 // specifically: it must log safeToRecover transitions and temperature slope during
-// COOLDOWN/OVERHEAT, must stay silent otherwise, and must never itself change durable state. The
+// COOLDOWN/EMERGENCY, must stay silent otherwise, and must never itself change durable state. The
 // recovery predicate that acts on safeToRecover is a separate mechanism (recoveryHealthyPolls in
 // controlMinerAfterSafety, see TestCooldownExitsAfterConsecutiveHealthyPollsAndClearsSafetyReason);
 // this instrumentation remains purely observational.
@@ -1770,7 +1994,7 @@ func TestRecoveryInstrumentationLogsWithoutActingOnPhase(t *testing.T) {
 
 	minerController.logRecoveryInstrumentation(state, rootTestInfo(state.CurrentPoint(), 100), settings, now)
 	if buffer.Len() != 0 {
-		t.Fatalf("instrumentation logged outside COOLDOWN/OVERHEAT: %q", buffer.String())
+		t.Fatalf("instrumentation logged outside COOLDOWN/EMERGENCY: %q", buffer.String())
 	}
 
 	state.Phase = lib.PhaseCooldown
@@ -2013,8 +2237,8 @@ func TestFreshEmergencyEpisodeResetsStaleRecoveryHealthyCount(t *testing.T) {
 	if _, err := transitionEmergencyState(&state, info, asic, settings, now, assessment); err != nil {
 		t.Fatalf("transitionEmergencyState: %v", err)
 	}
-	if state.Phase != lib.PhaseOverheat {
-		t.Fatalf("fresh emergency did not enter OVERHEAT: %+v", state)
+	if state.Phase != lib.PhaseEmergency {
+		t.Fatalf("fresh emergency did not enter EMERGENCY: %+v", state)
 	}
 	if state.RecoveryHealthyCount != 0 {
 		t.Fatalf("stale RecoveryHealthyCount survived a fresh emergency episode: got %d, want 0", state.RecoveryHealthyCount)

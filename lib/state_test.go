@@ -104,7 +104,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return result.State, now
 }
 
-func TestSchemaV9BootstrapAndReopen(t *testing.T) {
+func TestSchemaV10BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -118,7 +118,7 @@ func TestSchemaV9BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 9 {
+	if err != nil || version != 10 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -193,12 +193,12 @@ func TestAutomationPersistenceRejectsOffGridAuthority(t *testing.T) {
 }
 
 // TestRecoveryHealthyCountValidation pins validateMinerState's RecoveryHealthyCount boundary: a
-// negative value is always rejected, a nonzero value is rejected outside COOLDOWN/OVERHEAT (the
+// negative value is always rejected, a nonzero value is rejected outside COOLDOWN/EMERGENCY (the
 // counter's only meaningful phases), and a nonzero value is accepted inside either.
 func TestRecoveryHealthyCountValidation(t *testing.T) {
 	store := openTestStore(t)
 	state, _ := bootstrapTestMiner(t, store)
-	if state.Phase == PhaseCooldown || state.Phase == PhaseOverheat {
+	if state.Phase == PhaseCooldown || state.Phase == PhaseEmergency {
 		t.Fatalf("test fixture assumption violated: bootstrap phase = %s", state.Phase)
 	}
 	negative := state
@@ -209,9 +209,9 @@ func TestRecoveryHealthyCountValidation(t *testing.T) {
 	outsideCooldown := state
 	outsideCooldown.RecoveryHealthyCount = 3
 	if err := validateMinerState(outsideCooldown); err == nil {
-		t.Fatalf("nonzero recovery healthy count was accepted outside COOLDOWN/OVERHEAT: phase=%s", outsideCooldown.Phase)
+		t.Fatalf("nonzero recovery healthy count was accepted outside COOLDOWN/EMERGENCY: phase=%s", outsideCooldown.Phase)
 	}
-	for _, phase := range []OptimizerPhase{PhaseCooldown, PhaseOverheat} {
+	for _, phase := range []OptimizerPhase{PhaseCooldown, PhaseEmergency} {
 		inPhase := state
 		inPhase.Phase = phase
 		inPhase.RecoveryHealthyCount = 3
@@ -252,7 +252,7 @@ func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
 	attemptID := admitResult.AttemptID
 	offGrid := OperatingPoint{Frequency: 500, CoreVoltage: 1000}
 	adoptResult, err := store.Apply(AdoptExternalPoint{
-		State: state, Point: offGrid, AttemptID: attemptID,
+		State: state, Point: offGrid, AttemptID: attemptID, Stage: MutationFailurePreflight,
 	}, now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatalf("adopt off-grid external point: %v", err)
@@ -579,9 +579,9 @@ func storePath(t *testing.T, store *OptimizerStore) string {
 }
 
 // Earlier schemas encode terminal safety-hold semantics. Reject them whole rather than silently
-// reinterpreting durable state under the schema-9 recovery contract.
+// reinterpreting durable state under the schema-10 recovery contract.
 func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
-	for _, version := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8} {
+	for _, version := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "optimizer.db")
 			store, err := OpenOptimizerStore(path)
@@ -619,10 +619,10 @@ func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
 	}
 }
 
-// TestSchemaV9ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
+// TestSchemaV10ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
 // (evidence_epochs_one_open, evidence_epochs_mac_opened) into the schema-validation boundary: an
 // unexpected column or a missing/altered index must fail loudly, not silently.
-func TestSchemaV9ExactColumnAndIndexSet(t *testing.T) {
+func TestSchemaV10ExactColumnAndIndexSet(t *testing.T) {
 	store := openTestStore(t)
 	columns, err := tableColumns(context.Background(), store.conn, "evidence_epochs")
 	if err != nil {
@@ -874,7 +874,7 @@ func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 
 // TestCompleteResumeDoesNotPreopenCooldownEpoch is a regression test for a bug found analyzing a
 // live deployment: applyCompleteResume opened a safety_validation epoch immediately for any
-// completed MutationSafetyRollback/MutationOverheatRecovery attempt (the old resume mapping
+// completed MutationSafetyRollback/MutationFirmwareRecovery attempt (the old resume mapping
 // treated PhaseCooldown as safety_validation), which happens well before controlMinerAfterSafety's
 // recovery
 // predicate (recoveryHealthyPolls consecutive safeToRecover polls) has ever run. Once that epoch
@@ -882,7 +882,7 @@ func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 // count it should have been counting never advanced past whatever it happened to be at that
 // instant — observed in production as a miner permanently stuck in COOLDOWN with
 // RecoveryHealthyCount frozen far below threshold, which in turn fleet-wide-blocked all other
-// miners' normal optimization work (mutationCoordinator.Advance treats any COOLDOWN/OVERHEAT miner
+// miners' normal optimization work (mutationCoordinator.Advance treats any COOLDOWN/EMERGENCY miner
 // as safetyBlocked). This test drives a real safety-rollback attempt through its full milestone
 // lifecycle to CompleteResume and asserts no epoch is open afterward — only the recovery predicate
 // may open one now.
@@ -894,13 +894,13 @@ func TestCompleteResumeDoesNotPreopenCooldownEpoch(t *testing.T) {
 	incumbent := state.CurrentPoint()
 	state.Phase = PhaseCooldown
 	state.PhaseStartedAt = now
-	state.SafetyReason = SafetyReasonMutationUncertain
+	state.SafetyReason = SafetyReasonTelemetryUnavailable
 	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
 	if _, err := store.Apply(CloseEpoch{State: state, Epoch: baseline, Outcome: EpochContradicted}, now); err != nil {
 		t.Fatal(err)
 	}
 	attempt := MutationAttempt{
-		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: SafetyReasonMutationUncertain,
+		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: SafetyReasonTelemetryUnavailable,
 		FromFrequency: incumbent.Frequency, FromCoreVoltage: incumbent.CoreVoltage,
 		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
 		IntentCreatedAt: now, StartedAt: now,
@@ -1119,7 +1119,7 @@ func TestReopenRejectsSafetyEpochWithoutRecoveryProof(t *testing.T) {
 	}
 	if _, err := store.conn.ExecContext(context.Background(),
 		"UPDATE optimizer_miners SET safety_reason = ? WHERE mac_addr = ?",
-		SafetyReasonMutationUncertain, state.MacAddr); err != nil {
+		SafetyReasonTelemetryUnavailable, state.MacAddr); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -1174,7 +1174,7 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 		})
 	}
 	for _, state := range []MinerState{
-		{MacAddr: testMAC, Phase: PhaseOverheat, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
+		{MacAddr: testMAC, Phase: PhaseEmergency, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
 		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldRejected, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
 	} {
 		epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(), Purpose: EpochBaseline, RequiredWindows: 2}
@@ -1348,49 +1348,6 @@ func TestStartMutationAttemptRequiresIntentTimestampMatch(t *testing.T) {
 	}
 }
 
-func TestQuarantineMutationClosesAmbiguousCandidateAtomically(t *testing.T) {
-	store := openTestStore(t)
-	state, now := bootstrapTestMiner(t, store)
-	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	admitResult := admitTestTrial(t, store, state, candidate, PhaseFrequencyTest, 100, now.Add(time.Minute))
-	state = admitResult.State
-	attemptID := admitResult.AttemptID
-	if err := store.AdvanceMutationAttempt(attemptID, MutationMilestonePatchRequested, now.Add(90*time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	state.ClearPendingMutation()
-	state.SetFallbackPoint(OperatingPoint{})
-	state.Phase = PhaseOverheat
-	state.HoldReason = ""
-	state.SettledAt = time.Time{}
-	state.SafetyReason = SafetyReasonMutationUncertain
-	state.OverheatCount = 1
-	failedAt := now.Add(2 * time.Minute)
-	quarantineResult, err := store.Apply(QuarantineMutation{
-		State: state, AttemptID: attemptID, Stage: MutationFailureConfiguredVerification,
-	}, failedAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = quarantineResult.State
-	records, err := store.ListPoints(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	record, found := findTestPoint(records, candidate)
-	if !found || record.Status != PointUnobservable {
-		t.Fatalf("quarantined candidate = %+v", record)
-	}
-	attempts, err := store.ListMutationAttempts(testMAC)
-	if err != nil || len(attempts) != 1 || attempts[0].FailureStage != MutationFailureConfiguredVerification {
-		t.Fatalf("quarantined attempt = %+v, %v", attempts, err)
-	}
-	loaded, err := store.LoadMiner(testMAC)
-	if err != nil || loaded.Phase != PhaseOverheat || loaded.SafetyReason != SafetyReasonMutationUncertain || loaded.PendingKind != "" {
-		t.Fatalf("quarantined state = %+v, %v", loaded, err)
-	}
-}
-
 func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
@@ -1420,9 +1377,9 @@ func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := state
-	state.Phase = PhaseOverheat
+	state.Phase = PhaseEmergency
 	state.SafetyReason = SafetyReasonFirmwareOverheat
-	state.SetPendingMutation(MutationOverheatRecovery, minimum, now.Add(time.Minute))
+	state.SetPendingMutation(MutationFirmwareRecovery, minimum, now.Add(time.Minute))
 	transitionAt := now.Add(2 * time.Minute)
 	transitionResult, err := store.Apply(SafetyTransition{Expected: expected, State: state, Record: nil}, transitionAt)
 	if err != nil {
@@ -1499,15 +1456,15 @@ func TestSafetyTransitionSupersedesReissuedSafetyAuthority(t *testing.T) {
 	}
 }
 
-func TestOverheatRecoveryRequiresFirmwareCause(t *testing.T) {
+func TestFirmwareRecoveryRequiresFirmwareCause(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = PhaseOverheat
-	state.SafetyReason = SafetyReasonMutationUncertain
-	state.SetPendingMutation(MutationOverheatRecovery, OperatingPoint{Frequency: 400, CoreVoltage: 1000}, now)
+	state.Phase = PhaseEmergency
+	state.SafetyReason = SafetyReasonTelemetryUnavailable
+	state.SetPendingMutation(MutationFirmwareRecovery, OperatingPoint{Frequency: 400, CoreVoltage: 1000}, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err == nil {
-		t.Fatal("overheat recovery without a firmware-overheat cause was accepted")
+		t.Fatal("firmware recovery without a firmware-overheat cause was accepted")
 	}
 }
 
@@ -1688,7 +1645,6 @@ func TestApplyIsExhaustiveOverTransitionVariants(t *testing.T) {
 		SafetyTransition{},
 		FailMutation{},
 		FailMutationFinalizeTrial{},
-		QuarantineMutation{},
 		SupersedeMutation{},
 		CompleteMutation{},
 		OpenEpoch{},

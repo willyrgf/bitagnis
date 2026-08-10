@@ -541,7 +541,7 @@ func classifyReportMutation(kind MutationKind) reportMutationClass {
 	switch kind {
 	case MutationOperatingPoint:
 		return reportMutationNormal
-	case MutationSafetyRollback, MutationOverheatRecovery:
+	case MutationSafetyRollback, MutationFirmwareRecovery:
 		return reportMutationSafety
 	default:
 		return reportMutationIgnored
