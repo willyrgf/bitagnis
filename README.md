@@ -97,9 +97,14 @@ autonomous overheat recovery (`power_management_task.c`'s six consecutive
 Bitagnis's coarser and lossier poll cadence. Reaching the threshold clears the
 durable `SafetyReason` in the same transition and opens a `safety_validation`
 evidence epoch, exactly like a starved `HOLD` re-entering evaluation; a single
-required window's worth of admitted evidence then either settles the miner
-into `HoldSafety` or, if that window's quality is unhealthy, rejects the epoch
-and leaves the miner in `COOLDOWN` to accumulate the healthy-poll count again.
+required window's worth of admitted evidence then either closes validation and
+atomically opens a fresh two-window baseline at the recovered current point,
+or, if that window's quality is unhealthy, rejects the epoch and leaves the
+miner in `COOLDOWN` to accumulate the healthy-poll count again. Successful
+recovery resumes the same finite optimization pass: evaluated point history is
+preserved, an interrupted unobservable candidate remains consumed, and the
+frontier continues with the next unseen eligible pair. Safety recovery is not
+a terminal `HOLD` and does not require an operator retune.
 A completed safety mutation and healthy-mining resumption never open this
 epoch: the cooldown recovery predicate is its sole owner. Every store
 transition and database reopen verifies that an open `safety_validation` epoch
@@ -155,16 +160,16 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 8, with typed pending mutations, finite frontier
+The current schema is version 9, with typed pending mutations, finite frontier
 state, hourly accounting, a durable evidence-epoch ledger, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema version 7
+`overheat_pending` field, migration, or compatibility reader. Schema version 8
 and earlier, an old partial database, or an unknown application object is
 rejected without modification; move it aside or remove it to create the
-current baseline. Version 7 used the same physical evidence tables but could
-not prove that a safety-validation epoch was opened only after the required
-healthy-poll dwell, so it is rejected whole rather than repaired from
-timestamps. Evaluated history, pending mutation ages, emergency episode ages,
+current baseline. Version 8 used terminal safety-hold semantics and did not
+require every active normal phase to carry its exact open evidence authority,
+so it is rejected whole rather than reinterpreted or repaired. Evaluated
+history, pending mutation ages, emergency episode ages,
 mutation attempts, evidence epochs, and the bounded 384-hour hourly accounting
 history persist across ordinary restarts after that baseline is created.
 
@@ -262,8 +267,13 @@ resolves to the closed evaluation that produced it.
 Normal optimization is a finite pass. Each advertised complete pair is consumed
 at most once per pass, terminal point outcomes are not reopened by elapsed time
 or cooler telemetry, and a settled `HOLD` performs no normal operating-point
-mutation. After an environmental or hardware change, explicitly qualify one
-named miner for a new pass:
+mutation. A safety episode pauses this pass but does not finish it: successful
+recovery rebaselines the safe current point and continues past every already
+consumed pair. An optimized `HOLD` is created only after the safe frontier has
+no unseen admissible candidate (or no exploration headroom remains) and the
+selected highest sustained-hash point has passed final validation. After an
+environmental or hardware change, explicitly qualify one named miner for a new
+pass:
 
 ```sh
 ./bitagnis --retune bitaxe-example
@@ -271,9 +281,8 @@ named miner for a new pass:
 
 `--retune` never resets safety state or issues hardware writes by itself. It is
 accepted only after the named miner has two consecutive safe startup polls in a
-settled, unblocked `HOLD`; it rejects `all`, mining reapply, pending work, and
-active or unsettled safety episodes. A settled safety-derived `HOLD` may qualify;
-the accepted pass clears its safety reason and starts without an arm snapshot.
+settled optimized or manual `HOLD`; it rejects `all`, mining reapply, pending
+work, rejected holds, and active or unsettled safety episodes.
 
 ## Configuration
 
@@ -359,15 +368,15 @@ Per-miner hash rates are aggregated below the table.
 
 Optimizer states are:
 
-- `BASELINE`: validating a live or manually adopted point;
+- `BASELINE`: validating the current pass point, including after safety recovery;
 - `UNDERVOLT`: testing a lower voltage at the same frequency;
 - `FREQ_TEST`: testing the next frequency;
 - `VOLT_TEST`: testing whether one higher voltage improves a new frequency;
-- `HOLD`: running the best currently safe point, blocked on a starved
-  environment that can still recover on its own, blocked on a rejected point
-  that needs an operator retune, or settled after a manual or safety hold;
-- `COOLDOWN`: monitoring without upward exploration, and, until the recovery
-  predicate below lands, without an automatic exit either; and
+- `HOLD`: settled at the pass-selected optimum or a validated manual point,
+  blocked on a starved environment that can still recover on its own, or
+  blocked on a rejected point that needs an operator retune;
+- `COOLDOWN`: monitoring without upward exploration until the consecutive-safe
+  dwell and safety-validation window complete, then resuming `BASELINE`; and
 - `OVERHEAT`: containing or waiting for safe recovery.
 
 Durable ordinary work is shown as `PENDING`, typed hard-limit work as

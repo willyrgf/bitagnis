@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -103,7 +104,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return result.State, now
 }
 
-func TestSchemaV8BootstrapAndReopen(t *testing.T) {
+func TestSchemaV9BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -117,7 +118,7 @@ func TestSchemaV8BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 8 {
+	if err != nil || version != 9 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -245,21 +246,8 @@ func TestUnobservablePointCannotPersistEvidence(t *testing.T) {
 func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.BestHashRate = 100
-	saveResult, err := store.Apply(SaveState{State: state}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = saveResult.State
 	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	admitResult, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: state.CurrentPoint(), Phase: PhaseUndervolt,
-		ReferenceHash: 100,
-	}, now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	admitResult := admitTestTrial(t, store, state, candidate, PhaseUndervolt, 100, now.Add(time.Minute))
 	state = admitResult.State
 	attemptID := admitResult.AttemptID
 	offGrid := OperatingPoint{Frequency: 500, CoreVoltage: 1000}
@@ -348,16 +336,18 @@ func TestResetOptimizationPassPersistsCompleteBoundarySnapshot(t *testing.T) {
 		MeasuredAt: now.Add(10 * time.Minute), EnteredAt: now,
 	}
 	epochForBaseline := mustOpenEpoch(t, store, testMAC)
-	finalizeResult, err := store.Apply(FinalizeBaseline{State: state, Record: baseline, Block: false, Epoch: epochForBaseline}, baseline.MeasuredAt)
+	finalizeResult, err := store.Apply(CompleteBaseline{
+		State: state, Record: baseline, Epoch: epochForBaseline, Decision: BaselinePlace,
+		Selected: selected, Best: selected, BestHashRate: baseline.MedianHash,
+	}, baseline.MeasuredAt)
 	if err != nil {
-		t.Fatalf("finalize baseline: %v", err)
+		t.Fatalf("complete baseline: %v", err)
 	}
 	state = finalizeResult.State
 	settledAt := now.Add(20 * time.Minute)
-	state.Phase = PhaseHold
-	state.HoldReason = HoldOptimized
+	holdEpoch := mustOpenEpoch(t, store, testMAC)
 	state.SettledAt = settledAt
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
+	if _, err := store.Apply(CloseEpoch{State: state, Epoch: holdEpoch, Outcome: EpochValidated}, settledAt); err != nil {
 		t.Fatalf("save settled hold: %v", err)
 	}
 
@@ -426,11 +416,13 @@ func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	passStart := now.Add(2 * time.Hour)
-	if _, err := store.Apply(ResetPass{
+	resetResult, err := store.Apply(ResetPass{
 		MacAddr: testMAC, Point: state.CurrentPoint(),
-	}, passStart); err != nil {
+	}, passStart)
+	if err != nil {
 		t.Fatalf("manual retune: %v", err)
 	}
+	state = resetResult.State
 	baseline := OperatingPointRecord{
 		MacAddr: testMAC, Frequency: state.CurrentFrequency, CoreVoltage: state.CurrentCoreVoltage,
 		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
@@ -438,7 +430,10 @@ func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
 		MeasuredAt: passStart.Add(10 * time.Minute), EnteredAt: passStart,
 	}
 	epochForBaseline := mustOpenEpoch(t, store, testMAC)
-	finalizeResult, err := store.Apply(FinalizeBaseline{State: state, Record: baseline, Block: false, Epoch: epochForBaseline}, baseline.MeasuredAt)
+	finalizeResult, err := store.Apply(CompleteBaseline{
+		State: state, Record: baseline, Epoch: epochForBaseline, Decision: BaselinePlace,
+		Selected: state.CurrentPoint(), Best: state.CurrentPoint(), BestHashRate: baseline.MedianHash,
+	}, baseline.MeasuredAt)
 	if err != nil {
 		t.Fatalf("manual baseline: %v", err)
 	}
@@ -507,38 +502,8 @@ func TestReopenRejectsInvalidPassReferenceSnapshot(t *testing.T) {
 	}
 }
 
-func TestResetOptimizationPassAcceptsSettledSafetyHold(t *testing.T) {
-	store := openTestStore(t)
-	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = PhaseHold
-	state.HoldReason = HoldSafety
-	state.SafetyReason = ""
-	state.SettledAt = now.Add(time.Hour)
-	state.PhaseStartedAt = now.Add(time.Hour)
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Apply(ResetPass{
-		MacAddr: testMAC, Point: state.CurrentPoint(),
-	}, now.Add(2*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := store.LoadMiner(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Phase != PhaseBaseline || loaded.PassTrigger != PassOperator ||
-		loaded.SafetyReason != "" || loaded.PassReferenceHash != 0 {
-		t.Fatalf("safety retune state = %+v", loaded)
-	}
-}
-
-// closeInitialBaselineEpoch closes the baseline epoch Bootstrap opened, as validated, so a test can
-// go on to admit a trial or reset the pass without violating the one-open-epoch invariant. Tests
-// that only exercise a narrower slice of the lifecycle (AdmitTrial, ResetPass, ...) still need a
-// clean starting point, exactly as production code always closes the baseline epoch (FinalizeBaseline)
-// before either of those transitions.
+// closeInitialBaselineEpoch completes the bootstrap baseline into a settled optimized hold. Tests
+// that need a candidate use admitTestTrial instead so baseline closure and admission stay atomic.
 func closeInitialBaselineEpoch(t *testing.T, store *OptimizerStore, state MinerState, at time.Time) MinerState {
 	t.Helper()
 	epoch := mustOpenEpoch(t, store, state.MacAddr)
@@ -548,11 +513,48 @@ func closeInitialBaselineEpoch(t *testing.T, store *OptimizerStore, state MinerS
 		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
 		MeasuredAt: at, EnteredAt: state.PassStartedAt,
 	}
-	result, err := store.Apply(FinalizeBaseline{State: state, Record: record, Block: false, Epoch: epoch}, at)
+	result, err := store.Apply(CompleteBaseline{
+		State: state, Record: record, Epoch: epoch, Decision: BaselinePlace,
+		Selected: state.CurrentPoint(), Best: state.CurrentPoint(), BestHashRate: record.MedianHash,
+	}, at)
 	if err != nil {
 		t.Fatalf("close initial baseline epoch: %v", err)
 	}
+	state = result.State
+	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	state.SettledAt = at
+	result, err = store.Apply(CloseEpoch{State: state, Epoch: holdEpoch, Outcome: EpochValidated}, at)
+	if err != nil {
+		t.Fatalf("settle initial optimized hold: %v", err)
+	}
 	return result.State
+}
+
+func admitTestTrial(
+	t *testing.T,
+	store *OptimizerStore,
+	state MinerState,
+	candidate OperatingPoint,
+	phase OptimizerPhase,
+	referenceHash float64,
+	at time.Time,
+) TransitionResult {
+	t.Helper()
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	record := OperatingPointRecord{
+		MacAddr: state.MacAddr, Frequency: state.CurrentFrequency, CoreVoltage: state.CurrentCoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: at, EnteredAt: state.PassStartedAt,
+	}
+	result, err := store.Apply(CompleteBaseline{
+		State: state, Record: record, Epoch: epoch, Decision: BaselineContinue,
+		Candidate: candidate, CandidatePhase: phase, ReferenceHash: referenceHash,
+	}, at)
+	if err != nil {
+		t.Fatalf("admit test trial: %v", err)
+	}
+	return result
 }
 
 func mustOpenEpoch(t *testing.T, store *OptimizerStore, macAddr string) EvidenceEpoch {
@@ -576,10 +578,10 @@ func storePath(t *testing.T, store *OptimizerStore) string {
 	return path
 }
 
-// Schema 7 cannot prove that an existing safety_validation epoch was opened only after the durable
-// healthy-poll dwell. Reject it whole rather than repairing or inferring history from timestamps.
+// Earlier schemas encode terminal safety-hold semantics. Reject them whole rather than silently
+// reinterpreting durable state under the schema-9 recovery contract.
 func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
-	for _, version := range []int{3, 4, 5, 6, 7} {
+	for _, version := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "optimizer.db")
 			store, err := OpenOptimizerStore(path)
@@ -598,14 +600,29 @@ func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
 			if _, err := OpenOptimizerStoreReadOnly(path); err == nil {
 				t.Fatalf("schema v%d was accepted read-only", version)
 			}
+			database, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var storedVersion int
+			if err := database.QueryRow("PRAGMA user_version").Scan(&storedVersion); err != nil {
+				_ = database.Close()
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if storedVersion != version {
+				t.Fatalf("rejected schema was modified: got v%d, want v%d", storedVersion, version)
+			}
 		})
 	}
 }
 
-// TestSchemaV8ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
+// TestSchemaV9ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
 // (evidence_epochs_one_open, evidence_epochs_mac_opened) into the schema-validation boundary: an
 // unexpected column or a missing/altered index must fail loudly, not silently.
-func TestSchemaV8ExactColumnAndIndexSet(t *testing.T) {
+func TestSchemaV9ExactColumnAndIndexSet(t *testing.T) {
 	store := openTestStore(t)
 	columns, err := tableColumns(context.Background(), store.conn, "evidence_epochs")
 	if err != nil {
@@ -728,19 +745,21 @@ func TestReopenRejectsOrphanedUnfinishedMutationAuthority(t *testing.T) {
 	}
 }
 
-func TestAdmitTrialBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
+func TestBaselineContinuationBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
 	baseline := state.CurrentPoint()
-	state.BestHashRate = 100
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
 	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	if _, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: baseline, Phase: PhaseUndervolt,
-		ReferenceHash: 99,
+	epoch := mustOpenEpoch(t, store, testMAC)
+	baselineRecord := OperatingPointRecord{
+		MacAddr: testMAC, Frequency: baseline.Frequency, CoreVoltage: baseline.CoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: now.Add(time.Minute), EnteredAt: state.PassStartedAt,
+	}
+	if _, err := store.Apply(CompleteBaseline{
+		State: state, Record: baselineRecord, Epoch: epoch, Decision: BaselineContinue,
+		Candidate: candidate, CandidatePhase: PhaseUndervolt, ReferenceHash: 99,
 	}, now.Add(time.Minute)); err == nil {
 		t.Fatal("stale frozen reference was accepted")
 	}
@@ -757,13 +776,7 @@ func TestAdmitTrialBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
 		t.Fatalf("positive pass reference was overwritten: %+v, %v", loaded, err)
 	}
 	state = loaded
-	admitResult, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: baseline, Phase: PhaseUndervolt,
-		ReferenceHash: 100,
-	}, now.Add(time.Minute))
-	if err != nil {
-		t.Fatalf("admit trial: %v", err)
-	}
+	admitResult := admitTestTrial(t, store, state, candidate, PhaseUndervolt, 100, now.Add(time.Minute))
 	state = admitResult.State
 	attemptID := admitResult.AttemptID
 	if attemptID <= 0 || state.PendingPoint() != candidate || state.FallbackPoint() != baseline {
@@ -799,10 +812,12 @@ func TestAdmitTrialBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
 	if state.PendingKind != "" || state.FallbackPoint() != (OperatingPoint{}) || state.Phase != PhaseBaseline {
 		t.Fatalf("return state = %+v", state)
 	}
-	if _, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: OperatingPoint{Frequency: 525, CoreVoltage: 1100}, Incumbent: baseline,
-		Phase: PhaseUndervolt, ReferenceHash: 100,
-	}, now); err == nil {
+	epoch = mustOpenEpoch(t, store, testMAC)
+	baselineRecord.MeasuredAt = now.Add(13 * time.Minute)
+	if _, err := store.Apply(CompleteBaseline{
+		State: state, Record: baselineRecord, Epoch: epoch, Decision: BaselineContinue,
+		Candidate: candidate, CandidatePhase: PhaseUndervolt, ReferenceHash: 100,
+	}, baselineRecord.MeasuredAt); err == nil {
 		t.Fatal("duplicate candidate was admitted")
 	}
 }
@@ -810,19 +825,8 @@ func TestAdmitTrialBindsOneEntryAttemptAndFinalizesReturn(t *testing.T) {
 func TestFailedTrialClosesAttemptAndPointAtomically(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.BestHashRate = 100
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
 	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	admitResult, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: state.CurrentPoint(), Phase: PhaseUndervolt,
-		ReferenceHash: 100,
-	}, now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	admitResult := admitTestTrial(t, store, state, candidate, PhaseUndervolt, 100, now.Add(time.Minute))
 	state = admitResult.State
 	attemptID := admitResult.AttemptID
 	records, err := store.ListPoints(testMAC)
@@ -988,6 +992,112 @@ func TestSafetyValidationEpochRequiresCompletedRecoveryAndRollsBack(t *testing.T
 	defer reopened.Close()
 }
 
+func TestNormalContradictionAtomicallyOpensDerivedSuccessor(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	interrupted := mustOpenEpoch(t, store, state.MacAddr)
+	result, err := store.Apply(CloseEpoch{
+		State: state, Epoch: interrupted, Outcome: EpochContradicted,
+	}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := mustOpenEpoch(t, store, state.MacAddr)
+	if resumed.ID == interrupted.ID || resumed.Purpose != EpochBaseline || resumed.RequiredWindows != 2 ||
+		resumed.Point != result.State.CurrentPoint() {
+		t.Fatalf("normal contradiction successor = %+v", resumed)
+	}
+}
+
+func TestApplyRollsBackNormalPhaseWithoutEpochAuthority(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	if _, err := store.Apply(CloseEpoch{
+		State: state, Epoch: epoch, Outcome: EpochValidated,
+	}, now.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "has no open baseline evidence epoch") {
+		t.Fatalf("missing epoch postcondition error = %v", err)
+	}
+	open := mustOpenEpoch(t, store, state.MacAddr)
+	if open.ID != epoch.ID || !open.ClosedAt.IsZero() {
+		t.Fatalf("failed transition did not roll back epoch: %+v", open)
+	}
+}
+
+func TestReopenRejectsNormalPhaseWithoutEpochAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, now := bootstrapTestMiner(t, store)
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	if _, err := store.conn.ExecContext(context.Background(),
+		"UPDATE evidence_epochs SET closed_at = ?, outcome = ? WHERE id = ?",
+		timeValue(now.Add(time.Second)), EpochContradicted, epoch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, open := range []func(string) (*OptimizerStore, error){OpenOptimizerStore, OpenOptimizerStoreReadOnly} {
+		if reopened, err := open(path); err == nil || !strings.Contains(err.Error(), "has no open baseline evidence epoch") {
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			t.Fatalf("missing epoch reopen error = %v", err)
+		}
+	}
+}
+
+func TestReopenRejectsPointEvidenceFromWrongEpochPurpose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, now := bootstrapTestMiner(t, store)
+	point := state.CurrentPoint()
+	baseline := mustOpenEpoch(t, store, state.MacAddr)
+	record := OperatingPointRecord{
+		MacAddr: state.MacAddr, Frequency: point.Frequency, CoreVoltage: point.CoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: now.Add(time.Minute), EnteredAt: state.PassStartedAt,
+	}
+	result, err := store.Apply(CompleteBaseline{
+		State: state, Record: record, Epoch: baseline, Decision: BaselinePlace,
+		Selected: point, Best: point, BestHashRate: record.MedianHash,
+	}, record.MeasuredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	hold := mustOpenEpoch(t, store, state.MacAddr)
+	state.SettledAt = now.Add(2 * time.Minute)
+	if _, err := store.Apply(CloseEpoch{
+		State: state, Epoch: hold, Outcome: EpochValidated,
+	}, state.SettledAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.conn.ExecContext(context.Background(),
+		"UPDATE operating_points SET evidence_epoch_id = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?",
+		hold.ID, state.MacAddr, point.Frequency, point.CoreVoltage); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, open := range []func(string) (*OptimizerStore, error){OpenOptimizerStore, OpenOptimizerStoreReadOnly} {
+		if reopened, err := open(path); err == nil || !strings.Contains(err.Error(), "non-baseline evidence epoch") {
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			t.Fatalf("wrong point evidence reopen error = %v", err)
+		}
+	}
+}
+
 func TestReopenRejectsSafetyEpochWithoutRecoveryProof(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := OpenOptimizerStore(path)
@@ -1046,11 +1156,11 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 				CurrentFrequency: 400, CurrentCoreVoltage: 1000}
 			epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(),
 				Purpose: testCase.purpose, RequiredWindows: testCase.windows}
-			if err := validateOpenEpochState(state, epoch, false); err != nil {
+			if err := validateOpenEpochState(state, epoch, false, false); err != nil {
 				t.Fatalf("canonical shape: %v", err)
 			}
 			epoch.RequiredWindows = 3 - testCase.windows
-			if err := validateOpenEpochState(state, epoch, false); err == nil {
+			if err := validateOpenEpochState(state, epoch, false, false); err == nil {
 				t.Fatal("wrong required-window count was accepted")
 			}
 			epoch.RequiredWindows = testCase.windows
@@ -1058,7 +1168,7 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 			if testCase.purpose == EpochBaseline {
 				epoch.Purpose = EpochSafetyValidation
 			}
-			if err := validateOpenEpochState(state, epoch, false); err == nil {
+			if err := validateOpenEpochState(state, epoch, false, false); err == nil {
 				t.Fatal("wrong purpose was accepted")
 			}
 		})
@@ -1066,26 +1176,11 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 	for _, state := range []MinerState{
 		{MacAddr: testMAC, Phase: PhaseOverheat, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
 		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldRejected, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
-		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldSafety, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
 	} {
 		epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(), Purpose: EpochBaseline, RequiredWindows: 2}
-		if err := validateOpenEpochState(state, epoch, false); err == nil {
+		if err := validateOpenEpochState(state, epoch, false, false); err == nil {
 			t.Fatalf("state %s/%s accepted an open epoch", state.Phase, state.HoldReason)
 		}
-	}
-}
-
-func TestSafetyHoldRejectsActiveSafetyReason(t *testing.T) {
-	store := openTestStore(t)
-	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = PhaseHold
-	state.HoldReason = HoldSafety
-	state.SafetyReason = SafetyReasonASICLimit
-	state.SettledAt = now.Add(time.Minute)
-	if _, err := store.Apply(SaveState{State: state}, now.Add(time.Minute)); err == nil ||
-		!strings.Contains(err.Error(), "settled safety hold retains") {
-		t.Fatalf("invalid safety HOLD error = %v", err)
 	}
 }
 
@@ -1094,6 +1189,9 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	state, now := bootstrapTestMiner(t, store)
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
+	state.Phase = PhaseBaseline
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
@@ -1172,6 +1270,63 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	}
 }
 
+func TestMiningConfigurationRestartReopensInterruptedNormalEpoch(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	interrupted := mustOpenEpoch(t, store, testMAC)
+	state.MiningPending = true
+	result, err := store.Apply(SaveState{State: state}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	attempt := MutationAttempt{
+		MacAddr: state.MacAddr, Kind: MutationMiningConfiguration,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		IntentCreatedAt: now.Add(time.Second), StartedAt: now.Add(time.Second),
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestonePatchRequested, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordConfiguredVerification(id, now.Add(3*time.Second), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRestartRequested, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(id, MutationMilestoneRebootVerified, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Apply(CompleteMutation{
+		MacAddr: state.MacAddr, IP: state.IP, AttemptID: id,
+	}, now.Add(6*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	if _, open, err := store.OpenEvidenceEpochFor(testMAC); err != nil || open {
+		t.Fatalf("completed restart retained stale epoch: open=%t err=%v", open, err)
+	}
+	if err := store.RecordFirstPositive(id, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Apply(CompleteResume{MacAddr: testMAC, AttemptID: id}, now.Add(8*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	resumed := mustOpenEpoch(t, store, testMAC)
+	if resumed.ID == interrupted.ID || resumed.Purpose != EpochBaseline || resumed.RequiredWindows != 2 ||
+		resumed.Point != state.CurrentPoint() || state.MiningPending || state.Phase != PhaseBaseline {
+		t.Fatalf("mining restart resume = state:%+v epoch:%+v", state, resumed)
+	}
+}
+
 func TestStartMutationAttemptRequiresIntentTimestampMatch(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
@@ -1196,19 +1351,8 @@ func TestStartMutationAttemptRequiresIntentTimestampMatch(t *testing.T) {
 func TestQuarantineMutationClosesAmbiguousCandidateAtomically(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
-	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.BestHashRate = 100
-	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
-		t.Fatal(err)
-	}
 	candidate := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
-	admitResult, err := store.Apply(AdmitTrial{
-		MacAddr: state.MacAddr, Candidate: candidate, Incumbent: state.CurrentPoint(), Phase: PhaseFrequencyTest,
-		ReferenceHash: 100,
-	}, now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	admitResult := admitTestTrial(t, store, state, candidate, PhaseFrequencyTest, 100, now.Add(time.Minute))
 	state = admitResult.State
 	attemptID := admitResult.AttemptID
 	if err := store.AdvanceMutationAttempt(attemptID, MutationMilestonePatchRequested, now.Add(90*time.Second)); err != nil {
@@ -1253,6 +1397,8 @@ func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = PhaseCooldown
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SafetyReason = SafetyReasonASICLimit
 	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -1318,6 +1464,8 @@ func TestSafetyTransitionSupersedesReissuedSafetyAuthority(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = PhaseCooldown
+	state.HoldReason = ""
+	state.SettledAt = time.Time{}
 	state.SafetyReason = SafetyReasonASICLimit
 	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
 	if result, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -1530,13 +1678,13 @@ func TestApplyIsExhaustiveOverTransitionVariants(t *testing.T) {
 	transitions := []Transition{
 		Bootstrap{},
 		ResetPass{},
-		AdmitTrial{},
 		FinalizeTrial{},
-		FinalizeBaseline{},
+		CompleteBaseline{},
 		AdoptManualPoint{},
 		AdoptExternalPoint{},
 		SaveState{},
 		CompleteResume{},
+		ResumePassAfterSafety{},
 		SafetyTransition{},
 		FailMutation{},
 		FailMutationFinalizeTrial{},

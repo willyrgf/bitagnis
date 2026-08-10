@@ -196,11 +196,12 @@ These invariants are high risk if violated:
   opening that epoch: mutation completion and healthy-mining resumption must not open it. Every open
   epoch must match its exact phase/reason, current point, required-window count, pending-authority,
   settlement, and safety-recovery shape; enforce that invariant both as an `Apply` postcondition and
-  on reopen. Schema version 8 rejects version 7 unchanged because a version-7 ledger cannot prove
-  that an existing or already-closed safety epoch followed the dwell; do not repair it from
-  timestamps. The wall-clock cooldown timer this replaced (and the durable field it wrote) was
-  removed as part of the schema-version-7 cutover; do not reintroduce a duration-based gate here —
-  prefer a monotone, restart-surviving count, as below. A second,
+  on reopen. A validated `safety_validation` epoch atomically opens a fresh two-window baseline for
+  the same pass; it never creates a safety-derived `HOLD`, deletes point history, or retries a
+  consumed candidate. Schema version 9 rejects version 8 and earlier unchanged; do not repair or
+  reinterpret prior semantic contracts. The wall-clock cooldown timer this replaced (and the
+  durable field it wrote) was removed as part of the schema-version-7 cutover; do not reintroduce a
+  duration-based gate here — prefer a monotone, restart-surviving count, as below. A second,
   distinct emergency interrupting a `COOLDOWN` dwell in progress must reset the count to zero, not
   carry a prior episode's partial progress into the new one — every site that begins a fresh or
   escalating emergency episode (`transitionEmergencyState`'s new-episode branch and its callers'
@@ -210,9 +211,10 @@ These invariants are high risk if violated:
   the `COOLDOWN` exit predicate above — do not conflate the two. `OverheatCount` itself is durable
   and increments correctly, but no restriction currently reads it, and the RFC's stated derivation
   (an "episode anchor" read from `MinerState.PhaseStartedAt`) does not hold: `PhaseStartedAt` is
-  overwritten by ordinary transitions (`ResetPass`, `AdmitTrial`, `FinalizeTrial`, `FinalizeBaseline`,
-  `AdoptManualPoint`, mutation completion) that can occur between an overheat episode and a later
-  exploration pass, so it cannot serve as a stable anchor for "how recently did this miner overheat."
+  overwritten by ordinary transitions (`ResetPass`, `CompleteBaseline`, `FinalizeTrial`,
+  `ResumePassAfterSafety`, `AdoptManualPoint`, mutation completion) that can occur between an
+  overheat episode and a later exploration pass, so it cannot serve as a stable anchor for "how
+  recently did this miner overheat."
   This is a known, reported gap requiring a design decision (e.g., deriving the anchor from
   `mutation_attempts` history instead), not license to guess at a replacement unilaterally.
 - Time may be an input to a predicate; time must never be the authority for a transition. A durable
