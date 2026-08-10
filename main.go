@@ -46,7 +46,7 @@ type deviceAPI interface {
 	GetSystemInfo(context.Context, string) (lib.Info, error)
 	GetASICSettings(context.Context, string) (lib.ASICSettings, error)
 	PatchOperatingPoint(context.Context, lib.OperatingPoint, string) error
-	PatchOverheatRecovery(context.Context, lib.OperatingPoint, string) error
+	PatchFirmwareRecovery(context.Context, lib.OperatingPoint, string) error
 	PatchMiningConfiguration(
 		context.Context,
 		lib.MiningSettings,
@@ -682,7 +682,7 @@ func loadReportMinerInput(
 
 func reportPointStable(attempts []lib.MutationAttempt, window lib.ReportWindow) bool {
 	for _, attempt := range attempts {
-		if attempt.Kind != lib.MutationOperatingPoint && attempt.Kind != lib.MutationSafetyRollback && attempt.Kind != lib.MutationOverheatRecovery {
+		if attempt.Kind != lib.MutationOperatingPoint && attempt.Kind != lib.MutationSafetyRollback && attempt.Kind != lib.MutationFirmwareRecovery {
 			continue
 		}
 		if mutationOverlapsReportWindow(attempt, window) {
@@ -1291,14 +1291,19 @@ func formatAggregateHashRate(hashRate float64, available bool) string {
 
 func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 	switch {
-	case info.OverHeatMode != 0 || state.Phase == lib.PhaseOverheat:
-		return colorize(colorRed, string(lib.PhaseOverheat))
+	case info.OverHeatMode != 0 ||
+		(state.Phase == lib.PhaseEmergency && state.SafetyReason == lib.SafetyReasonFirmwareOverheat):
+		return colorize(colorRed, "AXEOS")
+	case state.Phase == lib.PhaseEmergency && state.SafetyReason == lib.SafetyReasonTelemetryUnavailable:
+		return colorize(colorRed, "VERIFY")
+	case state.Phase == lib.PhaseEmergency:
+		return colorize(colorRed, "CONTAIN")
 	case state.PendingKind == lib.MutationSafetyRollback:
-		return colorize(colorRed, "ROLLBACK")
+		return colorize(colorRed, "BACKOFF")
 	case state.PendingKind != "" || state.MiningPending:
 		return colorize(colorYellow, "PENDING")
 	case state.Phase == lib.PhaseCooldown:
-		return colorize(colorYellow, string(lib.PhaseCooldown))
+		return colorize(colorYellow, "RECOVERY")
 	case state.Phase == lib.PhaseHold:
 		return colorize(colorGreen, string(state.Phase))
 	default:
