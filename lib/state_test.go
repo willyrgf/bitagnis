@@ -887,7 +887,7 @@ func TestCompleteResumeDoesNotPreopenCooldownEpoch(t *testing.T) {
 	state, now := bootstrapTestMiner(t, store)
 	baseline := mustOpenEpoch(t, store, testMAC)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
-	state.SetCurrentPoint(minimum)
+	incumbent := state.CurrentPoint()
 	state.Phase = PhaseCooldown
 	state.PhaseStartedAt = now
 	state.SafetyReason = SafetyReasonMutationUncertain
@@ -897,7 +897,7 @@ func TestCompleteResumeDoesNotPreopenCooldownEpoch(t *testing.T) {
 	}
 	attempt := MutationAttempt{
 		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: SafetyReasonMutationUncertain,
-		FromFrequency: minimum.Frequency, FromCoreVoltage: minimum.CoreVoltage,
+		FromFrequency: incumbent.Frequency, FromCoreVoltage: incumbent.CoreVoltage,
 		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
 		IntentCreatedAt: now, StartedAt: now,
 		ConfiguredVerifiedUptimeSeconds: -1,
@@ -1277,13 +1277,89 @@ func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 	state.Phase = PhaseOverheat
 	state.SafetyReason = SafetyReasonFirmwareOverheat
 	state.SetPendingMutation(MutationOverheatRecovery, minimum, now.Add(time.Minute))
-	if _, err := store.Apply(SafetyTransition{Expected: expected, State: state, Record: nil}, now.Add(2*time.Minute)); err != nil {
+	transitionAt := now.Add(2 * time.Minute)
+	transitionResult, err := store.Apply(SafetyTransition{Expected: expected, State: state, Record: nil}, transitionAt)
+	if err != nil {
 		t.Fatal(err)
 	}
 	attempts, err := store.ListMutationAttempts(testMAC)
 	if err != nil || len(attempts) != 1 || attempts[0].ID != attemptID ||
 		attempts[0].FailureStage != MutationFailureSafetySuperseded {
 		t.Fatalf("superseded safety attempt = %+v, %v", attempts, err)
+	}
+	if !attempts[0].FailedAt.Equal(transitionAt) {
+		t.Fatalf("superseded safety timestamp = %s, want %s", attempts[0].FailedAt, transitionAt)
+	}
+
+	// A returning worker may observe the same supersession after SafetyTransition committed it.
+	// That is one terminal fact, even though the worker's observation has a later timestamp and a
+	// now-obsolete proposed state.
+	durable := transitionResult.State
+	lateState := durable
+	lateState.ClearPendingMutation()
+	lateResult, err := store.Apply(SupersedeMutation{
+		Expected: durable, State: lateState, AttemptID: attemptID,
+	}, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("late convergent supersession: %v", err)
+	}
+	if lateResult.State != durable {
+		t.Fatalf("late supersession rewrote durable state: got %+v want %+v", lateResult.State, durable)
+	}
+	attempts, err = store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || !attempts[0].FailedAt.Equal(transitionAt) {
+		t.Fatalf("late supersession rewrote the first terminal timestamp: %+v, %v", attempts, err)
+	}
+}
+
+func TestSafetyTransitionSupersedesReissuedSafetyAuthority(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
+	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	state.Phase = PhaseCooldown
+	state.SafetyReason = SafetyReasonASICLimit
+	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
+	if result, err := store.Apply(SaveState{State: state}, now); err != nil {
+		t.Fatal(err)
+	} else {
+		state = result.State
+	}
+	attempt := MutationAttempt{
+		MacAddr: testMAC, Kind: MutationSafetyRollback, Reason: state.SafetyReason,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: minimum.Frequency, TargetCoreVoltage: minimum.CoreVoltage,
+		IntentCreatedAt: state.PendingSince, StartedAt: now, ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := store.LoadMiner(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reissued := expected
+	reissued.SetPendingMutation(MutationSafetyRollback, minimum, now.Add(time.Minute))
+	if _, err := store.Apply(SafetyTransition{Expected: expected, State: reissued}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := store.ListMutationAttempts(testMAC)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != id ||
+		attempts[0].FailureStage != MutationFailureSafetySuperseded {
+		t.Fatalf("reissued authority did not supersede its old attempt: %+v, %v", attempts, err)
+	}
+}
+
+func TestOverheatRecoveryRequiresFirmwareCause(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now)
+	state.Phase = PhaseOverheat
+	state.SafetyReason = SafetyReasonMutationUncertain
+	state.SetPendingMutation(MutationOverheatRecovery, OperatingPoint{Frequency: 400, CoreVoltage: 1000}, now)
+	if _, err := store.Apply(SaveState{State: state}, now); err == nil {
+		t.Fatal("overheat recovery without a firmware-overheat cause was accepted")
 	}
 }
 

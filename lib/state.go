@@ -2929,9 +2929,13 @@ func applySupersedeMutation(tx *sql.Tx, value SupersedeMutation, at time.Time) (
 		return TransitionResult{}, fmt.Errorf("supersede mutation: stale miner state")
 	}
 	if !attempt.FailedAt.IsZero() {
-		if attempt.FailureStage != MutationFailureSafetySuperseded || !attempt.FailedAt.Equal(at) {
+		if attempt.FailureStage != MutationFailureSafetySuperseded {
 			return TransitionResult{}, fmt.Errorf("supersede mutation: failure milestone conflicts with stored value")
 		}
+		// SafetyTransition and a returning mutation worker may independently observe the same
+		// supersession. The first transaction owns the timestamp and state; later applications are
+		// convergent no-ops, never a second rewrite of that terminal fact.
+		return TransitionResult{State: durable}, nil
 	} else if attempt.MiningResumedAt.IsZero() {
 		attempt.FailedAt = at
 		attempt.FailureStage = MutationFailureSafetySuperseded
@@ -3041,7 +3045,7 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 		closeAttempt := attempt.Kind == MutationOperatingPoint || attempt.Kind == MutationMiningConfiguration
 		if attempt.Kind == MutationSafetyRollback || attempt.Kind == MutationOverheatRecovery {
 			closeAttempt = state.PendingKind != attempt.Kind || state.PendingPoint() != attempt.TargetPoint() ||
-				state.SafetyReason != attempt.Reason
+				state.SafetyReason != attempt.Reason || !state.PendingSince.Equal(attempt.IntentCreatedAt)
 		}
 		if closeAttempt && attempt.Kind == MutationOperatingPoint && record == nil {
 			candidate, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
@@ -5087,6 +5091,9 @@ func validateMinerStateWithTransition(state MinerState, allowUnsettledHold bool)
 	case state.PendingKind == MutationOverheatRecovery &&
 		state.Phase != PhaseOverheat:
 		return fmt.Errorf("overheat recovery requires overheat phase")
+	case state.PendingKind == MutationOverheatRecovery &&
+		state.SafetyReason != SafetyReasonFirmwareOverheat:
+		return fmt.Errorf("overheat recovery requires firmware-overheat cause")
 	case state.Phase == PhaseOverheat &&
 		state.PendingKind != "" &&
 		state.PendingKind != MutationSafetyRollback &&
