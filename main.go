@@ -71,6 +71,8 @@ type optimizerStateStore interface {
 	CompareAndSetHourly(string, time.Time, time.Time, []lib.HourlyAggregate, time.Time) error
 	ListHourly(string, time.Time, time.Time) ([]lib.HourlyAggregate, error)
 	OpenEvidenceEpochFor(string) (lib.EvidenceEpoch, bool, error)
+	EvidenceEpochByID(int64) (lib.EvidenceEpoch, error)
+	MonitorReference(int64) (lib.WindowAggregate, error)
 }
 
 type controller struct {
@@ -675,7 +677,7 @@ func loadReportMinerInput(
 	input.BoundaryPoint = selected.Point()
 	input.BoundarySettledAt = state.SettledAt
 	input.SettledAt = state.SettledAt
-	input.PointStable = state.Phase == lib.PhaseHold && state.HoldReason == lib.HoldOptimized &&
+	input.PointStable = state.Phase == lib.PhaseMonitor && state.MonitorReason == lib.MonitorSelected &&
 		!state.SettledAt.IsZero() && state.PendingKind == "" && !state.MiningPending && mutationStable
 	return input, nil
 }
@@ -1040,26 +1042,28 @@ func qualifiesSettledObservation(
 	now time.Time,
 	allowManual bool,
 ) bool {
-	switch state.HoldReason {
-	case lib.HoldOptimized:
-	case lib.HoldManual:
+	switch state.MonitorReason {
+	case lib.MonitorSelected:
+		if state.SettledAt.IsZero() || state.MonitorReferenceEpochID <= 0 || now.Before(state.SettledAt) {
+			return false
+		}
+	case lib.MonitorManual, lib.MonitorRejected, lib.MonitorStarved:
 		if !allowManual {
 			return false
 		}
 	default:
 		return false
 	}
-	if states == nil || state.Phase != lib.PhaseHold || state.SettledAt.IsZero() ||
-		now.Before(state.SettledAt) ||
+	if states == nil || state.Phase != lib.PhaseMonitor ||
 		state.PendingKind != "" || state.MiningPending ||
 		info.MacAddr != state.MacAddr || operatingPointFromInfo(info) != state.CurrentPoint() ||
 		canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, state.CurrentPoint()) ||
 		!completeSafetyTelemetry(info) || hasPowerFault(info) {
 		return false
 	}
-	// Ramp completion and hold validation are epoch-driven rather than clock-driven: a settled HOLD
-	// with no open evidence epoch has already closed its validation epoch successfully.
-	if _, open, err := states.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
+	epoch, open, err := states.OpenEvidenceEpochFor(state.MacAddr)
+	if err != nil || !open || epoch.Purpose != lib.EpochMonitor || epoch.Point != state.CurrentPoint() ||
+		epoch.RequiredWindows != 2 {
 		return false
 	}
 	minimum, err := minimumAdvertisedPoint(asic)
@@ -1075,10 +1079,10 @@ func qualifiesSettledObservation(
 			return false
 		}
 	}
-	switch state.HoldReason {
-	case lib.HoldManual:
+	switch state.MonitorReason {
+	case lib.MonitorManual, lib.MonitorRejected, lib.MonitorStarved:
 		return state.SafetyReason == ""
-	case lib.HoldOptimized:
+	case lib.MonitorSelected:
 		if state.SafetyReason != "" {
 			return false
 		}
@@ -1304,7 +1308,7 @@ func formatState(state lib.MinerState, info lib.Info, now time.Time) string {
 		return colorize(colorYellow, "PENDING")
 	case state.Phase == lib.PhaseCooldown:
 		return colorize(colorYellow, "RECOVERY")
-	case state.Phase == lib.PhaseHold:
+	case state.Phase == lib.PhaseMonitor:
 		return colorize(colorGreen, string(state.Phase))
 	default:
 		return colorize(colorYellow, string(state.Phase))

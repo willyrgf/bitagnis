@@ -104,7 +104,7 @@ func bootstrapTestMiner(t *testing.T, store *OptimizerStore) (MinerState, time.T
 	return result.State, now
 }
 
-func TestSchemaV10BootstrapAndReopen(t *testing.T) {
+func TestSchemaV11BootstrapAndReopen(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	if state.PassTrigger != PassInitial || state.PassStartedAt != now || state.AccountedThroughAt != now {
@@ -118,7 +118,7 @@ func TestSchemaV10BootstrapAndReopen(t *testing.T) {
 		t.Fatalf("unexpected baseline row: %+v", points)
 	}
 	version, err := schemaVersion(context.Background(), store.conn)
-	if err != nil || version != 10 {
+	if err != nil || version != 11 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 	path := storePath(t, store)
@@ -136,6 +136,121 @@ func TestSchemaV10BootstrapAndReopen(t *testing.T) {
 	}
 }
 
+func TestMonitorReferencePersistsCombinedAssessmentAcrossReopen(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	point := state.CurrentPoint()
+	baseline := mustOpenEpoch(t, store, state.MacAddr)
+	record := OperatingPointRecord{
+		MacAddr: state.MacAddr, Frequency: point.Frequency, CoreVoltage: point.CoreVoltage,
+		Status: PointValidated, MedianHash: 100, ExpectedHash: 100, Attainment: 1,
+		MeanTemp: 55, P95Temp: 56, P95VRTemp: 70, P95Power: 18,
+		MeasuredAt: now.Add(time.Minute), EnteredAt: state.PassStartedAt,
+	}
+	result, err := store.Apply(CompleteBaseline{
+		State: state, Record: record, Epoch: baseline, Decision: BaselinePlace,
+		Selected: point, Best: point, BestHashRate: record.MedianHash,
+	}, record.MeasuredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	first, err := NewWindowAggregate(30, 5*time.Minute, 100, 100, 1, 55, 56, 70, 18, nil, 4, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewWindowAggregate(30, 5*time.Minute, 90, 100, .9, 58, 60, 72, 19, nil, 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	progress := epoch.Progress
+	if err := progress.CloseWindow(true, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(AdvanceEpoch{Epoch: epoch, Progress: progress}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	epoch = mustOpenEpoch(t, store, state.MacAddr)
+	progress = epoch.Progress
+	if err := progress.CloseWindow(true, second); err != nil {
+		t.Fatal(err)
+	}
+	combined, err := first.Combine(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(CompleteMonitor{
+		State: state, Epoch: epoch, Progress: progress, Aggregate: second,
+		Decision: MonitorContinue, NextReason: MonitorSelected,
+	}, now.Add(3*time.Minute)); err == nil {
+		t.Fatal("single window was accepted as a combined monitor reference")
+	}
+	result, err = store.Apply(CompleteMonitor{
+		State: state, Epoch: epoch, Progress: progress, Aggregate: combined,
+		Decision: MonitorContinue, NextReason: MonitorSelected,
+	}, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = result.State
+	if state.MonitorReferenceEpochID != epoch.ID {
+		t.Fatalf("monitor reference epoch = %d, want %d", state.MonitorReferenceEpochID, epoch.ID)
+	}
+	storedEpoch, err := store.EvidenceEpochByID(epoch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedFirst, ok := storedEpoch.Progress.ClosedWindow()
+	if !ok || storedEpoch.Progress.ClosedWindows() != 2 || storedFirst.MedianHash() != first.MedianHash() {
+		t.Fatalf("evidence ledger did not retain the first window: %+v", storedEpoch.Progress)
+	}
+	reference, err := store.MonitorReference(epoch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference.SampleCount() != 60 || reference.MedianHash() != 90 || reference.P95Temp() != 60 ||
+		reference.AcceptedDelta() != 9 || reference.RejectedDelta() != 1 {
+		t.Fatalf("combined monitor reference = %+v", reference)
+	}
+	path := storePath(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reference, err = reopened.MonitorReference(epoch.ID)
+	if err != nil || reference.SampleCount() != 60 || reference.MedianHash() != 90 || reference.P95Temp() != 60 {
+		t.Fatalf("reopened combined monitor reference = %+v, %v", reference, err)
+	}
+}
+
+func TestReopenRejectsSelectedMonitorWithoutCombinedReference(t *testing.T) {
+	store := openTestStore(t)
+	state, now := bootstrapTestMiner(t, store)
+	state = closeInitialBaselineEpoch(t, store, state, now.Add(time.Minute))
+	if _, err := store.conn.ExecContext(context.Background(),
+		"DELETE FROM monitor_references WHERE evidence_epoch_id = ?", state.MonitorReferenceEpochID); err != nil {
+		t.Fatal(err)
+	}
+	path := storePath(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, open := range []func(string) (*OptimizerStore, error){OpenOptimizerStore, OpenOptimizerStoreReadOnly} {
+		reopened, err := open(path)
+		if err == nil || !strings.Contains(err.Error(), "invalid monitor reference epoch") {
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			t.Fatalf("missing combined monitor reference reopen error = %v", err)
+		}
+	}
+}
+
 func TestBootstrapOffGridPairIsRejectedWithoutFrontierRow(t *testing.T) {
 	store := openTestStore(t)
 	offGrid := testInfo()
@@ -149,7 +264,7 @@ func TestBootstrapOffGridPairIsRejectedWithoutFrontierRow(t *testing.T) {
 		t.Fatalf("off-grid bootstrap = %+v, %t, %v", result.State, result.Created, err)
 	}
 	state := result.State
-	if state.Phase != PhaseHold || state.HoldReason != HoldRejected ||
+	if state.Phase != PhaseMonitor || state.MonitorReason != MonitorOffGrid ||
 		state.CurrentPoint() != (OperatingPoint{Frequency: offGrid.Frequency, CoreVoltage: offGrid.CoreVoltage}) {
 		t.Fatalf("off-grid bootstrap state = %+v", state)
 	}
@@ -258,7 +373,7 @@ func TestAdoptExternalPointAllowsOffGridManualObservation(t *testing.T) {
 		t.Fatalf("adopt off-grid external point: %v", err)
 	}
 	state = adoptResult.State
-	if state.CurrentPoint() != offGrid || state.Phase != PhaseHold || state.HoldReason != HoldManual {
+	if state.CurrentPoint() != offGrid || state.Phase != PhaseMonitor || state.MonitorReason != MonitorManual {
 		t.Fatalf("off-grid manual state = %+v", state)
 	}
 	points, err := store.ListPoints(testMAC)
@@ -345,15 +460,11 @@ func TestResetOptimizationPassPersistsCompleteBoundarySnapshot(t *testing.T) {
 	}
 	state = finalizeResult.State
 	settledAt := now.Add(20 * time.Minute)
-	holdEpoch := mustOpenEpoch(t, store, testMAC)
-	state.SettledAt = settledAt
-	if _, err := store.Apply(CloseEpoch{State: state, Epoch: holdEpoch, Outcome: EpochValidated}, settledAt); err != nil {
-		t.Fatalf("save settled hold: %v", err)
-	}
+	state = settleSelectedMonitor(t, store, state, settledAt)
 
 	passStart := now.Add(time.Hour)
-	if _, err := store.Apply(ResetPass{
-		MacAddr: testMAC, Point: selected,
+	if _, err := store.Apply(StartPass{
+		MacAddr: testMAC, Point: selected, Trigger: PassOperator,
 	}, passStart); err != nil {
 		t.Fatalf("reset optimization pass: %v", err)
 	}
@@ -409,15 +520,15 @@ func TestManualRetuneKeepsArmSnapshotAbsentAfterBaseline(t *testing.T) {
 	store := openTestStore(t)
 	state, now := bootstrapTestMiner(t, store)
 	state = closeInitialBaselineEpoch(t, store, state, now)
-	state.Phase = PhaseHold
-	state.HoldReason = HoldManual
+	state.Phase = PhaseMonitor
+	state.MonitorReason = MonitorManual
 	state.SettledAt = now.Add(time.Hour)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
 	}
 	passStart := now.Add(2 * time.Hour)
-	resetResult, err := store.Apply(ResetPass{
-		MacAddr: testMAC, Point: state.CurrentPoint(),
+	resetResult, err := store.Apply(StartPass{
+		MacAddr: testMAC, Point: state.CurrentPoint(), Trigger: PassOperator,
 	}, passStart)
 	if err != nil {
 		t.Fatalf("manual retune: %v", err)
@@ -453,7 +564,7 @@ func TestUnsettledManualHoldPersistsWithoutEvidenceDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unsettled manual hold: %v", err)
 	}
-	if result.State.Phase != PhaseHold || result.State.HoldReason != HoldManual || !result.State.SettledAt.IsZero() {
+	if result.State.Phase != PhaseMonitor || result.State.MonitorReason != MonitorManual || !result.State.SettledAt.IsZero() {
 		t.Fatalf("manual hold state = %+v", result.State)
 	}
 }
@@ -520,12 +631,38 @@ func closeInitialBaselineEpoch(t *testing.T, store *OptimizerStore, state MinerS
 	if err != nil {
 		t.Fatalf("close initial baseline epoch: %v", err)
 	}
-	state = result.State
-	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
-	state.SettledAt = at
-	result, err = store.Apply(CloseEpoch{State: state, Epoch: holdEpoch, Outcome: EpochValidated}, at)
+	return settleSelectedMonitor(t, store, result.State, at)
+}
+
+func settleSelectedMonitor(t *testing.T, store *OptimizerStore, state MinerState, at time.Time) MinerState {
+	t.Helper()
+	monitorEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	window, err := NewWindowAggregate(30, 5*time.Minute, 100, 100, 1, 55, 56, 70, 18, nil, 0, 0)
 	if err != nil {
-		t.Fatalf("settle initial optimized hold: %v", err)
+		t.Fatal(err)
+	}
+	progress := monitorEpoch.Progress
+	if err := progress.CloseWindow(true, window); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(AdvanceEpoch{Epoch: monitorEpoch, Progress: progress}, at); err != nil {
+		t.Fatal(err)
+	}
+	monitorEpoch = mustOpenEpoch(t, store, state.MacAddr)
+	progress = monitorEpoch.Progress
+	if err := progress.CloseWindow(true, window); err != nil {
+		t.Fatal(err)
+	}
+	combined, err := window.Combine(window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Apply(CompleteMonitor{
+		State: state, Epoch: monitorEpoch, Progress: progress, Aggregate: combined,
+		Decision: MonitorContinue, NextReason: MonitorSelected,
+	}, at)
+	if err != nil {
+		t.Fatalf("settle initial selected monitor: %v", err)
 	}
 	return result.State
 }
@@ -578,10 +715,10 @@ func storePath(t *testing.T, store *OptimizerStore) string {
 	return path
 }
 
-// Earlier schemas encode terminal safety-hold semantics. Reject them whole rather than silently
-// reinterpreting durable state under the schema-10 recovery contract.
+// Earlier schemas encode terminal monitoring semantics. Reject them whole rather than silently
+// reinterpreting durable state under the schema-11 continuous-monitor contract.
 func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
-	for _, version := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
+	for _, version := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "optimizer.db")
 			store, err := OpenOptimizerStore(path)
@@ -619,10 +756,10 @@ func TestRejectPriorSchemasWithoutMigration(t *testing.T) {
 	}
 }
 
-// TestSchemaV10ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
+// TestSchemaV11ExactColumnAndIndexSet locks the evidence_epochs shape and the two indexes
 // (evidence_epochs_one_open, evidence_epochs_mac_opened) into the schema-validation boundary: an
 // unexpected column or a missing/altered index must fail loudly, not silently.
-func TestSchemaV10ExactColumnAndIndexSet(t *testing.T) {
+func TestSchemaV11ExactColumnAndIndexSet(t *testing.T) {
 	store := openTestStore(t)
 	columns, err := tableColumns(context.Background(), store.conn, "evidence_epochs")
 	if err != nil {
@@ -694,7 +831,7 @@ func TestDecodeRejectsUnknownEnumValues(t *testing.T) {
 	if validEpochOutcome(EpochOutcome("bogus")) {
 		t.Fatal("unknown epoch outcome validated")
 	}
-	if validHoldReason(HoldReason("bogus")) {
+	if validMonitorReason(MonitorReason("bogus")) {
 		t.Fatal("unknown hold reason validated")
 	}
 	window, err := NewWindowAggregate(30, 5*time.Minute, 100, 100, 1, 55, 56, 70, 18, nil, 0, 0)
@@ -1072,17 +1209,10 @@ func TestReopenRejectsPointEvidenceFromWrongEpochPurpose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state = result.State
-	hold := mustOpenEpoch(t, store, state.MacAddr)
-	state.SettledAt = now.Add(2 * time.Minute)
-	if _, err := store.Apply(CloseEpoch{
-		State: state, Epoch: hold, Outcome: EpochValidated,
-	}, state.SettledAt); err != nil {
-		t.Fatal(err)
-	}
+	state = settleSelectedMonitor(t, store, result.State, now.Add(2*time.Minute))
 	if _, err := store.conn.ExecContext(context.Background(),
 		"UPDATE operating_points SET evidence_epoch_id = ? WHERE mac_addr = ? AND frequency = ? AND core_voltage = ?",
-		hold.ID, state.MacAddr, point.Frequency, point.CoreVoltage); err != nil {
+		state.MonitorReferenceEpochID, state.MacAddr, point.Frequency, point.CoreVoltage); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -1137,7 +1267,7 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 	states := []struct {
 		name    string
 		phase   OptimizerPhase
-		reason  HoldReason
+		reason  MonitorReason
 		purpose EpochPurpose
 		windows int
 	}{
@@ -1145,14 +1275,16 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 		{"undervolt", PhaseUndervolt, "", EpochTrial, 2},
 		{"frequency", PhaseFrequencyTest, "", EpochTrial, 2},
 		{"voltage", PhaseVoltageTest, "", EpochTrial, 2},
-		{"manual hold", PhaseHold, HoldManual, EpochHoldValidation, 1},
-		{"optimized hold", PhaseHold, HoldOptimized, EpochHoldValidation, 1},
-		{"starved hold", PhaseHold, HoldStarved, EpochProbation, 1},
+		{"manual monitor", PhaseMonitor, MonitorManual, EpochMonitor, 2},
+		{"selected monitor", PhaseMonitor, MonitorSelected, EpochMonitor, 2},
+		{"rejected monitor", PhaseMonitor, MonitorRejected, EpochMonitor, 2},
+		{"starved monitor", PhaseMonitor, MonitorStarved, EpochMonitor, 2},
+		{"off-grid monitor", PhaseMonitor, MonitorOffGrid, EpochMonitor, 2},
 		{"cooldown", PhaseCooldown, "", EpochSafetyValidation, 1},
 	}
 	for _, testCase := range states {
 		t.Run(testCase.name, func(t *testing.T) {
-			state := MinerState{MacAddr: testMAC, Phase: testCase.phase, HoldReason: testCase.reason,
+			state := MinerState{MacAddr: testMAC, Phase: testCase.phase, MonitorReason: testCase.reason,
 				CurrentFrequency: 400, CurrentCoreVoltage: 1000}
 			epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(),
 				Purpose: testCase.purpose, RequiredWindows: testCase.windows}
@@ -1175,11 +1307,10 @@ func TestOpenEpochPurposeMustMatchDurableState(t *testing.T) {
 	}
 	for _, state := range []MinerState{
 		{MacAddr: testMAC, Phase: PhaseEmergency, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
-		{MacAddr: testMAC, Phase: PhaseHold, HoldReason: HoldRejected, CurrentFrequency: 400, CurrentCoreVoltage: 1000},
 	} {
 		epoch := &EvidenceEpoch{MacAddr: testMAC, Point: state.CurrentPoint(), Purpose: EpochBaseline, RequiredWindows: 2}
 		if err := validateOpenEpochState(state, epoch, false, false); err == nil {
-			t.Fatalf("state %s/%s accepted an open epoch", state.Phase, state.HoldReason)
+			t.Fatalf("state %s/%s accepted an open epoch", state.Phase, state.MonitorReason)
 		}
 	}
 }
@@ -1190,7 +1321,8 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	target := OperatingPoint{Frequency: 525, CoreVoltage: 1100}
 	state.Phase = PhaseBaseline
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SetPendingMutation(MutationOperatingPoint, target, now)
 	if _, err := store.Apply(SaveState{State: state}, now); err != nil {
@@ -1233,8 +1365,8 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	}
 	state.SetCurrentPoint(target)
 	state.ClearPendingMutation()
-	state.Phase = PhaseHold
-	state.HoldReason = HoldRejected
+	state.Phase = PhaseMonitor
+	state.MonitorReason = MonitorRejected
 	state.SetFallbackPoint(OperatingPoint{})
 	completeResult, err := store.Apply(CompleteMutation{
 		MacAddr: state.MacAddr, IP: state.IP, AttemptID: id,
@@ -1244,7 +1376,7 @@ func TestMutationMilestonesAndAtomicResume(t *testing.T) {
 	}
 	state = completeResult.State
 	loaded, err := store.LoadMiner(testMAC)
-	if err != nil || loaded.Phase != PhaseBaseline || loaded.HoldReason != "" || loaded.CurrentPoint() != target {
+	if err != nil || loaded.Phase != PhaseBaseline || loaded.MonitorReason != "" || loaded.CurrentPoint() != target {
 		t.Fatalf("completion was not store-derived: %+v, %v", loaded, err)
 	}
 	if err := store.RecordFirstPositive(id, now.Add(6*time.Second)); err != nil {
@@ -1354,7 +1486,8 @@ func TestSafetyTransitionSupersedesChangedSafetyAttempt(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = PhaseCooldown
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SafetyReason = SafetyReasonASICLimit
 	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
@@ -1421,7 +1554,8 @@ func TestSafetyTransitionSupersedesReissuedSafetyAuthority(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = PhaseCooldown
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SafetyReason = SafetyReasonASICLimit
 	state.SetPendingMutation(MutationSafetyRollback, minimum, now)
@@ -1634,7 +1768,8 @@ func TestApplyIsExhaustiveOverTransitionVariants(t *testing.T) {
 	at := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	transitions := []Transition{
 		Bootstrap{},
-		ResetPass{},
+		StartPass{},
+		CompleteMonitor{},
 		FinalizeTrial{},
 		CompleteBaseline{},
 		AdoptManualPoint{},
