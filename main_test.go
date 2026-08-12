@@ -396,8 +396,24 @@ func TestEntryMarginRejectsInvalidFrozenEvidence(t *testing.T) {
 	entry := rootRecord(rootTestMAC, lib.OperatingPoint{Frequency: 525, CoreVoltage: 1100}, 100, 55, 18, 70)
 	entry.EntryAttemptID = 1
 	entry.ReferenceHash = 0
-	if controller.entryMarginPositive(&lib.MinerState{}, entry, lib.Settings{}, time.Now().UTC()) {
+	if controller.entryMarginPositive(&lib.MinerState{}, entry, 100, lib.Settings{}, time.Now().UTC()) {
 		t.Fatal("entry margin accepted a missing frozen reference")
+	}
+}
+
+func TestEntryMarginUsesCompletedTrialHash(t *testing.T) {
+	now := time.Now().UTC()
+	settings := rootTestSettings(t)
+	attempt := lib.MutationAttempt{
+		ID:               1,
+		PatchRequestedAt: now.Add(-2 * time.Minute),
+		MiningResumedAt:  now.Add(-time.Minute),
+	}
+	if !mutationMarginPositive(1075.88, 541.54, attempt, settings, now) {
+		t.Fatal("profitable measured trial was rejected by mutation margin")
+	}
+	if mutationMarginPositive(0, 541.54, attempt, settings, now) {
+		t.Fatal("missing measured trial hash was accepted")
 	}
 }
 
@@ -432,7 +448,7 @@ func TestTrialPredicatesApplyToEachWindow(t *testing.T) {
 	}
 }
 
-func TestUnhealthyManualValidationBecomesRejectedHold(t *testing.T) {
+func TestUnhealthyManualValidationBecomesRejectedMonitoring(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -453,17 +469,30 @@ func TestUnhealthyManualValidationBecomesRejectedHold(t *testing.T) {
 	}
 	state = result.State
 	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
-	if err := minerController.finishManualHold(
-		&state, mustOpenEpoch(t, store, state.MacAddr),
-		mustWindow(t, 0, 100, 55, 55, 70, 18, nil), rootTestSettings(t), now.Add(2*time.Minute),
+	window := mustWindow(t, 0, 100, 55, 55, 70, 18, nil)
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	progress := epoch.Progress
+	if err := progress.CloseWindow(true, window); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(lib.AdvanceEpoch{Epoch: epoch, Progress: progress}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	epoch = mustOpenEpoch(t, store, state.MacAddr)
+	combined, err := window.Combine(window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := minerController.evaluateMonitor(
+		context.Background(), &state, epoch, combined, rootTestASIC(), rootTestSettings(t), now.Add(3*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldRejected || !state.SettledAt.IsZero() {
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorRejected || !state.SettledAt.IsZero() {
 		t.Fatalf("unhealthy manual validation = %+v", state)
 	}
-	if _, open, err := store.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
-		t.Fatalf("rejected manual hold retained epoch: open=%t err=%v", open, err)
+	if epoch, open, err := store.OpenEvidenceEpochFor(state.MacAddr); err != nil || !open || epoch.Purpose != lib.EpochMonitor {
+		t.Fatalf("rejected manual monitor lost evidence: open=%t err=%v", open, err)
 	}
 }
 
@@ -535,18 +564,12 @@ func TestReportLoaderUsesHistoricalControlBoundaryAfterSecondRetune(t *testing.T
 	}
 	state = finalizeResult.State
 	boundarySettledAt := createdAt.Add(23 * time.Hour)
-	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
-	state.SettledAt = boundarySettledAt
-	if _, err := store.Apply(lib.CloseEpoch{
-		State: state, Epoch: holdEpoch, Outcome: lib.EpochValidated,
-	}, boundarySettledAt); err != nil {
-		t.Fatal(err)
-	}
+	state = settleSelectedMonitor(t, store, state, boundarySettledAt)
 
 	armStart := createdAt.Add(24 * time.Hour)
 	passStart := armStart.Add(lib.ReportArmDuration)
-	if _, err := store.Apply(lib.ResetPass{
-		MacAddr: info.MacAddr, Point: oldPoint,
+	if _, err := store.Apply(lib.StartPass{
+		MacAddr: info.MacAddr, Point: oldPoint, Trigger: lib.PassOperator,
 	}, passStart); err != nil {
 		t.Fatal(err)
 	}
@@ -615,8 +638,8 @@ func TestHourlyFragmentsSplitUTCAndClassifyTrials(t *testing.T) {
 func TestHourlyAccountingClassificationRejectsSamePhaseStateTransition(t *testing.T) {
 	from := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	state := lib.MinerState{
-		Phase:              lib.PhaseHold,
-		HoldReason:         lib.HoldOptimized,
+		Phase:              lib.PhaseMonitor,
+		MonitorReason:      lib.MonitorSelected,
 		CurrentFrequency:   525,
 		CurrentCoreVoltage: 1150,
 		PassReferenceHash:  100,
@@ -1019,14 +1042,9 @@ func starveExhaustBaseline(
 	return cursor
 }
 
-// TestMaxRejectedWindowsStarvesBaselineAndOpensProbation drives a baseline evidence epoch's
-// rejected-window budget to exhaustion and asserts the epoch-lifecycle consequence the RFC's
-// "Terminal States Get Exit Predicates" describes: the epoch closes starved (verified indirectly, by
-// reopening the durable store afterward and confirming validateCrossTableState's starved-HOLD
-// invariants all hold), the miner lands in HoldStarved/PhaseHold exactly as a rejected baseline would
-// except for the reason, and a probation successor opens at the same point immediately, in the same
-// transaction.
-func TestMaxRejectedWindowsStarvesBaselineAndOpensProbation(t *testing.T) {
+// TestMaxRejectedWindowsStartsStarvedMonitoring proves an exhausted baseline closes as starved and
+// atomically opens continuous two-window monitoring at the same point.
+func TestMaxRejectedWindowsStartsStarvedMonitoring(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "optimizer.db")
 	store, err := lib.OpenOptimizerStore(dbPath)
 	if err != nil {
@@ -1047,8 +1065,8 @@ func TestMaxRejectedWindowsStarvesBaselineAndOpensProbation(t *testing.T) {
 
 	starveExhaustBaseline(t, minerController, &state, point, asic, settings, now)
 
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldStarved || !state.SettledAt.IsZero() {
-		t.Fatalf("starved baseline did not land in HoldStarved/HOLD: %+v", state)
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorStarved || !state.SettledAt.IsZero() {
+		t.Fatalf("starved baseline did not enter starved monitoring: %+v", state)
 	}
 	if state.CurrentPoint() != point {
 		t.Fatalf("starvation changed the durable current point: %+v", state)
@@ -1057,11 +1075,11 @@ func TestMaxRejectedWindowsStarvesBaselineAndOpensProbation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !open || epoch.Purpose != lib.EpochProbation || epoch.Point != point || epoch.RequiredWindows != 1 {
-		t.Fatalf("starved baseline did not open a probation successor at the same point: open=%t epoch=%+v", open, epoch)
+	if !open || epoch.Purpose != lib.EpochMonitor || epoch.Point != point || epoch.RequiredWindows != 2 {
+		t.Fatalf("starved baseline did not open monitoring at the same point: open=%t epoch=%+v", open, epoch)
 	}
 	if epoch.Progress.SettledSamples() != 0 {
-		t.Fatalf("fresh probation epoch has nonzero settled samples: %+v", epoch.Progress)
+		t.Fatalf("fresh monitor epoch has nonzero settled samples: %+v", epoch.Progress)
 	}
 	points, err := store.ListPoints(rootTestMAC)
 	if err != nil {
@@ -1071,10 +1089,7 @@ func TestMaxRejectedWindowsStarvesBaselineAndOpensProbation(t *testing.T) {
 		t.Fatalf("starvation wrote or discarded the baseline's entered row: %+v", points)
 	}
 
-	// Reopening the store re-runs full schema and cross-table validation (validateStoredOptimizerData
-	// -> validateCrossTableState), including this commit's starved-HOLD invariants (an open epoch
-	// exists and is exactly Probation). A structurally invalid starved/probation shape would fail
-	// here even though every direct assertion above passed.
+	// Reopening re-runs the full starved-monitor cross-table invariant.
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1085,12 +1100,9 @@ func TestMaxRejectedWindowsStarvesBaselineAndOpensProbation(t *testing.T) {
 	defer reopened.Close()
 }
 
-// TestStarvedHoldAutoExitsOnceEnvironmentRecovers is the direct behavioral counterpart of
-// TestMaxRejectedWindowsStarvesBaselineAndOpensProbation: once a probation epoch is open, it
-// continues driving polls at a clean rate and asserts the RFC's exit predicate fires exactly at
-// windowMinSamples consecutive admitted samples — no timer, a sample count — reopening the identical
-// baseline evaluation (same point, EpochBaseline, 2 required windows) that starvation interrupted.
-func TestStarvedHoldAutoExitsOnceEnvironmentRecovers(t *testing.T) {
+// TestStarvedMonitorAutoExitsAfterTwoHealthyWindows proves starvation is not terminal: continuous
+// monitoring starts a new environmental pass once it can produce a complete healthy assessment.
+func TestStarvedMonitorAutoExitsAfterTwoHealthyWindows(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1110,35 +1122,33 @@ func TestStarvedHoldAutoExitsOnceEnvironmentRecovers(t *testing.T) {
 	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
 
 	cursor := starveExhaustBaseline(t, minerController, &state, point, asic, settings, now)
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldStarved {
-		t.Fatalf("setup did not reach a starved HOLD: %+v", state)
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorStarved {
+		t.Fatalf("setup did not reach starved monitoring: %+v", state)
 	}
 
-	// windowMinSamples consecutive clean polls: enough for probation's exit predicate, one short of
-	// which must not exit (checked at each step below).
-	target := windowMinSamples(settings)
-	for i := 1; i <= target; i++ {
-		cursor = cursor.Add(settings.MetricsTime)
+	target := rampSamples(settings) + 2*targetSampleCount(settings)
+	for i, tick := range pollSequence(cursor.Add(settings.MetricsTime), settings, 1, target) {
+		cursor = tick
 		info := rootTestInfo(point, 100)
 		if err := minerController.controlMinerAfterSafety(context.Background(), &state, mustReadablePoll(t, info, asic), settings, cursor, true); err != nil {
-			t.Fatalf("control miner after safety (probation sample %d) at %s: %v", i, cursor, err)
+			t.Fatalf("control miner after safety (monitor sample %d) at %s: %v", i+1, cursor, err)
 		}
-		if i < target {
-			if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldStarved {
-				t.Fatalf("starved HOLD exited before windowMinSamples samples were admitted (at sample %d of %d): %+v", i, target, state)
+		if i+1 < target {
+			if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorStarved {
+				t.Fatalf("starved monitor exited before two windows completed (at sample %d of %d): %+v", i+1, target, state)
 			}
 		}
 	}
 
-	if state.Phase != lib.PhaseBaseline || state.HoldReason != "" {
-		t.Fatalf("starved HOLD did not auto-exit at windowMinSamples samples: %+v", state)
+	if state.Phase != lib.PhaseBaseline || state.MonitorReason != "" {
+		t.Fatalf("starved monitor did not start an environmental pass: %+v", state)
 	}
 	epoch, open, err := store.OpenEvidenceEpochFor(rootTestMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !open || epoch.Purpose != lib.EpochBaseline || epoch.Point != point || epoch.RequiredWindows != 2 {
-		t.Fatalf("probation did not reopen the interrupted baseline evaluation: open=%t epoch=%+v", open, epoch)
+		t.Fatalf("monitor did not open a fresh baseline evaluation: open=%t epoch=%+v", open, epoch)
 	}
 	if epoch.Progress.SettledSamples() != 0 || epoch.Progress.ClosedWindows() != 0 {
 		t.Fatalf("reopened baseline epoch is not fresh: %+v", epoch.Progress)
@@ -1152,13 +1162,9 @@ func TestStarvedHoldAutoExitsOnceEnvironmentRecovers(t *testing.T) {
 	}
 }
 
-// TestRejectedHoldNeverAutoExits is the negative counterpart the RFC's starvation-exit verification
-// explicitly requires alongside the positive case: a HoldRejected miner (a real measured, terminal
-// conclusion about the hardware) must never re-arm on its own, unlike HoldStarved. It drives a
-// baseline to a genuine quality failure (median hash rate of exactly zero, an always-unhealthy
-// window), then polls it for far longer than the starved case's exit predicate would ever need, and
-// asserts the miner never leaves HoldRejected and no evidence epoch ever reopens.
-func TestRejectedHoldNeverAutoExits(t *testing.T) {
+// TestRejectedMonitorAutoExitsWhenQualityRecovers proves a measured rejection remains monitored and
+// automatically starts a fresh pass after two healthy windows reverse the failed condition.
+func TestRejectedMonitorAutoExitsWhenQualityRecovers(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1185,7 +1191,7 @@ func TestRejectedHoldNeverAutoExits(t *testing.T) {
 	}
 	// Two full admitted windows (ramp + two full targetSampleCount windows) at a clean rate, every
 	// sample reporting zero hash: qualityHealthy fails on the combined aggregate and evaluateBaseline
-	// blocks with a real (if bad) measurement, landing HoldRejected.
+	// records a real (if bad) measurement and enters rejected monitoring.
 	var lastTick time.Time
 	for _, tick := range pollSequence(now, settings, 1.0, rampSamples(settings)+2*targetSampleCount(settings)) {
 		if err := minerController.controlMinerAfterSafety(context.Background(), &state, mustReadablePoll(t, unhealthyInfo(), asic), settings, tick, true); err != nil {
@@ -1193,8 +1199,8 @@ func TestRejectedHoldNeverAutoExits(t *testing.T) {
 		}
 		lastTick = tick
 	}
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldRejected || !state.SettledAt.IsZero() {
-		t.Fatalf("setup did not reach a rejected HOLD: %+v", state)
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorRejected || !state.SettledAt.IsZero() {
+		t.Fatalf("setup did not reach rejected monitoring: %+v", state)
 	}
 	points, err := store.ListPoints(rootTestMAC)
 	if err != nil {
@@ -1205,33 +1211,23 @@ func TestRejectedHoldNeverAutoExits(t *testing.T) {
 		t.Fatalf("rejected baseline did not carry a real measured record: %+v", points)
 	}
 
-	// Drive far more polls than the starved case's windowMinSamples exit predicate would ever need,
-	// including a run of clean samples at the exact rejected point, to confirm nothing re-arms.
 	cursor := lastTick
-	for i := 0; i < 4*windowMinSamples(settings); i++ {
-		cursor = cursor.Add(settings.MetricsTime)
+	for i, tick := range pollSequence(cursor.Add(settings.MetricsTime), settings, 1,
+		rampSamples(settings)+2*targetSampleCount(settings)) {
+		cursor = tick
 		if err := minerController.controlMinerAfterSafety(context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, cursor, true); err != nil {
-			t.Fatalf("control miner after safety (rejected hold poll %d) at %s: %v", i, cursor, err)
+			t.Fatalf("control miner after safety (rejected monitor poll %d) at %s: %v", i, cursor, err)
 		}
 	}
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldRejected || !state.SettledAt.IsZero() {
-		t.Fatalf("rejected HOLD did not remain terminal: %+v", state)
+	if state.Phase != lib.PhaseBaseline || state.PassTrigger != lib.PassEnvironment {
+		t.Fatalf("rejected monitor did not start an environmental pass: %+v", state)
 	}
-	if _, open, err := store.OpenEvidenceEpochFor(rootTestMAC); err != nil || open {
-		t.Fatalf("rejected HOLD reopened an evidence epoch: open=%t err=%v", open, err)
+	if epoch, open, err := store.OpenEvidenceEpochFor(rootTestMAC); err != nil || !open || epoch.Purpose != lib.EpochBaseline {
+		t.Fatalf("environmental pass has no baseline evidence: open=%t epoch=%+v err=%v", open, epoch, err)
 	}
 }
 
-// TestProbationAtDegradedRateDoesNotOscillate answers the RFC's own flagged material uncertainty
-// (the report accompanying this commit calls it out explicitly): at a delivered-tick rate low enough
-// that individual windows would fail admission (rate = 0.4, the same period-5 deliver/drop/drop/
-// deliver/drop pattern TestWindowClosesOnSpanAndAdmitsAtWindowMinSamples uses), does a probation
-// epoch itself starve and reopen another probation, oscillating indefinitely? By this commit's
-// mechanics it structurally cannot: probation never evaluates a window or a rejected-window budget at
-// all, only a plain consecutive-sample count with no reset except contradiction, so a degraded but
-// nonzero delivery rate can only ever slow the exit down, never restart or oscillate it. This test
-// observes and records that directly, without needing to add a rescue.
-func TestProbationAtDegradedRateDoesNotOscillate(t *testing.T) {
+func TestSelectedMonitorContinuouslyReopensAfterStableAssessment(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1241,58 +1237,262 @@ func TestProbationAtDegradedRateDoesNotOscillate(t *testing.T) {
 	asic := rootTestASIC()
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
-	bootstrapResult, err := store.Apply(lib.Bootstrap{
+	bootstrap, err := store.Apply(lib.Bootstrap{
 		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
 	}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := bootstrapResult.State
+	state := closeInitialBaselineEpoch(t, store, bootstrap.State, now.Add(time.Minute))
+	referenceID := state.MonitorReferenceEpochID
+	settledAt := state.SettledAt
+	firstSuccessor := mustOpenEpoch(t, store, state.MacAddr).ID
 	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
-
-	cursor := starveExhaustBaseline(t, minerController, &state, point, asic, settings, now)
-	if state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldStarved {
-		t.Fatalf("setup did not reach a starved HOLD: %+v", state)
+	if window := minerController.formatWindow(state, settings, now.Add(time.Minute)); !strings.HasPrefix(window, "selected 0/") {
+		t.Fatalf("selected monitor progress is hidden: %q", window)
 	}
-	probationEpoch, open, err := store.OpenEvidenceEpochFor(rootTestMAC)
-	if err != nil || !open || probationEpoch.Purpose != lib.EpochProbation {
-		t.Fatalf("setup did not open a probation epoch: open=%t epoch=%+v err=%v", open, probationEpoch, err)
+	cursor := now.Add(time.Minute)
+	for _, tick := range pollSequence(cursor.Add(settings.MetricsTime), settings, 1, 2*targetSampleCount(settings)) {
+		cursor = tick
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, tick, true,
+		); err != nil {
+			t.Fatalf("stable monitor poll at %s: %v", tick, err)
+		}
 	}
-	probationEpochID := probationEpoch.ID
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorSelected ||
+		state.MonitorReferenceEpochID != referenceID || !state.SettledAt.Equal(settledAt) {
+		t.Fatalf("stable assessment changed selected monitor authority: %+v", state)
+	}
+	successor := mustOpenEpoch(t, store, state.MacAddr)
+	if successor.ID == firstSuccessor || successor.Purpose != lib.EpochMonitor ||
+		successor.Progress.ClosedWindows() != 0 {
+		t.Fatalf("stable assessment did not open a fresh monitor cycle: %+v", successor)
+	}
+}
 
-	// Period-5 "deliver, drop, drop, deliver, drop" (delivered at tick%5 == 0 or 3): exactly the 0.4
-	// delivered-tick rate the RFC's own verification section calls out for this measurement, well
-	// below the 0.5 threshold windows need to survive admission at all.
-	var reopenedAt time.Time
-	reopened := false
-	for tick := 1; tick <= 300; tick++ {
-		if tick%5 != 0 && tick%5 != 3 {
-			continue
+func TestSafetyInterruptClosesMonitorAndClearsLiveReference(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := closeInitialBaselineEpoch(t, store, bootstrap.State, now.Add(time.Minute))
+	monitor := mustOpenEpoch(t, store, state.MacAddr)
+	info := rootTestInfo(point, 100)
+	info.Temp = settings.TempLimit + .5
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	handled, err := minerController.enforceMinerSafety(
+		context.Background(), &state, info, asic, settings, now.Add(2*time.Minute),
+	)
+	if err != nil || !handled {
+		t.Fatalf("safety interrupt = handled:%t err:%v", handled, err)
+	}
+	if state.Phase != lib.PhaseCooldown || state.PendingKind != lib.MutationSafetyRollback ||
+		state.MonitorReason != "" || state.MonitorReferenceEpochID != 0 || !state.SettledAt.IsZero() {
+		t.Fatalf("safety interrupt retained monitor authority: %+v", state)
+	}
+	if _, open, err := store.OpenEvidenceEpochFor(state.MacAddr); err != nil || open {
+		t.Fatalf("safety interrupt retained open monitor evidence: open=%t err=%v", open, err)
+	}
+	closed, err := store.EvidenceEpochByID(monitor.ID)
+	if err != nil || closed.Outcome != lib.EpochContradicted || closed.ClosedAt.IsZero() {
+		t.Fatalf("interrupted monitor epoch = %+v, %v", closed, err)
+	}
+}
+
+func TestWarmBaselineStillExploresSafeUndervolt(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := bootstrap.State
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	for _, tick := range pollSequence(now.Add(settings.MetricsTime), settings, 1,
+		rampSamples(settings)+2*targetSampleCount(settings)) {
+		info := rootTestInfo(point, 100)
+		info.Temp = settings.TargetTemp
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, info, asic), settings, tick, true,
+		); err != nil {
+			t.Fatalf("warm baseline poll at %s: %v", tick, err)
 		}
-		cursor = cursor.Add(settings.MetricsTime)
-		if err := minerController.controlMinerAfterSafety(context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, cursor, true); err != nil {
-			t.Fatalf("control miner after safety (degraded probation tick %d) at %s: %v", tick, cursor, err)
+	}
+	want := lib.OperatingPoint{Frequency: point.Frequency, CoreVoltage: 1100}
+	if state.Phase != lib.PhaseUndervolt || state.PendingKind != lib.MutationOperatingPoint ||
+		state.PendingPoint() != want {
+		t.Fatalf("warm baseline did not choose the safe lower-voltage pair: %+v", state)
+	}
+}
+
+func TestSelectedMonitorHashDriftStartsEnvironmentalPass(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := closeInitialBaselineEpoch(t, store, bootstrap.State, now.Add(time.Minute))
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	for _, tick := range pollSequence(now.Add(time.Minute+settings.MetricsTime), settings, 1, 2*targetSampleCount(settings)) {
+		info := rootTestInfo(point, 100)
+		info.HashRate = 90
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, info, asic), settings, tick, true,
+		); err != nil {
+			t.Fatalf("drift monitor poll at %s: %v", tick, err)
 		}
-		epoch, open, err := store.OpenEvidenceEpochFor(rootTestMAC)
-		if err != nil {
+	}
+	if state.Phase != lib.PhaseBaseline || state.PassTrigger != lib.PassEnvironment ||
+		state.MonitorReason != "" || state.MonitorReferenceEpochID != 0 || !state.SettledAt.IsZero() {
+		t.Fatalf("hash drift did not start a fresh environmental pass: %+v", state)
+	}
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	if epoch.Purpose != lib.EpochBaseline || epoch.Point != point || epoch.Progress.ClosedWindows() != 0 {
+		t.Fatalf("environmental pass baseline = %+v", epoch)
+	}
+	points, err := store.ListPoints(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Point() != point || points[0].Status != lib.PointEntered {
+		t.Fatalf("environmental pass did not reset the finite frontier: %+v", points)
+	}
+}
+
+func TestSelectedMonitorResumesSecondWindowAfterRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := lib.OpenOptimizerStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 525, CoreVoltage: 1150}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := closeInitialBaselineEpoch(t, store, bootstrap.State, now.Add(time.Minute))
+	referenceID := state.MonitorReferenceEpochID
+	controllerBefore := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	cursor := now.Add(time.Minute)
+	for _, tick := range pollSequence(cursor.Add(settings.MetricsTime), settings, 1, targetSampleCount(settings)) {
+		cursor = tick
+		if err := controllerBefore.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, tick, true,
+		); err != nil {
 			t.Fatal(err)
 		}
-		if open && epoch.Purpose == lib.EpochProbation && epoch.ID != probationEpochID {
-			t.Fatalf("probation reopened a second probation epoch at tick %d instead of accumulating on the first: original=%d new=%+v", tick, probationEpochID, epoch)
-		}
-		if open && epoch.Purpose == lib.EpochProbation && epoch.Progress.RejectedWindows() != 0 {
-			t.Fatalf("probation epoch accumulated a rejected window at tick %d: %+v", tick, epoch.Progress)
-		}
-		if state.Phase == lib.PhaseBaseline {
-			reopened = true
-			reopenedAt = cursor
-			break
+	}
+	interrupted := mustOpenEpoch(t, store, state.MacAddr)
+	if interrupted.Progress.ClosedWindows() != 1 {
+		t.Fatalf("first monitor window was not durable before restart: %+v", interrupted.Progress)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = lib.OpenOptimizerStore(dbPath)
+	if err != nil {
+		t.Fatalf("reopen after first monitor window: %v", err)
+	}
+	defer store.Close()
+	state, err = store.LoadMiner(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controllerAfter := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	for _, tick := range pollSequence(cursor.Add(settings.MetricsTime), settings, 1, targetSampleCount(settings)) {
+		cursor = tick
+		if err := controllerAfter.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, tick, true,
+		); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if !reopened {
-		t.Fatalf("probation never exited at a 0.4 delivered-tick rate within the poll budget: state=%+v", state)
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorSelected ||
+		state.MonitorReferenceEpochID != referenceID {
+		t.Fatalf("restart lost selected monitor authority: %+v", state)
 	}
-	t.Logf("observation: at a 0.4 delivered-tick rate, the single probation epoch (id %d) opened by starvation at %s exited cleanly at %s with no reopen and no rejected window ever recorded against it — probation's pure sample-count race is immune to the admission-rate degradation that would starve a normal window-evaluating epoch", probationEpochID, now, reopenedAt)
+	successor := mustOpenEpoch(t, store, state.MacAddr)
+	if successor.ID == interrupted.ID || successor.Purpose != lib.EpochMonitor {
+		t.Fatalf("restart did not complete and replace the interrupted monitor epoch: %+v", successor)
+	}
+}
+
+func TestOffGridMonitorStartsPassOnlyAfterExactPairBecomesAdvertised(t *testing.T) {
+	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings := rootTestSettings(t)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 490, CoreVoltage: 1000}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: false,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := bootstrap.State
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorOffGrid {
+		t.Fatalf("setup did not enter off-grid monitoring: %+v", state)
+	}
+	asic := rootTestASIC()
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	for _, tick := range pollSequence(now.Add(settings.MetricsTime), settings, 1,
+		rampSamples(settings)+2*targetSampleCount(settings)) {
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, rootTestInfo(point, 100), asic), settings, tick, true,
+		); err != nil {
+			t.Fatalf("new-grid monitor poll at %s: %v", tick, err)
+		}
+	}
+	if state.Phase != lib.PhaseBaseline || state.PassTrigger != lib.PassEnvironment ||
+		state.CurrentPoint() != point || state.PendingKind != "" {
+		t.Fatalf("newly advertised exact pair did not begin an evidence-only pass: %+v", state)
+	}
+	points, err := store.ListPoints(state.MacAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Point() != point || points[0].Status != lib.PointEntered {
+		t.Fatalf("newly advertised pair produced unexpected frontier authority: %+v", points)
+	}
 }
 
 // mustOpenEpoch and closeInitialBaselineEpoch mirror the lib-package test helpers.
@@ -1325,11 +1525,35 @@ func closeInitialBaselineEpoch(t *testing.T, store *lib.OptimizerStore, state li
 		t.Fatalf("close initial baseline epoch: %v", err)
 	}
 	state = result.State
-	holdEpoch := mustOpenEpoch(t, store, state.MacAddr)
-	state.SettledAt = at
-	result, err = store.Apply(lib.CloseEpoch{State: state, Epoch: holdEpoch, Outcome: lib.EpochValidated}, at)
+	return settleSelectedMonitor(t, store, state, at)
+}
+
+func settleSelectedMonitor(t *testing.T, store *lib.OptimizerStore, state lib.MinerState, at time.Time) lib.MinerState {
+	t.Helper()
+	monitorEpoch := mustOpenEpoch(t, store, state.MacAddr)
+	window := mustWindow(t, 100, 100, 55, 56, 70, 18, nil)
+	progress := monitorEpoch.Progress
+	if err := progress.CloseWindow(true, window); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Apply(lib.AdvanceEpoch{Epoch: monitorEpoch, Progress: progress}, at); err != nil {
+		t.Fatal(err)
+	}
+	monitorEpoch = mustOpenEpoch(t, store, state.MacAddr)
+	progress = monitorEpoch.Progress
+	if err := progress.CloseWindow(true, window); err != nil {
+		t.Fatal(err)
+	}
+	combined, err := window.Combine(window)
 	if err != nil {
-		t.Fatalf("settle initial optimized hold: %v", err)
+		t.Fatal(err)
+	}
+	result, err := store.Apply(lib.CompleteMonitor{
+		State: state, Epoch: monitorEpoch, Progress: progress, Aggregate: combined,
+		Decision: lib.MonitorContinue, NextReason: lib.MonitorSelected,
+	}, at)
+	if err != nil {
+		t.Fatalf("settle initial selected monitor: %v", err)
 	}
 	return result.State
 }
@@ -2246,8 +2470,8 @@ func TestFreshEmergencyEpisodeResetsStaleRecoveryHealthyCount(t *testing.T) {
 }
 
 // TestSafetyRecoveryResumesPassAndIsNotSettled drives the complete durable recovery path. A
-// successful safety-validation window must open a fresh baseline for the same pass, not become a
-// terminal or retune-eligible HOLD.
+// successful safety-validation window must open a fresh baseline for the same pass, not manufacture
+// a monitor conclusion.
 func TestSafetyRecoveryResumesPassAndIsNotSettled(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
 	if err != nil {
@@ -2281,7 +2505,7 @@ func TestSafetyRecoveryResumesPassAndIsNotSettled(t *testing.T) {
 			t.Fatalf("control miner after safety (window poll %d): %v", i, err)
 		}
 	}
-	if state.Phase != lib.PhaseBaseline || state.HoldReason != "" || !state.SettledAt.IsZero() {
+	if state.Phase != lib.PhaseBaseline || state.MonitorReason != "" || !state.SettledAt.IsZero() {
 		t.Fatalf("miner did not resume its pass baseline: %+v", state)
 	}
 	if state.SafetyReason != "" {
@@ -2304,7 +2528,7 @@ func TestSafetyRecoveryResumesPassAndIsNotSettled(t *testing.T) {
 // TestSafetyInterruptedCandidateIsConsumedAndRecoveryContinuesFrontier reproduces the incident
 // shape: 400/1060 was reserved but never became observable before emergency recovery returned the
 // miner to 400/1000. Recovery must preserve 400/1060 as consumed, revalidate the safe incumbent,
-// and continue with the next unseen frequency candidate instead of entering a terminal HOLD or
+// and continue with the next unseen frequency candidate instead of manufacturing a monitor result or
 // retrying the interrupted voltage point.
 func TestSafetyInterruptedCandidateIsConsumedAndRecoveryContinuesFrontier(t *testing.T) {
 	store, err := lib.OpenOptimizerStore(filepath.Join(t.TempDir(), "optimizer.db"))
@@ -2378,7 +2602,7 @@ func TestSafetyInterruptedCandidateIsConsumedAndRecoveryContinuesFrontier(t *tes
 		t.Fatal(err)
 	}
 	if state.Phase != lib.PhaseFrequencyTest || state.PendingKind != lib.MutationOperatingPoint ||
-		state.PendingPoint() != next || state.PendingPoint() == interrupted || state.HoldReason != "" {
+		state.PendingPoint() != next || state.PendingPoint() == interrupted || state.MonitorReason != "" {
 		t.Fatalf("frontier did not continue past interrupted point: %+v", state)
 	}
 	records, err = store.ListPoints(rootTestMAC)

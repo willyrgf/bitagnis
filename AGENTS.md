@@ -132,7 +132,7 @@ blocker. If verification was intentionally omitted, say so explicitly.
 - `main.go` owns process startup, network discovery orchestration, polling, and terminal rendering.
   Keep it thin; domain decisions belong in the optimizer or `lib`.
 - `optimizer.go` owns thermal-frontier search, the per-poll evidence-epoch lifecycle (ramp,
-  window admission, starvation/probation recovery), safety evaluation, rollback, cooldown, overheat
+  window admission, continuous monitoring and starvation recovery), safety evaluation, rollback, cooldown, overheat
   policy, and operating-point target selection.
 - `mutation.go` owns mutation priority, durable-intent coordination, preflight checks, PATCH/restart
   ordering, durable mutation-attempt milestones, same-MAC rediscovery, reboot proof, readback,
@@ -192,11 +192,12 @@ These invariants are high risk if violated:
   complete safe post-boot reads exactly 100 MHz / 100 mV below an unfinished requested point are
   typed AxeOS-reduction evidence; arbitrary stable safe mismatches use the manual-adoption path.
 - A manual operating-point change requires two consecutive observations before adoption. Adoption
-  starts a fresh baseline ramp and telemetry window.
+  starts a fresh monitor ramp and two-window assessment.
 - Telemetry samples remain in memory. Durable state contains optimizer control state, the
   evidence-epoch ledger's settled-sample and window counters, evaluated summaries, and
   credential-free mutation lifecycle timestamps — not raw polling history. A closed epoch's first
-  admitted window is the one durable exception: it is a stored aggregate, never raw samples.
+  admitted window and a selected monitor's conservative combined reference are the durable
+  exceptions: both are aggregates, never raw samples.
 - Preserve evaluated-point history across firmware recovery and ordinary process restarts unless a
   deliberate schema or policy change says otherwise.
 - `COOLDOWN` exits on a durable count of consecutive polls proving the device is actually safe to
@@ -208,8 +209,8 @@ These invariants are high risk if violated:
   epoch must match its exact phase/reason, current point, required-window count, pending-authority,
   settlement, and safety-recovery shape; enforce that invariant both as an `Apply` postcondition and
   on reopen. A validated `safety_validation` epoch atomically opens a fresh two-window baseline for
-  the same pass; it never creates a safety-derived `HOLD`, deletes point history, or retries a
-  consumed candidate. Schema version 10 rejects version 9 and earlier unchanged; do not repair or
+  the same pass; it never creates a safety-derived monitor conclusion, deletes point history, or
+  retries a consumed candidate. Schema version 11 rejects version 10 and earlier unchanged; do not repair or
   reinterpret prior semantic contracts. The wall-clock cooldown timer this replaced (and the
   durable field it wrote) was removed as part of the schema-version-7 cutover; do not reintroduce a
   duration-based gate here — prefer a monotone, restart-surviving count, as below. A second,
@@ -222,7 +223,7 @@ These invariants are high risk if violated:
   the `COOLDOWN` exit predicate above — do not conflate the two. `EmergencyCount` itself is durable
   and increments correctly, but no restriction currently reads it, and the RFC's stated derivation
   (an "episode anchor" read from `MinerState.PhaseStartedAt`) does not hold: `PhaseStartedAt` is
-  overwritten by ordinary transitions (`ResetPass`, `CompleteBaseline`, `FinalizeTrial`,
+  overwritten by ordinary transitions (`StartPass`, `CompleteBaseline`, `FinalizeTrial`,
   `ResumePassAfterSafety`, `AdoptManualPoint`, mutation completion) that can occur between an
   emergency episode and a later exploration pass, so it cannot serve as a stable anchor for "how
   recently did this miner enter emergency control."
@@ -242,10 +243,12 @@ These invariants are high risk if violated:
   not erase healthy evidence on other miners. A baseline may durably close its first of two windows
   behind the gate and pauses before the second window can create frontier authority; a trial pauses
   immediately because its first window may authorize an early return mutation.
-- A blocked `HOLD` splits by cause: `starved` (the environment never delivered a usable evaluation
-  window) exits automatically once it proves it can, with no timer and no operator step; `rejected`
-  (the controller measured the point and it failed) stays terminal until an explicit retune. Do not
-  collapse them back into one absorbing state.
+- `MONITOR` is active evidence collection, never an absorbing optimizer stop. Every selected,
+  manual, rejected, starved, or off-grid monitor state has an open two-window epoch. Selected
+  monitoring keeps a durable combined reference and starts a fresh finite environmental pass only
+  after a persistent material change in actual hash, quality, or thermal headroom. Rejected and
+  starved monitoring recover automatically when complete healthy evidence returns. Off-grid points
+  remain observable but cannot become automated targets.
 - Actual sustained hash rate is the objective. Expected hash rate, attainment, ASIC error
   percentage, and share deltas are diagnostics or quality constraints; expected hash alone must not
   veto a faster safe point.

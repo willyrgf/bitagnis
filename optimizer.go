@@ -25,7 +25,7 @@ const (
 	// is a count"). It is asserted in the RFC, not derived: commit 0's per-cycle attribution was
 	// meant to calibrate it against a measured clean-interval rate, but no real hardware measurement
 	// exists yet. Exhausting it ends a baseline epoch as starved (starveBaseline) or a trial
-	// candidate as PointStarved (finalizeTrial); hold_validation and safety_validation keep trying
+	// candidate as PointStarved (finalizeTrial); monitor and safety_validation keep trying
 	// regardless of it (see the exhaustion handling in controlMinerAfterSafety for why). Left at the
 	// RFC's stated value pending real measurement.
 	maxRejectedWindows = 6
@@ -143,7 +143,7 @@ type accountingClassification struct {
 	pendingKind       lib.MutationKind
 	pendingPoint      lib.OperatingPoint
 	miningPending     bool
-	holdReason        lib.HoldReason
+	monitorReason     lib.MonitorReason
 	safetyReason      lib.SafetyReason
 	evidencePending   bool
 	settled           bool
@@ -164,7 +164,7 @@ func classifyAccountingState(
 		pendingKind:       state.PendingKind,
 		pendingPoint:      state.PendingPoint(),
 		miningPending:     state.MiningPending,
-		holdReason:        state.HoldReason,
+		monitorReason:     state.MonitorReason,
 		safetyReason:      state.SafetyReason,
 		evidencePending:   hasOpenEpoch,
 		settled:           settled,
@@ -292,7 +292,8 @@ func (minerController *controller) enforceMinerSafety(
 					state.PhaseStartedAt = now
 				}
 				state.Phase = lib.PhaseEmergency
-				state.HoldReason = ""
+				state.MonitorReason = ""
+				state.MonitorReferenceEpochID = 0
 				if firmwareOverheat {
 					state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonFirmwareOverheat)
 				} else {
@@ -304,7 +305,8 @@ func (minerController *controller) enforceMinerSafety(
 					state.PhaseStartedAt = now
 				}
 				state.Phase = lib.PhaseEmergency
-				state.HoldReason = ""
+				state.MonitorReason = ""
+				state.MonitorReferenceEpochID = 0
 				state.SafetyReason = escalateSafetyReason(state.SafetyReason, reasonForSafetyFailure(assessment.failure))
 			}
 			state.UnreadablePollCount = 0
@@ -450,7 +452,8 @@ func (minerController *controller) recordUnreadablePoll(
 		state.PhaseStartedAt = now
 	}
 	state.Phase = lib.PhaseEmergency
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SafetyReason = escalateSafetyReason(state.SafetyReason, lib.SafetyReasonTelemetryUnavailable)
 	state.UnreadablePollCount = 0
 	// See the matching reset in enforceMinerSafety: a dwell count from a prior COOLDOWN belongs to
@@ -498,24 +501,19 @@ func (minerController *controller) controlMinerAfterSafety(
 			return fmt.Errorf("%s reported invalid normal operating point %d MHz/%d mV", state.Hostname, livePoint.Frequency, livePoint.CoreVoltage)
 		}
 		state.SetCurrentPoint(livePoint)
-		// Both branches below are HoldRejected, not HoldStarved: durable current had never been
-		// established at all (Bootstrap's own else-branches leave it unset for exactly this
-		// follow-up poll to resolve), and no evidence epoch was ever opened for any point here to
-		// give a probation successor something to reopen. The first branch is the off-grid case the
-		// RFC discusses directly: the device is seen and running something the automation can never
-		// target, a real terminal conclusion. The second branch (grid canonical and advertised) is
-		// the same degenerate-bootstrap bucket for symmetry: this call path never formally enters
-		// BASELINE or opens an epoch, so even a fine point lands in the same terminal, operator-
-		// retune-only state as it always has.
+		// A newly usable live point enters continuous monitoring. An unadvertised pair remains
+		// observable but cannot become an automated target unless a later canonical AxeOS grid
+		// advertises that exact pair.
 		if canonicalASICGrid(asic) != nil || !operatingPointAdvertised(asic, livePoint) {
-			state.Phase = lib.PhaseHold
-			state.HoldReason = lib.HoldRejected
+			state.Phase = lib.PhaseMonitor
+			state.MonitorReason = lib.MonitorOffGrid
+			state.MonitorReferenceEpochID = 0
 			state.SettledAt = time.Time{}
 			minerController.resetRuntime(state.MacAddr)
 			return minerController.saveMinerState(state, now)
 		}
-		state.Phase = lib.PhaseHold
-		state.HoldReason = lib.HoldRejected
+		state.Phase = lib.PhaseMonitor
+		state.MonitorReason = lib.MonitorRejected
 		state.PhaseStartedAt = now
 		minerController.resetRuntime(state.MacAddr)
 		return minerController.saveMinerState(state, now)
@@ -523,11 +521,10 @@ func (minerController *controller) controlMinerAfterSafety(
 	// Live-point reconciliation is an input to every phase, not a phase itself: it must not precede
 	// the PendingKind/Overheat/Cooldown recovery handling immediately below — the RFC's own cited
 	// range (optimizer.go:311-333 in the pre-cutover file) covers exactly that block, not the
-	// Hold-reason switch further down — or the satisfied recovery predicate below becomes unreachable
+	// monitor handling further down — or the satisfied recovery predicate below becomes unreachable
 	// whenever the live point also differs, exactly the ordering defect that left mineira deadlocked
-	// in COOLDOWN. Reconciliation is deliberately positioned BEFORE the Hold-switch
-	// so a settled HoldManual/HoldOptimized miner's live-point drift is still reconciled exactly as it
-	// was before this reordering — moving it past the Hold-switch too would silently and permanently
+	// in COOLDOWN. Reconciliation is deliberately positioned before monitoring
+	// so a selected or manual miner's live-point drift is still reconciled — moving it later would
 	// stop reconciling drift for any settled miner, a regression this fix does not intend. The
 	// ObservedCount reset stays here: it is independent of phase, and it must run before a phase
 	// early-return either way, since it only fires when the live point already matches durable
@@ -579,28 +576,13 @@ func (minerController *controller) controlMinerAfterSafety(
 			return minerController.openEpochTransition(state, lib.EpochSafetyValidation, 1, now)
 		}
 		// The recovery threshold was already met on an earlier poll and a safety_validation epoch is
-		// open: fall through to the shared epoch lifecycle below, exactly like a starved HOLD does.
+		// open: fall through to the shared epoch lifecycle below.
 	}
 	if livePoint != state.CurrentPoint() {
 		return minerController.observeExternalPoint(state, poll, settings, now)
 	}
-	if state.Phase == lib.PhaseHold {
-		switch state.HoldReason {
-		case lib.HoldRejected:
-			return nil
-		case lib.HoldManual, lib.HoldOptimized:
-			if !state.SettledAt.IsZero() {
-				return nil
-			}
-		case lib.HoldStarved:
-			// Unlike HoldRejected, a starved HOLD falls through to the epoch-progress code below:
-			// starveBaseline always opens a probation epoch in the same transaction it starves in,
-			// so there is always an open epoch here to accumulate settled samples toward the
-			// windowMinSamples auto-exit (see the probation handling further down).
-		default:
-			return nil
-		}
-	}
+	// MONITOR is an active evidence phase. It deliberately falls through to the shared epoch
+	// lifecycle even after a point has been selected and settled.
 
 	epoch, open, err := minerController.states.OpenEvidenceEpochFor(state.MacAddr)
 	if err != nil {
@@ -622,30 +604,19 @@ func (minerController *controller) controlMinerAfterSafety(
 	}
 	if !open {
 		// Nothing accumulates without an epoch. Every phase reachable here already had its epoch
-		// opened by the transition that put the miner in it (Bootstrap, ResetPass, CompleteResume,
-		// AdoptManualPoint/AdoptExternalPoint, CompleteBaseline's final hold placement
-		// validation, or starveBaseline's probation successor).
+		// opened by the transition that put the miner in it (Bootstrap, StartPass, CompleteResume,
+		// AdoptManualPoint/AdoptExternalPoint, CompleteBaseline, or starveBaseline).
 		return nil
 	}
 
 	runtime := minerController.runtimeFor(state.MacAddr)
 	missedSincePrevious := pollGapMissed(runtime, settings, now)
 
-	// Probation never evaluates a window: it is a pure recovery-sample race, deliberately compared
-	// against windowMinSamples rather than rampSamples (RFC "Terminal States Get Exit Predicates":
-	// probation asks whether the *environment* can deliver a window's worth of samples, not whether
-	// the *hardware* has settled). "No timer" is exact — there is no bound on how long this can take,
-	// only on how many consecutive samples it needs once they start arriving.
-	if epoch.Purpose == lib.EpochProbation {
-		progress := epoch.Progress
-		progress.ObserveSample(missedSincePrevious)
-		if progress.SettledSamples() < windowMinSamples(settings) {
-			return minerController.advanceEpoch(state, epoch, progress, now)
-		}
-		return minerController.closeProbation(state, epoch, now)
-	}
-
-	if epoch.Progress.SettledSamples() < rampSamples(settings) {
+	// The first assessment at a new monitor point uses the ordinary hardware-settling ramp. Stable
+	// successor assessments reuse the same proven point and therefore begin collecting their wider
+	// two-window evidence immediately.
+	if epoch.Progress.SettledSamples() < rampSamples(settings) &&
+		!(epoch.Purpose == lib.EpochMonitor && state.MonitorReferenceEpochID > 0) {
 		progress := epoch.Progress
 		progress.ObserveSample(missedSincePrevious)
 		return minerController.advanceEpoch(state, epoch, progress, now)
@@ -680,19 +651,10 @@ func (minerController *controller) controlMinerAfterSafety(
 			return err
 		}
 		if progress.RejectedWindows() >= maxRejectedWindows {
-			// The starvation exit (starveBaseline -> probation -> reopen) is wired for baseline
-			// epochs only. A starved baseline is exactly the "blocked HOLD" scenario the RFC's
-			// "Terminal States Get Exit Predicates" describes, and the reopen target is
-			// unambiguous: the same point, EpochBaseline, 2 required windows. A starved trial
-			// candidate is abandoned like any other trial failure instead (PointStarved via
-			// TrialReturn): it never strands the miner in HOLD, so it needs no rescue, and trying
-			// to rescue it would need to remember which of three trial sub-phases to resume — a
-			// distinction EpochPurpose does not carry. hold_validation and safety_validation keep
-			// today's "keeps trying regardless of budget" shape for the same reason: which HOLD
-			// sub-reason (Optimized vs. Manual) or COOLDOWN dwell state to resume into is not
-			// something EpochPurpose alone can distinguish, so a rejected window there simply retries
-			// (finishSafetyValidation reopens the count via controlMinerAfterSafety's recovery predicate on
-			// the next poll) rather than starving.
+			// Exhausted baseline evidence moves into continuous starved monitoring at the same point.
+			// A starved trial is returned like any other failed candidate. Monitor and safety evidence
+			// never become absorbing: rejected windows remain in the same open epoch until a complete
+			// assessment can be made, while instantaneous safety still runs on every poll.
 			switch epoch.Purpose {
 			case lib.EpochBaseline:
 				return minerController.starveBaseline(state, epoch, now)
@@ -798,15 +760,15 @@ func (minerController *controller) observeExternalPoint(
 			return minerController.saveMinerState(state, now)
 		}
 		// A live point that resolves to off-grid or unadvertised, after two confirming polls, is a
-		// real conclusion: the device is running something the automation can never target. Terminal
-		// HoldRejected, not HoldStarved — the environment did not fail to deliver evidence, it
-		// delivered a definitive one.
+		// real current observation. It remains continuously monitored, but never becomes an
+		// automated target while absent from the canonical advertised grid.
 		state.SetCurrentPoint(livePoint)
 		state.ObservedFrequency = 0
 		state.ObservedCoreVoltage = 0
 		state.ObservedCount = 0
-		state.Phase = lib.PhaseHold
-		state.HoldReason = lib.HoldRejected
+		state.Phase = lib.PhaseMonitor
+		state.MonitorReason = lib.MonitorOffGrid
+		state.MonitorReferenceEpochID = 0
 		state.SettledAt = time.Time{}
 		minerController.resetRuntime(state.MacAddr)
 		return minerController.saveMinerState(state, now)
@@ -904,23 +866,164 @@ func (minerController *controller) evaluateWindow(
 		return minerController.evaluateTrial(ctx, state, epoch, combined, settings, now)
 	case lib.EpochSafetyValidation:
 		return minerController.finishSafetyValidation(state, epoch, combined, settings, now)
-	case lib.EpochHoldValidation:
-		if state.HoldReason == lib.HoldManual {
-			return minerController.finishManualHold(state, epoch, combined, settings, now)
-		}
-		if state.HoldReason == lib.HoldOptimized {
-			return minerController.finishFinalPlacement(state, epoch, combined, settings, now)
-		}
-		return nil
+	case lib.EpochMonitor:
+		return minerController.evaluateMonitor(ctx, state, epoch, combined, asic, settings, now)
 	case lib.EpochBaseline:
 		return minerController.evaluateBaseline(ctx, state, epoch, combined, asic, settings, now)
 	default:
-		// EpochProbation never reaches evaluateWindow: it is intercepted earlier, at the ramp-check
-		// step in controlMinerAfterSafety, and closes through closeProbation on its own
-		// settled-sample-count threshold instead of a closed/admitted window (see starveBaseline's
-		// and closeProbation's doc comments).
 		return fmt.Errorf("evaluate window: unreachable evidence-epoch purpose %q", epoch.Purpose)
 	}
+}
+
+func (minerController *controller) evaluateMonitor(
+	ctx context.Context,
+	state *lib.MinerState,
+	epoch lib.EvidenceEpoch,
+	combined lib.WindowAggregate,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+	now time.Time,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	progress := epoch.Progress
+	if err := progress.CloseWindow(true, combined); err != nil {
+		return err
+	}
+	decision := lib.MonitorContinue
+	nextReason := state.MonitorReason
+	gridReady := canonicalASICGrid(asic) == nil && operatingPointAdvertised(asic, state.CurrentPoint())
+	healthy := qualityHealthy(combined, settings)
+
+	switch state.MonitorReason {
+	case lib.MonitorSelected:
+		if state.MonitorReferenceEpochID == 0 {
+			if !healthy {
+				nextReason = lib.MonitorRejected
+			}
+			break
+		}
+		reference, err := minerController.monitorReference(*state)
+		if err != nil {
+			return err
+		}
+		records, err := minerController.states.ListPoints(state.MacAddr)
+		if err != nil {
+			return err
+		}
+		if monitorEvidenceChanged(reference, combined, records, state.CurrentPoint(), asic, settings) {
+			decision = lib.MonitorStartPass
+		}
+	case lib.MonitorManual:
+		if !gridReady {
+			nextReason = lib.MonitorOffGrid
+		} else if healthy {
+			decision = lib.MonitorStartPass
+		} else {
+			nextReason = lib.MonitorRejected
+		}
+	case lib.MonitorRejected:
+		if !gridReady {
+			nextReason = lib.MonitorOffGrid
+		} else if healthy {
+			if state.MonitorReferenceEpochID == 0 {
+				decision = lib.MonitorStartPass
+			} else {
+				reference, err := minerController.monitorReference(*state)
+				if err != nil {
+					return err
+				}
+				if !qualityHealthy(reference, settings) || monitorAggregateChanged(reference, combined, settings) {
+					decision = lib.MonitorStartPass
+				} else {
+					// A selected point whose quality temporarily failed can become selected again
+					// after a full healthy assessment matches its durable reference. No fresh pass
+					// or hardware work is justified when the original optimum has simply recovered.
+					nextReason = lib.MonitorSelected
+				}
+			}
+		}
+	case lib.MonitorStarved:
+		if !gridReady {
+			nextReason = lib.MonitorOffGrid
+		} else if healthy {
+			decision = lib.MonitorStartPass
+		} else {
+			nextReason = lib.MonitorRejected
+		}
+	case lib.MonitorOffGrid:
+		if gridReady && healthy {
+			// The exact live point is now advertised, so beginning a pass does not replace or request
+			// the formerly off-grid pair.
+			decision = lib.MonitorStartPass
+		}
+	default:
+		return fmt.Errorf("monitor has invalid reason %q", state.MonitorReason)
+	}
+
+	result, err := minerController.states.Apply(lib.CompleteMonitor{
+		State: *state, Epoch: epoch, Progress: progress, Aggregate: combined,
+		Decision: decision, NextReason: nextReason,
+	}, now)
+	if err != nil {
+		return err
+	}
+	*state = result.State
+	minerController.resetRuntime(state.MacAddr)
+	return nil
+}
+
+func (minerController *controller) monitorReference(state lib.MinerState) (lib.WindowAggregate, error) {
+	epoch, err := minerController.states.EvidenceEpochByID(state.MonitorReferenceEpochID)
+	if err != nil {
+		return lib.WindowAggregate{}, err
+	}
+	if epoch.MacAddr != state.MacAddr || epoch.Point != state.CurrentPoint() || epoch.ClosedAt.IsZero() ||
+		epoch.Progress.ClosedWindows() != epoch.RequiredWindows {
+		return lib.WindowAggregate{}, fmt.Errorf("monitor reference epoch %d does not prove a complete current-point assessment", epoch.ID)
+	}
+	return minerController.states.MonitorReference(epoch.ID)
+}
+
+func monitorAggregateChanged(reference, current lib.WindowAggregate, settings lib.Settings) bool {
+	if qualityHealthy(reference, settings) != qualityHealthy(current, settings) ||
+		hasExplorationHeadroom(reference, settings) != hasExplorationHeadroom(current, settings) {
+		return true
+	}
+	low := reference.MedianHash() * (1 - minimumHashGain)
+	high := reference.MedianHash() * (1 + minimumHashGain)
+	return current.MedianHash() < low || current.MedianHash() >= high
+}
+
+func monitorEvidenceChanged(
+	reference, current lib.WindowAggregate,
+	records []lib.OperatingPointRecord,
+	incumbent lib.OperatingPoint,
+	asic lib.ASICSettings,
+	settings lib.Settings,
+) bool {
+	if monitorAggregateChanged(reference, current, settings) {
+		return true
+	}
+	tempDelta := current.P95Temp() - reference.P95Temp()
+	vrDelta := current.P95VRTemp() - reference.P95VRTemp()
+	powerDelta := current.P95Power() - reference.P95Power()
+	for _, record := range records {
+		if !safetyPointStatus(record.Status) || !operatingPointAdvertised(asic, record.Point()) ||
+			(record.Frequency <= incumbent.Frequency && record.CoreVoltage <= incumbent.CoreVoltage) {
+			continue
+		}
+		projectedTemp := record.P95Temp + tempDelta
+		projectedVR := record.P95VRTemp + vrDelta
+		projectedPower := record.P95Power + powerDelta
+		if projectedTemp < settings.TargetTemp && projectedPower > 0 &&
+			projectedPower <= settings.MaxPower-powerHeadroom &&
+			(projectedVR <= 0 || projectedVR <= settings.VRTempHigh*vrExplorationFactor) {
+			return true
+		}
+	}
+	return false
 }
 
 // evaluateBaseline closes a root or recovery baseline and commits its next finite-pass authority in
@@ -970,11 +1073,11 @@ func (minerController *controller) evaluateBaseline(
 	if record.Status == lib.PointValidated {
 		best, selectable := selectBestPoint(prospective, asic, settings)
 		frontierValid := true
-		if selectable && hasExplorationHeadroom(combined, settings) {
+		if selectable {
 			candidate, phase, found, candidateErr := nextCandidate(prospective, point, asic)
 			if candidateErr != nil {
 				frontierValid = false
-			} else if found {
+			} else if found && (phase == lib.PhaseUndervolt || hasExplorationHeadroom(combined, settings)) {
 				transition.Decision = lib.BaselineContinue
 				transition.Candidate = candidate
 				transition.CandidatePhase = phase
@@ -1011,15 +1114,9 @@ func replacePointRecord(records []lib.OperatingPointRecord, replacement lib.Oper
 	return append(updated, replacement)
 }
 
-// starveBaseline closes an exhausted baseline evidence epoch as starved and, in the same
-// transaction, opens a probation successor at the same point (RFC "Terminal States Get Exit
-// Predicates"). No operating_points record is written: starved "carries no measurement", and the
-// baseline's existing PointEntered row is left exactly as it is — still valid, per
-// validateCrossTableState's HoldStarved exemption, through starvation and probation, because
-// probation reopens the identical baseline evaluation rather than a different point. The Phase/
-// HoldReason/SettledAt/BestPoint/BestHashRate shape mirrors CompleteBaseline's rejection branch
-// exactly (the destination a rejected baseline already lands in today), substituting HoldStarved
-// for HoldRejected.
+// starveBaseline closes an exhausted baseline without manufacturing a measurement and opens
+// continuous monitoring at the same point. Two later healthy monitor windows start a fresh
+// environmental pass; unusable evidence therefore slows recovery but can never stop observation.
 func (minerController *controller) starveBaseline(
 	state *lib.MinerState,
 	epoch lib.EvidenceEpoch,
@@ -1027,46 +1124,12 @@ func (minerController *controller) starveBaseline(
 ) error {
 	state.SetBestPoint(lib.OperatingPoint{})
 	state.BestHashRate = 0
-	state.Phase = lib.PhaseHold
-	state.HoldReason = lib.HoldStarved
+	state.Phase = lib.PhaseMonitor
+	state.MonitorReason = lib.MonitorStarved
 	state.SettledAt = time.Time{}
 	result, err := minerController.states.Apply(lib.CloseEpoch{
 		State: *state, Epoch: epoch, Outcome: lib.EpochStarved,
-		Successor: &lib.OpenEpoch{
-			State: *state, Purpose: lib.EpochProbation, Point: epoch.Point, RequiredWindows: 1,
-		},
-	}, now)
-	if err != nil {
-		return err
-	}
-	*state = result.State
-	minerController.resetRuntime(state.MacAddr)
-	return nil
-}
-
-// closeProbation validates a probation epoch once the environment has proven it can deliver
-// windowMinSamples consecutive samples at the current point, and reopens the baseline evaluation
-// that starveBaseline interrupted: the same point, same purpose, same required-window count. No
-// operating_points record is written here either — probation measured nothing, it only proved the
-// environment can deliver samples (RFC: "reaching windowMinSamples closes it as validated and opens
-// the real epoch that starvation interrupted"). Probation is currently reachable only via
-// starveBaseline, so this reopen target is always EpochBaseline; it is not a generic "resume
-// whatever purpose starved" mechanism (see this commit's report for why that generality was not
-// built: EpochPurpose alone cannot recover which of several phases a non-baseline epoch belonged
-// to).
-func (minerController *controller) closeProbation(
-	state *lib.MinerState,
-	epoch lib.EvidenceEpoch,
-	now time.Time,
-) error {
-	state.Phase = lib.PhaseBaseline
-	state.HoldReason = ""
-	state.PhaseStartedAt = now
-	result, err := minerController.states.Apply(lib.CloseEpoch{
-		State: *state, Epoch: epoch, Outcome: lib.EpochValidated,
-		Successor: &lib.OpenEpoch{
-			State: *state, Purpose: lib.EpochBaseline, Point: epoch.Point, RequiredWindows: 2,
-		},
+		Successor: &lib.OpenEpoch{State: *state, Purpose: lib.EpochMonitor, Point: epoch.Point, RequiredWindows: 2},
 	}, now)
 	if err != nil {
 		return err
@@ -1090,66 +1153,6 @@ func trialWindowPredicate(
 	default:
 		return false
 	}
-}
-
-func (minerController *controller) finishManualHold(
-	state *lib.MinerState,
-	epoch lib.EvidenceEpoch,
-	window lib.WindowAggregate,
-	settings lib.Settings,
-	now time.Time,
-) error {
-	state.SettledAt = time.Time{}
-	state.HoldReason = lib.HoldManual
-	outcome := lib.EpochRejected
-	if qualityHealthy(window, settings) {
-		state.SettledAt = now
-		outcome = lib.EpochValidated
-	} else {
-		// A completed manual hold-validation window is real evidence. If it is unhealthy the point is
-		// rejected, not left as an unsettled manual HOLD with no epoch and no automatic exit.
-		state.HoldReason = lib.HoldRejected
-	}
-	result, err := minerController.states.Apply(lib.CloseEpoch{State: *state, Epoch: epoch, Outcome: outcome}, now)
-	if err != nil {
-		return err
-	}
-	*state = result.State
-	minerController.resetRuntime(state.MacAddr)
-	return nil
-}
-
-func (minerController *controller) finishFinalPlacement(
-	state *lib.MinerState,
-	epoch lib.EvidenceEpoch,
-	window lib.WindowAggregate,
-	settings lib.Settings,
-	now time.Time,
-) error {
-	state.SettledAt = time.Time{}
-	outcome := lib.EpochRejected
-	if qualityHealthy(window, settings) {
-		state.HoldReason = lib.HoldOptimized
-		state.Phase = lib.PhaseHold
-		state.SettledAt = now
-		outcome = lib.EpochValidated
-	} else {
-		// hold_validation re-confirming an already-settled point failed quality on a real closed
-		// window: measured and rejected, not starved. Non-baseline purposes keep today's
-		// keep-trying shape on the rejected-window budget itself (see the maxRejectedWindows
-		// handling further down); this is a different, already-existing rejection path unaffected
-		// by that scoping decision.
-		state.HoldReason = lib.HoldRejected
-		state.Phase = lib.PhaseHold
-	}
-	state.PhaseStartedAt = now
-	result, err := minerController.states.Apply(lib.CloseEpoch{State: *state, Epoch: epoch, Outcome: outcome}, now)
-	if err != nil {
-		return err
-	}
-	*state = result.State
-	minerController.resetRuntime(state.MacAddr)
-	return nil
 }
 
 // trialWindowAdmissible runs the per-window predicates at step 9 of the epoch lifecycle, before the
@@ -1202,7 +1205,7 @@ func (minerController *controller) evaluateTrial(
 		winner = undervoltUseful(combined, prior, entered.ReferenceHash)
 	case lib.PhaseFrequencyTest, lib.PhaseVoltageTest:
 		winner = performanceWinner(combined, entered.ReferenceHash) &&
-			minerController.entryMarginPositive(state, entered, settings, now)
+			minerController.entryMarginPositive(state, entered, combined.MedianHash(), settings, now)
 	}
 	if winner {
 		return minerController.finalizeTrial(state, epoch, combined, lib.PointValidated, lib.TrialPromote, settings, now)
@@ -1301,6 +1304,7 @@ func nextCandidate(
 func (minerController *controller) entryMarginPositive(
 	state *lib.MinerState,
 	entry lib.OperatingPointRecord,
+	measuredHash float64,
 	settings lib.Settings,
 	now time.Time,
 ) bool {
@@ -1308,7 +1312,7 @@ func (minerController *controller) entryMarginPositive(
 		return true
 	}
 	if !finite(entry.ReferenceHash) || entry.ReferenceHash <= 0 ||
-		!finite(entry.MedianHash) || entry.MedianHash <= 0 {
+		!finite(measuredHash) || measuredHash <= 0 {
 		return false
 	}
 	attempts, err := minerController.states.ListMutationAttempts(state.MacAddr)
@@ -1322,14 +1326,23 @@ func (minerController *controller) entryMarginPositive(
 			break
 		}
 	}
-	if attempt.ID == 0 || attempt.MiningResumedAt.IsZero() || attempt.PatchRequestedAt.IsZero() {
+	return mutationMarginPositive(measuredHash, entry.ReferenceHash, attempt, settings, now)
+}
+
+func mutationMarginPositive(
+	measuredHash, referenceHash float64,
+	attempt lib.MutationAttempt,
+	settings lib.Settings,
+	now time.Time,
+) bool {
+	if !finite(measuredHash) || measuredHash <= 0 || !finite(referenceHash) || referenceHash <= 0 ||
+		attempt.ID == 0 || attempt.MiningResumedAt.IsZero() || attempt.PatchRequestedAt.IsZero() {
 		return false
 	}
-	conservative := entry.MedianHash
 	horizon := (168 * time.Hour).Seconds()
 	delay := attempt.MiningResumedAt.Sub(attempt.PatchRequestedAt).Seconds() + settings.RampUpTime.Seconds()
-	margin := (conservative-entry.ReferenceHash)*horizon - conservative*delay
-	return conservative >= entry.ReferenceHash*(1+minimumHashGain) && delay >= 0 && delay < horizon && margin > 0 && !now.Before(attempt.MiningResumedAt)
+	margin := (measuredHash-referenceHash)*horizon - measuredHash*delay
+	return measuredHash >= referenceHash*(1+minimumHashGain) && delay >= 0 && delay < horizon && margin > 0 && !now.Before(attempt.MiningResumedAt)
 }
 
 func (minerController *controller) requestOperatingPoint(
@@ -1353,10 +1366,12 @@ func (minerController *controller) requestOperatingPoint(
 	state.ObservedFrequency = 0
 	state.ObservedCoreVoltage = 0
 	state.ObservedCount = 0
-	if phase == lib.PhaseHold {
-		state.HoldReason = lib.HoldOptimized
+	if phase == lib.PhaseMonitor {
+		state.MonitorReason = lib.MonitorSelected
+		state.MonitorReferenceEpochID = 0
 	} else {
-		state.HoldReason = ""
+		state.MonitorReason = ""
+		state.MonitorReferenceEpochID = 0
 	}
 	minerController.resetRuntime(state.MacAddr)
 	return minerController.saveMinerState(state, now)
@@ -1422,7 +1437,8 @@ func (minerController *controller) rollbackForSafety(
 	state.SetPendingMutation(lib.MutationSafetyRollback, target, now)
 	state.Phase = lib.PhaseCooldown
 	state.PhaseStartedAt = now
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	// This is a new, distinct rollback trip (the pending-target-match early return above already
 	// covers "same rollback still pending"), possibly reached while a prior COOLDOWN dwell was mid-
@@ -1638,7 +1654,8 @@ func transitionEmergencyState(
 		state.EmergencyCount = incrementEmergencyCount(state.EmergencyCount)
 		state.Phase = lib.PhaseEmergency
 		state.PhaseStartedAt = now
-		state.HoldReason = ""
+		state.MonitorReason = ""
+		state.MonitorReferenceEpochID = 0
 		state.SettledAt = time.Time{}
 		state.SetFallbackPoint(lib.OperatingPoint{})
 		// A new episode invalidates any COOLDOWN dwell in progress: RecoveryHealthyCount must start
@@ -1748,7 +1765,8 @@ func (minerController *controller) finishSafetyValidation(
 	now time.Time,
 ) error {
 	if !qualityHealthy(window, settings) {
-		state.HoldReason = ""
+		state.MonitorReason = ""
+		state.MonitorReferenceEpochID = 0
 		state.SettledAt = time.Time{}
 		result, err := minerController.states.Apply(lib.CloseEpoch{State: *state, Epoch: epoch, Outcome: lib.EpochRejected}, now)
 		if err != nil {
@@ -1912,15 +1930,20 @@ func (minerController *controller) formatWindow(state lib.MinerState, settings l
 	if state.MiningPending {
 		return "mining"
 	}
-	if state.HoldReason != "" && state.Phase == lib.PhaseHold {
-		return string(state.HoldReason)
+	prefix := ""
+	if state.MonitorReason != "" && state.Phase == lib.PhaseMonitor {
+		prefix = string(state.MonitorReason) + " "
 	}
 	epoch, open, err := minerController.states.OpenEvidenceEpochFor(state.MacAddr)
 	if err != nil || !open {
+		if prefix != "" {
+			return strings.TrimSpace(prefix)
+		}
 		return fmt.Sprintf("0/%d", targetSampleCount(settings))
 	}
-	if epoch.Progress.SettledSamples() < rampSamples(settings) {
-		return fmt.Sprintf("ramp %d/%d", epoch.Progress.SettledSamples(), rampSamples(settings))
+	if epoch.Progress.SettledSamples() < rampSamples(settings) &&
+		!(epoch.Purpose == lib.EpochMonitor && state.MonitorReferenceEpochID > 0) {
+		return fmt.Sprintf("%sramp %d/%d", prefix, epoch.Progress.SettledSamples(), rampSamples(settings))
 	}
 	minerController.runtimeMu.Lock()
 	count := 0
@@ -1929,9 +1952,9 @@ func (minerController *controller) formatWindow(state lib.MinerState, settings l
 	}
 	minerController.runtimeMu.Unlock()
 	if epoch.Progress.ClosedWindows() > 0 {
-		return fmt.Sprintf("%d/%d %d/%d", epoch.Progress.ClosedWindows(), epoch.RequiredWindows, count, targetSampleCount(settings))
+		return fmt.Sprintf("%s%d/%d %d/%d", prefix, epoch.Progress.ClosedWindows(), epoch.RequiredWindows, count, targetSampleCount(settings))
 	}
-	return fmt.Sprintf("%d/%d", count, targetSampleCount(settings))
+	return fmt.Sprintf("%s%d/%d", prefix, count, targetSampleCount(settings))
 }
 
 func formatOperatingPoint(point lib.OperatingPoint) string {

@@ -131,7 +131,7 @@ func TestCooldownRecoveryReleasesFleetNormalMutationBlock(t *testing.T) {
 	if err := minerController.finishSafetyValidation(&safetyState, epoch, window, settings, finishedAt); err != nil {
 		t.Fatal(err)
 	}
-	if safetyState.Phase != lib.PhaseBaseline || safetyState.HoldReason != "" ||
+	if safetyState.Phase != lib.PhaseBaseline || safetyState.MonitorReason != "" ||
 		safetyState.SafetyReason != "" || !safetyState.SettledAt.IsZero() {
 		t.Fatalf("recovery did not resume the finite pass: %+v", safetyState)
 	}
@@ -216,7 +216,8 @@ func TestUnavailableSafetyReadbackRetainsTypedObligation(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = lib.PhaseCooldown
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonASICLimit
 	state.SetPendingMutation(lib.MutationSafetyRollback, minimum, now)
@@ -274,7 +275,8 @@ func TestProductionOverheatLoopStateEntersCooldownWithoutMutation(t *testing.T) 
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
 	state.Phase = lib.PhaseEmergency
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now.Add(-time.Hour)
 	state.SafetyReason = lib.SafetyReasonTelemetryUnavailable
@@ -317,7 +319,8 @@ func TestRedundantMinimumSafetyMutationIsSupersededBeforePatch(t *testing.T) {
 			state = closeInitialBaselineEpoch(t, store, state, now)
 			state.SetCurrentPoint(minimum)
 			state.Phase = lib.PhaseEmergency
-			state.HoldReason = ""
+			state.MonitorReason = ""
+			state.MonitorReferenceEpochID = 0
 			state.SettledAt = time.Time{}
 			state.PhaseStartedAt = now
 			state.SafetyReason = testCase.reason
@@ -378,7 +381,8 @@ func TestRebootPollsPreserveSafetyAuthority(t *testing.T) {
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.SetCurrentPoint(minimum)
 	state.Phase = lib.PhaseEmergency
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.PhaseStartedAt = now
 	state.SafetyReason = lib.SafetyReasonTelemetryUnavailable
@@ -449,7 +453,7 @@ func TestRebootPollsPreserveSafetyAuthority(t *testing.T) {
 // handleTerminalMutationFailureLocked's fallback branch for a non-trial MutationOperatingPoint
 // attempt that fails its pipeline before ever completing (preflight/PATCH/restart/rediscovery) —
 // the "never got its patch/restart to complete" shape that reads like starvation but is
-// deliberately classified HoldRejected, because this site has no durable epoch to recover a
+// deliberately classified as rejected monitoring, because this site has no durable epoch to recover a
 // starved-baseline resume target from (see the code's own comment at this call site).
 //
 // This branch calls state.ClearPendingMutation() before calling Apply(lib.FailMutation{...}). That
@@ -500,7 +504,7 @@ func TestTerminalOperatingPointMutationFailureIsRejectedNotStarved(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Phase != lib.PhaseHold || loaded.HoldReason != lib.HoldRejected || loaded.PendingKind != "" {
+	if loaded.Phase != lib.PhaseMonitor || loaded.MonitorReason != lib.MonitorRejected || loaded.PendingKind != "" {
 		t.Fatalf("uncompleted operating-point mutation failure was not classified rejected: %+v", loaded)
 	}
 	closed, err := store.ListMutationAttempts(state.MacAddr)
@@ -556,7 +560,7 @@ func TestIncompleteMiningWorkerLeavesAttemptRetryable(t *testing.T) {
 // that fully completed (PATCH + restart + readback verified — the device is confirmed running the
 // target configuration) but never produced a positive hash within the health deadline. That is a
 // real, measured conclusion about the configuration, mirroring the trial-phase branch's identical
-// no-positive-hash outcome, so it is classified HoldRejected, not HoldStarved.
+// no-positive-hash outcome, so it enters rejected rather than starved monitoring.
 func TestMiningResumeFailureAfterCompletedOperatingPointMutationIsRejected(t *testing.T) {
 	store, _, state, now := newRootMutationStore(t)
 	state = closeInitialBaselineEpoch(t, store, state, now)
@@ -615,7 +619,7 @@ func TestMiningResumeFailureAfterCompletedOperatingPointMutationIsRejected(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Phase != lib.PhaseHold || loaded.HoldReason != lib.HoldRejected || loaded.PendingKind != "" {
+	if loaded.Phase != lib.PhaseMonitor || loaded.MonitorReason != lib.MonitorRejected || loaded.PendingKind != "" {
 		t.Fatalf("completed operating-point mutation resume failure was not classified rejected: %+v", loaded)
 	}
 }
@@ -629,24 +633,7 @@ func TestRetuneRequiresVerifiedFinalSelectionAndElapsedRamp(t *testing.T) {
 	if !qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
 		t.Fatal("verified optimized hold was rejected")
 	}
-	// An unsettled optimized HOLD with its required validation epoch must not qualify for retune.
-	state.SettledAt = time.Time{}
-	if _, err := store.Apply(lib.OpenEpoch{
-		State: state, Purpose: lib.EpochHoldValidation, Point: state.CurrentPoint(), RequiredWindows: 1,
-	}, now.Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
-		t.Fatal("retune qualification ignored an open evidence epoch")
-	}
-	state.SettledAt = now.Add(-time.Second)
-	closed, err := store.Apply(lib.CloseEpoch{
-		State: state, Epoch: mustOpenEpoch(t, store, rootTestMAC), Outcome: lib.EpochValidated,
-	}, now.Add(2*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = closed.State
+	// Continuous monitoring is compatible with a settled selected point.
 	state.SetBestPoint(lib.OperatingPoint{Frequency: 550, CoreVoltage: 1000})
 	state.BestHashRate = 200
 	if qualifiesSettledObservation(store, state, info, asic, settings, now, true) {
@@ -741,7 +728,8 @@ func TestRetuneSafetyBlockBreaksConsecutivePair(t *testing.T) {
 		t.Fatalf("first retune poll = accepted:%t count:%d err:%v", accepted, coordinator.retuneHealthyCount, err)
 	}
 	state.Phase = lib.PhaseCooldown
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	if _, err := store.Apply(lib.SaveState{State: state}, now); err != nil {
 		t.Fatal(err)
@@ -771,7 +759,7 @@ func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
 	if err := controller.observeExternalPoint(&state, secondPoll, settings, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if state.CurrentPoint() != offGrid || state.Phase != lib.PhaseHold || state.HoldReason != lib.HoldRejected {
+	if state.CurrentPoint() != offGrid || state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorOffGrid {
 		t.Fatalf("second off-grid observation = %+v", state)
 	}
 }
@@ -782,7 +770,7 @@ func TestOffGridManualObservationRequiresTwoPolls(t *testing.T) {
 // mineira deadlocked in COOLDOWN, since COOLDOWN's own exit check was unreachable once a differing
 // live point returned early into observeExternalPoint first). The fix is deliberately scoped no
 // wider than the RFC's own cited range: it must NOT also move reconciliation past the Hold-reason
-// switch, or a settled HoldOptimized/HoldManual miner's live-point drift would silently stop being
+// switch, or a selected/manual monitored miner's live-point drift would silently stop being
 // reconciled at all — a regression the RFC never discusses and this fix must not introduce. COOLDOWN's
 // own exit now has direct live coverage elsewhere (see
 // TestCooldownExitsAfterConsecutiveHealthyPollsAndClearsSafetyReason); this test instead proves the
@@ -807,8 +795,8 @@ func TestPhaseHandlingRunsBeforeLiveDifferingPointReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.CurrentPoint() != drifted || loaded.Phase != lib.PhaseHold || loaded.HoldReason != lib.HoldManual {
-		t.Fatalf("settled HoldOptimized drift was not reconciled after two confirmations, as it was before this reordering: %+v", loaded)
+	if loaded.CurrentPoint() != drifted || loaded.Phase != lib.PhaseMonitor || loaded.MonitorReason != lib.MonitorManual {
+		t.Fatalf("selected-monitor drift was not reconciled after two confirmations: %+v", loaded)
 	}
 }
 
@@ -1001,7 +989,8 @@ func TestUnreadableSafetySupersessionPreservesFirmwareCause(t *testing.T) {
 	state = closeInitialBaselineEpoch(t, store, state, now)
 	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	state.Phase = lib.PhaseEmergency
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonFirmwareOverheat
 	state.SetPendingMutation(lib.MutationFirmwareRecovery, minimum, now)
@@ -1145,7 +1134,8 @@ func TestRebootInFlightSuppressesUnreadableEscalationAndStillCompletes(t *testin
 	target := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
 	incumbent := state.CurrentPoint()
 	state.Phase = lib.PhaseCooldown
-	state.HoldReason = ""
+	state.MonitorReason = ""
+	state.MonitorReferenceEpochID = 0
 	state.SettledAt = time.Time{}
 	state.SafetyReason = lib.SafetyReasonASICLimit
 	state.SetPendingMutation(lib.MutationSafetyRollback, target, now)

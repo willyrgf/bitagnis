@@ -11,8 +11,8 @@ Bitagnis reads the frequency and voltage options advertised by AxeOS and only
 sends complete `(frequency, coreVoltage)` pairs from that grid.
 
 For a new miner, Bitagnis starts from the settings currently running in AxeOS. It
-waits through the configured ramp period and then measures a full evaluation
-window before changing anything. For each window it calculates:
+waits through the configured ramp period and then requires two admitted
+evaluation windows before changing anything. For each window it calculates:
 
 - median actual and expected hash rate;
 - actual/expected hash attainment;
@@ -43,12 +43,10 @@ was too large; a poll that cannot be read (bad identity, bad ASIC grid, or
 incomplete telemetry) is a non-event for this machinery and neither advances
 nor discards progress. Progress toward the current evaluation, including a
 window already closed and stored, survives a process restart. An evaluation
-that keeps failing to produce an admissible window six times over is starved,
-not silently absorbed: the miner automatically re-attempts once the
-environment proves it can deliver a window's worth of samples again, with no
-timer and no operator action required. A point the controller did measure and
-reject is a different, and different-looking, terminal state — see `HOLD`
-below.
+that keeps failing to produce an admissible window six times is marked
+starved, not silently absorbed. Starved and measured-rejected points both
+enter `MONITOR`, which continues collecting two-window assessments until
+conditions justify a fresh pass. No timer or operator action is required.
 
 ## Safety
 
@@ -103,7 +101,7 @@ autonomous overheat recovery (`power_management_task.c`'s six consecutive
 5-second checks at or below its 45°C safe threshold, 30s), doubled for
 Bitagnis's coarser and lossier poll cadence. Reaching the threshold clears the
 durable `SafetyReason` in the same transition and opens a `safety_validation`
-evidence epoch, exactly like a starved `HOLD` re-entering evaluation; a single
+evidence epoch; a single
 required window's worth of admitted evidence then either closes validation and
 atomically opens a fresh two-window baseline at the recovered current point,
 or, if that window's quality is unhealthy, rejects the epoch and leaves the
@@ -111,7 +109,7 @@ miner in `COOLDOWN` to accumulate the healthy-poll count again. Successful
 recovery resumes the same finite optimization pass: evaluated point history is
 preserved, an interrupted unobservable candidate remains consumed, and the
 frontier continues with the next unseen eligible pair. Safety recovery is not
-a terminal `HOLD` and does not require an operator retune.
+an absorbing state and does not require an operator retune.
 A completed safety mutation and healthy-mining resumption never open this
 epoch: the cooldown recovery predicate is its sole owner. Every store
 transition and database reopen verifies that an open `safety_validation` epoch
@@ -180,15 +178,17 @@ Optimizer state and evaluated operating points are stored in `optimizer.db`.
 The database is exclusively owned by one Bitagnis process. A second process
 using the same path fails at startup.
 
-The current schema is version 10, with typed pending mutations, finite frontier
-state, hourly accounting, a durable evidence-epoch ledger, and one durable
+The current schema is version 11, with typed pending mutations, finite frontier
+state, continuous-monitor references, hourly accounting, a durable
+evidence-epoch ledger, and one durable
 `mutation_attempts` row per controller-owned hardware attempt. It has no legacy
-`overheat_pending` field, migration, or compatibility reader. Schema version 9
+`overheat_pending` field, migration, or compatibility reader. Schema version 10
 and earlier, an old partial database, or an unknown application object is
 rejected without modification; move it aside or remove it to create the
-current baseline. Version 9 could turn a temporary post-boot readback gap into
-a durable thermal emergency and used the old emergency names, so it is
-rejected whole rather than reinterpreted or repaired. Evaluated
+current baseline. Earlier schemas allowed optimizer conclusions to become
+absorbing and do not contain the durable evidence needed to reconstruct a
+continuous monitor reference, so they are rejected whole rather than
+reinterpreted or repaired. Evaluated
 history, pending mutation ages, emergency episode ages,
 mutation attempts, evidence epochs, and the bounded 384-hour hourly accounting
 history persist across ordinary restarts after that baseline is created.
@@ -196,10 +196,12 @@ history persist across ordinary restarts after that baseline is created.
 `evidence_epochs` is the durable ledger for evaluation progress, shaped after
 `mutation_attempts`: one open epoch per miner, monotone settled-sample and
 window counters, and a terminal outcome (`validated`, `rejected`, `starved`,
-or `contradicted`). Each open purpose has one durable state shape: baseline and
-trial epochs require their matching phase and two windows; hold validation,
-safety validation, and probation require their matching phase/reason and one
-window. This mapping is checked before every `Apply` commit and on reopen. It
+or `contradicted`). Each open purpose has one durable state shape: baseline,
+trial, and monitor epochs require their matching phase and two windows; safety
+validation requires `COOLDOWN` and one window. A selected monitor points to a
+closed monitor epoch and a separately stored conservative combination of both
+windows; the ledger retains its first admitted window as evidence. These
+relationships are checked before every `Apply` commit and on reopen. The ledger
 replaces the volatile in-memory progress and wall-clock
 evidence deadline schema version 6 used, which discarded everything it had
 learned on every process restart or mutation gate and could not distinguish
@@ -259,7 +261,8 @@ Archive the old database as owner-only diagnostic state and start the new
 baseline only after the live fleet state is understood.
 
 If AxeOS settings are changed manually while Bitagnis is running, two consecutive
-polls must confirm the new pair. Bitagnis then adopts it as a fresh baseline.
+polls must confirm the new pair. Bitagnis then adopts it into a fresh monitor
+assessment.
 Off-grid manual settings can be monitored, but Bitagnis will not emit them as
 automated requests. Before treating a differing live pair as a manual change,
 Bitagnis checks whether it is actually the verified target of one of its own
@@ -272,24 +275,23 @@ attempt reaching the same shape, since automated safety recovery does not
 currently clear the durable safety reason that a reconciliation would need to
 see cleared — a known, separate gap.
 
-A blocked `HOLD` is one of two distinct terminal causes, not one absorbing
-state: `starved` means the environment never delivered a usable evaluation
-window — the miner is healthy and untested, so it exits automatically the
-moment the environment proves it can deliver a window's worth of samples
-again, with no operator step and no timer. `rejected` means the controller did
-measure the point and it failed the quality or headroom bar, or the miner is
-running an off-grid or unadvertised pair it can observe but never automate; a
-rejected `HOLD` is a real conclusion and stays terminal until an explicit
-retune. A point record is never marked `unobservable` for both reasons at
-once: `starved` carries no measurement, and every other terminal status
-resolves to the closed evaluation that produced it.
+`MONITOR` is never terminal. `selected` means the current point is the latest
+safe frontier choice; `manual`, `rejected`, `starved`, and `off_grid` record why
+that point entered monitoring. Every reason retains an open two-window monitor
+epoch. Selected monitoring compares each completed assessment with its durable
+reference and starts a new environmental pass after a persistent material hash,
+quality, or thermal-headroom change. Rejected and starved monitoring starts a
+new pass after conditions recover. Off-grid points are observed but never used
+as automated targets; if that exact canonical pair later appears on the
+supported advertised grid, healthy monitoring may begin a same-point pass.
 
-Normal optimization is a finite pass. Each advertised complete pair is consumed
-at most once per pass, terminal point outcomes are not reopened by elapsed time
-or cooler telemetry, and a settled `HOLD` performs no normal operating-point
-mutation. A safety episode pauses this pass but does not finish it: successful
+Each optimization pass is finite: an advertised complete pair is consumed at
+most once in that pass. Continuous monitoring may start a fresh environmental
+pass when the measured environment or performance materially changes; it does
+not issue hardware work merely because time elapsed. A safety episode pauses a
+pass but does not finish it: successful
 recovery rebaselines the safe current point and continues past every already
-consumed pair. An optimized `HOLD` is created only after the safe frontier has
+consumed pair. Selected monitoring begins only after the safe frontier has
 no unseen admissible candidate (or no exploration headroom remains) and the
 selected highest sustained-hash point has passed final validation. After an
 environmental or hardware change, explicitly qualify one named miner for a new
@@ -301,8 +303,8 @@ pass:
 
 `--retune` never resets safety state or issues hardware writes by itself. It is
 accepted only after the named miner has two consecutive safe startup polls in a
-settled optimized or manual `HOLD`; it rejects `all`, mining reapply, pending
-work, rejected holds, and active or unsettled safety episodes.
+safe selected, manual, rejected, or starved monitor state; it rejects `all`,
+mining reapply, pending work, off-grid points, and active safety episodes.
 
 ## Configuration
 
@@ -392,9 +394,8 @@ Optimizer states are:
 - `UNDERVOLT`: testing a lower voltage at the same frequency;
 - `FREQ_TEST`: testing the next frequency;
 - `VOLT_TEST`: testing whether one higher voltage improves a new frequency;
-- `HOLD`: settled at the pass-selected optimum or a validated manual point,
-  blocked on a starved environment that can still recover on its own, or
-  blocked on a rejected point that needs an operator retune;
+- `MONITOR`: continuously collecting wider two-window evidence at the current
+  selected, manual, rejected, starved, or off-grid point;
 - `COOLDOWN`: monitoring without upward exploration until the consecutive-safe
   dwell and safety-validation window complete, then resuming `BASELINE`; and
 - `EMERGENCY`: the durable fleet safety block; its typed cause determines
@@ -404,8 +405,9 @@ Optimizer states are:
 Durable ordinary work is shown as `PENDING`, typed hard-limit work as
 `BACKOFF`, host or firmware-trip containment as `CONTAIN`, AxeOS-owned cooling
 as `AXEOS`, unreadable verification as `VERIFY`, and post-backoff observation
-as `RECOVERY`. The window column shows `minimum`, `normalize`, `firmware cool`,
-or `verify` for the matching obligation. Target and episode ages come from durable
+as `RECOVERY`. During `MONITOR`, the window column shows the reason plus live
+window progress, such as `selected 1/2 12/30`. It shows `minimum`, `normalize`,
+`firmware cool`, or `verify` for the matching safety obligation. Target and episode ages come from durable
 timestamps. These labels report obligations, not an unproven in-process PATCH
 stage. The hash column remains live AxeOS actual/expected telemetry, so values
 above 100% expected are possible. Only median actual hash from a completed
