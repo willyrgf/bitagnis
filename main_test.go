@@ -2740,3 +2740,456 @@ func TestSafetyRecoveryAtUnseenMinimumPreservesPassAnchorAndReopens(t *testing.T
 		t.Fatalf("reopened frontier state = %+v", loaded)
 	}
 }
+
+// --- validated-point safety demotion ------------------------------------------------------------
+//
+// The incident these tests pin: once a point reached status "validated" nothing could contradict it
+// again. A point that had become unsafe kept its historical statistics, final placement kept
+// re-selecting it, the ASIC exceeded the hard limit again within minutes, and the miner looped
+// through rollback and recovery every half hour without converging. Demotion ends the loop: the
+// hard-limit verdict that rolled the miner back is durable evidence about the point, so the point
+// leaves the feasible set and the next-best one is selected instead.
+
+func mustPointRecord(t *testing.T, store *lib.OptimizerStore, macAddr string, point lib.OperatingPoint) lib.OperatingPointRecord {
+	t.Helper()
+	records, err := store.ListPoints(macAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found := findRecord(records, point)
+	if !found {
+		t.Fatalf("miner %s has no durable row at %d/%d", macAddr, point.Frequency, point.CoreVoltage)
+	}
+	return record
+}
+
+// revalidatedStore reopens the database, which is the only way to run lib's full-state invariant
+// checker: it runs on every open, over every table at once. The reopened store replaces the closed
+// one so a test can keep driving the same miner afterwards.
+func revalidatedStore(t *testing.T, store *lib.OptimizerStore, path string) *lib.OptimizerStore {
+	t.Helper()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before revalidation: %v", err)
+	}
+	reopened, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatalf("durable state failed full-state invariant validation: %v", err)
+	}
+	return reopened
+}
+
+// baselineRecordForIncumbent mirrors evaluateBaseline's own record construction: a completed
+// baseline restates the durable incumbent's entry provenance, which differs between the pass
+// baseline row (no entry attempt, no reference hash) and the row a promoted trial left behind. An
+// incumbent that already carries a terminal verdict keeps its stored measurements — CompleteBaseline
+// leaves such a row untouched — so the record only has to stay consistent with what is stored.
+func baselineRecordForIncumbent(
+	t *testing.T,
+	store *lib.OptimizerStore,
+	state lib.MinerState,
+	hash float64,
+	p95Temp float64,
+	at time.Time,
+) lib.OperatingPointRecord {
+	t.Helper()
+	incumbent := mustPointRecord(t, store, state.MacAddr, state.CurrentPoint())
+	record := lib.OperatingPointRecord{
+		MacAddr: state.MacAddr, Frequency: state.CurrentFrequency, CoreVoltage: state.CurrentCoreVoltage,
+		Status: lib.PointValidated, MedianHash: hash, ExpectedHash: hash, Attainment: 1,
+		MeanTemp: p95Temp - 2, P95Temp: p95Temp, P95VRTemp: 70, P95Power: 18, MeasuredAt: at,
+		EnteredAt: incumbent.EnteredAt, EntryAttemptID: incumbent.EntryAttemptID,
+		ReferenceHash: incumbent.ReferenceHash,
+	}
+	if incumbent.Status != lib.PointEntered {
+		record.MedianHash, record.ExpectedHash = incumbent.MedianHash, incumbent.ExpectedHash
+		record.Attainment = incumbent.Attainment
+		record.MeanTemp, record.P95Temp = incumbent.MeanTemp, incumbent.P95Temp
+		record.P95VRTemp, record.P95Power = incumbent.P95VRTemp, incumbent.P95Power
+	}
+	return record
+}
+
+// completeTestMutation walks one durable mutation attempt through the milestone ledger the mutation
+// coordinator writes against real hardware — patch, configured readback, restart, reboot proof,
+// first positive share — and lands the miner on the attempt's target point.
+func completeTestMutation(
+	t *testing.T,
+	store *lib.OptimizerStore,
+	state lib.MinerState,
+	attemptID int64,
+	at time.Time,
+) (lib.MinerState, time.Time) {
+	t.Helper()
+	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestonePatchRequested, at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordConfiguredVerification(attemptID, at.Add(2*time.Second), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestoneRestartRequested, at.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceMutationAttempt(attemptID, lib.MutationMilestoneRebootVerified, at.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Apply(lib.CompleteMutation{
+		MacAddr: state.MacAddr, IP: state.IP, AttemptID: attemptID,
+	}, at.Add(5*time.Second))
+	if err != nil {
+		t.Fatalf("complete test mutation: %v", err)
+	}
+	if err := store.RecordFirstPositive(attemptID, at.Add(6*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Apply(lib.CompleteResume{MacAddr: result.State.MacAddr, AttemptID: attemptID}, at.Add(7*time.Second))
+	if err != nil {
+		t.Fatalf("resume test mutation: %v", err)
+	}
+	return result.State, at.Add(7 * time.Second)
+}
+
+// promoteTestTrial drives one complete trial to promotion: it closes the open baseline epoch at the
+// durable incumbent, admits candidate, completes the mutation, and finalizes the candidate as a
+// validated point the miner is now running. It is the only way to produce a trial-derived validated
+// row (EntryAttemptID > 0), one of the two shapes a demotion has to handle, and the candidate is
+// named explicitly rather than taken from nextCandidate so a test can build an exhausted frontier
+// without walking all thirty-six pairs.
+func promoteTestTrial(
+	t *testing.T,
+	store *lib.OptimizerStore,
+	state lib.MinerState,
+	candidate lib.OperatingPoint,
+	hash float64,
+	p95Temp float64,
+	at time.Time,
+) (lib.MinerState, time.Time) {
+	t.Helper()
+	epoch := mustOpenEpoch(t, store, state.MacAddr)
+	baseline := baselineRecordForIncumbent(t, store, state, 100, 55, at)
+	referenceHash := state.BestHashRate
+	if referenceHash <= 0 {
+		referenceHash = baseline.MedianHash
+	}
+	admitted, err := store.Apply(lib.CompleteBaseline{
+		State: state, Record: baseline, Epoch: epoch, Decision: lib.BaselineContinue,
+		Candidate: candidate, CandidatePhase: lib.PhaseVoltageTest, ReferenceHash: referenceHash,
+	}, at)
+	if err != nil {
+		t.Fatalf("admit trial at %d/%d: %v", candidate.Frequency, candidate.CoreVoltage, err)
+	}
+	state, at = completeTestMutation(t, store, admitted.State, admitted.AttemptID, at)
+	at = at.Add(time.Second)
+	entered := mustPointRecord(t, store, state.MacAddr, candidate)
+	measured := lib.OperatingPointRecord{
+		MacAddr: state.MacAddr, Frequency: candidate.Frequency, CoreVoltage: candidate.CoreVoltage,
+		Status: lib.PointValidated, MedianHash: hash, ExpectedHash: hash, Attainment: 1,
+		MeanTemp: p95Temp - 2, P95Temp: p95Temp, P95VRTemp: 70, P95Power: 18, MeasuredAt: at,
+		EnteredAt: entered.EnteredAt, EntryAttemptID: entered.EntryAttemptID,
+		ReferenceHash: entered.ReferenceHash,
+	}
+	promoted, err := store.Apply(lib.FinalizeTrial{
+		State: state, Record: measured, Decision: lib.TrialPromote,
+		Epoch: mustOpenEpoch(t, store, state.MacAddr),
+	}, at)
+	if err != nil {
+		t.Fatalf("promote trial at %d/%d: %v", candidate.Frequency, candidate.CoreVoltage, err)
+	}
+	return promoted.State, at
+}
+
+// startTestMutationAttempt records the durable attempt the mutation coordinator would open for
+// whatever operating-point intent the miner is currently carrying.
+func startTestMutationAttempt(t *testing.T, store *lib.OptimizerStore, state lib.MinerState) int64 {
+	t.Helper()
+	attempt := lib.MutationAttempt{
+		MacAddr: state.MacAddr, Kind: state.PendingKind, Reason: state.SafetyReason,
+		FromFrequency: state.CurrentFrequency, FromCoreVoltage: state.CurrentCoreVoltage,
+		TargetFrequency: state.PendingFrequency, TargetCoreVoltage: state.PendingCoreVoltage,
+		IntentCreatedAt: state.PendingSince, StartedAt: state.PendingSince,
+		ConfiguredVerifiedUptimeSeconds: -1,
+	}
+	if state.PendingKind == lib.MutationOperatingPoint {
+		attempt.Reason = ""
+	}
+	id, err := store.StartMutationAttempt(&attempt)
+	if err != nil {
+		t.Fatalf("start %s attempt: %v", state.PendingKind, err)
+	}
+	return id
+}
+
+// hardLimitPoll is telemetry above the hard temperature limit but below the host cutoff: the exact
+// reading that produced every asic_limit rollback in the incident.
+func hardLimitPoll(point lib.OperatingPoint, settings lib.Settings) lib.Info {
+	info := rootTestInfo(point, 600)
+	info.Temp = settings.TempLimit + 2
+	return info
+}
+
+// TestPlacedValidatedPointDemotedByHardLimitLeavesTheSelectableSet is the incident's mineiro shape:
+// final placement settles on the best validated point, the ASIC exceeds the hard limit there, and
+// the miner rolls back. The point must end the episode demoted, so the recovery baseline that
+// follows selects the next-best point instead of steering straight back into the same overheat.
+func TestPlacedValidatedPointDemotedByHardLimitLeavesTheSelectableSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	baselinePoint := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1150}
+	survivor := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1200}
+	unsafePoint := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1250}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(baselinePoint, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	state := bootstrap.State
+	at := now
+	state, at = promoteTestTrial(t, store, state, survivor, 120, 60, at.Add(time.Minute))
+	state, at = promoteTestTrial(t, store, state, unsafePoint, 140, 62, at.Add(time.Minute))
+	// 1250 mV is the highest advertised voltage and 625 MHz the highest advertised frequency, and the
+	// pair below is already measured, so the frontier is exhausted: this baseline places instead of
+	// admitting another candidate.
+	at = at.Add(time.Minute)
+	if err := minerController.evaluateBaseline(
+		context.Background(), &state, mustOpenEpoch(t, store, rootTestMAC),
+		mustWindow(t, 140, 140, 60, 62, 70, 18, nil), asic, settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorSelected ||
+		state.CurrentPoint() != unsafePoint || state.PendingKind != "" {
+		t.Fatalf("final placement did not settle on the best validated point: %+v", state)
+	}
+	placed := mustPointRecord(t, store, rootTestMAC, unsafePoint)
+	if placed.Status != lib.PointValidated || placed.EntryAttemptID <= 0 || placed.EvidenceEpochID <= 0 {
+		t.Fatalf("placed point is not a trial-derived validated row: %+v", placed)
+	}
+
+	at = at.Add(settings.MetricsTime)
+	handled, err := minerController.enforceMinerSafety(
+		context.Background(), &state, hardLimitPoll(unsafePoint, settings), asic, settings, at,
+	)
+	if err != nil || !handled {
+		t.Fatalf("hard-limit poll handled=%t: %v", handled, err)
+	}
+	demoted := mustPointRecord(t, store, rootTestMAC, unsafePoint)
+	if demoted.Status != lib.PointThermal {
+		t.Fatalf("validated point survived a hard-limit trip as %q: %+v", demoted.Status, demoted)
+	}
+	if demoted.EntryAttemptID != placed.EntryAttemptID || !demoted.EnteredAt.Equal(placed.EnteredAt) ||
+		demoted.ReferenceHash != placed.ReferenceHash || demoted.EvidenceEpochID != placed.EvidenceEpochID {
+		t.Fatalf("demotion did not preserve entry provenance: before=%+v after=%+v", placed, demoted)
+	}
+	if state.BestPoint() != survivor || state.BestHashRate != 120 {
+		t.Fatalf("best summary still points at the demoted point: %+v", state)
+	}
+	if state.Phase != lib.PhaseCooldown || state.PendingKind != lib.MutationSafetyRollback ||
+		state.PendingPoint() != survivor || state.SafetyReason != lib.SafetyReasonASICLimit {
+		t.Fatalf("hard-limit trip did not roll back onto the surviving point: %+v", state)
+	}
+	records, err := store.ListPoints(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected, ok := selectFinalPoint(records, asic, settings); !ok || selected.Point() != survivor {
+		t.Fatalf("final selection = %+v ok=%t, want %+v", selected.Point(), ok, survivor)
+	}
+	if target, err := minerController.bestRollbackPoint(&state, unsafePoint, asic, settings); err != nil || target != survivor {
+		t.Fatalf("rollback candidate = %+v: %v", target, err)
+	}
+	store = revalidatedStore(t, store, path)
+	minerController.states = store
+
+	// The rest of the episode: the rollback lands, COOLDOWN dwells, and the recovery baseline
+	// completes. Before the fix this is where the loop closed — the demoted point was still the
+	// feasible maximum and placement steered right back into it.
+	state, at = completeTestMutation(t, store, state, startTestMutationAttempt(t, store, state), at)
+	if state.Phase != lib.PhaseCooldown || state.CurrentPoint() != survivor {
+		t.Fatalf("rollback did not land on the surviving point: %+v", state)
+	}
+	for poll := 0; poll < recoveryHealthyPolls(settings); poll++ {
+		at = at.Add(settings.MetricsTime)
+		if err := minerController.controlMinerAfterSafety(
+			context.Background(), &state, mustReadablePoll(t, rootTestInfo(survivor, 100), asic), settings, at, true,
+		); err != nil {
+			t.Fatalf("recovery poll %d: %v", poll, err)
+		}
+	}
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.finishSafetyValidation(
+		&state, mustOpenEpoch(t, store, rootTestMAC), mustWindow(t, 120, 120, 58, 60, 70, 18, nil), settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	at = at.Add(settings.EvaluationWindowTime)
+	if err := minerController.evaluateBaseline(
+		context.Background(), &state, mustOpenEpoch(t, store, rootTestMAC),
+		mustWindow(t, 120, 120, 58, 60, 70, 18, nil), asic, settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.PendingPoint() == unsafePoint {
+		t.Fatalf("recovery baseline steered back into the demoted point: %+v", state)
+	}
+	if state.Phase != lib.PhaseMonitor || state.MonitorReason != lib.MonitorSelected ||
+		state.CurrentPoint() != survivor || state.PendingKind != "" {
+		t.Fatalf("recovery placement did not settle on the surviving point: %+v", state)
+	}
+	store = revalidatedStore(t, store, path)
+	minerController.states = store
+}
+
+// TestSafetySupersededPlacementDemotesItsValidatedTarget is the incident's mineira shape: the hard
+// limit is reached at the placement target while the placement mutation is still unfinished, so
+// durable current never advanced. The attempt must close superseded and the target — the point the
+// device was actually running when it overheated — must still be demoted.
+func TestSafetySupersededPlacementDemotesItsValidatedTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	baselinePoint := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1150}
+	incumbent := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1200}
+	unsafePoint := lib.OperatingPoint{Frequency: 625, CoreVoltage: 1250}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(baselinePoint, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	state := bootstrap.State
+	at := now
+	// The higher-hash point is measured first, so the miner ends the pass running the lower one and
+	// final placement is a real mutation rather than a hold.
+	state, at = promoteTestTrial(t, store, state, unsafePoint, 140, 62, at.Add(time.Minute))
+	state, at = promoteTestTrial(t, store, state, incumbent, 120, 60, at.Add(time.Minute))
+	at = at.Add(time.Minute)
+	if err := minerController.evaluateBaseline(
+		context.Background(), &state, mustOpenEpoch(t, store, rootTestMAC),
+		mustWindow(t, 120, 120, 58, 60, 70, 18, nil), asic, settings, at,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.PendingKind != lib.MutationOperatingPoint || state.PendingPoint() != unsafePoint ||
+		state.CurrentPoint() != incumbent {
+		t.Fatalf("final placement did not target the best validated point: %+v", state)
+	}
+	attemptID := startTestMutationAttempt(t, store, state)
+
+	// The device has already taken the new pair and overheats there while the ledger still shows the
+	// mutation unfinished: the failure is observed at the target, not at durable current.
+	at = at.Add(settings.MetricsTime)
+	handled, err := minerController.enforceMinerSafety(
+		context.Background(), &state, hardLimitPoll(unsafePoint, settings), asic, settings, at,
+	)
+	if err != nil || !handled {
+		t.Fatalf("hard-limit poll handled=%t: %v", handled, err)
+	}
+	demoted := mustPointRecord(t, store, rootTestMAC, unsafePoint)
+	if demoted.Status != lib.PointThermal {
+		t.Fatalf("mid-placement target survived a hard-limit trip as %q: %+v", demoted.Status, demoted)
+	}
+	attempts, err := store.ListMutationAttempts(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var placement lib.MutationAttempt
+	for _, attempt := range attempts {
+		if attempt.ID == attemptID {
+			placement = attempt
+		}
+	}
+	if placement.ID != attemptID || placement.FailedAt.IsZero() ||
+		placement.FailureStage != lib.MutationFailureSafetySuperseded {
+		t.Fatalf("placement attempt did not close superseded: %+v", placement)
+	}
+	if state.BestPoint() != incumbent || state.BestHashRate != 120 {
+		t.Fatalf("best summary still points at the demoted target: %+v", state)
+	}
+	if state.Phase != lib.PhaseCooldown || state.PendingKind != lib.MutationSafetyRollback ||
+		state.PendingPoint() != incumbent {
+		t.Fatalf("superseded placement did not roll back onto the incumbent: %+v", state)
+	}
+	records, err := store.ListPoints(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected, ok := selectFinalPoint(records, asic, settings); !ok || selected.Point() != incumbent {
+		t.Fatalf("final selection = %+v ok=%t, want %+v", selected.Point(), ok, incumbent)
+	}
+	store = revalidatedStore(t, store, path)
+	minerController.states = store
+}
+
+// TestBaselineDerivedValidatedPointIsDemotedByItsOwnOverheat covers the second durable shape a
+// validated row has: the pass baseline itself, which carries no entry attempt. The incumbent
+// overheating must demote it without tripping entry-authority validation, and must clear the best
+// summary rather than leave it pointing at a point no longer validated.
+func TestBaselineDerivedValidatedPointIsDemotedByItsOwnOverheat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "optimizer.db")
+	store, err := lib.OpenOptimizerStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	settings := rootTestSettings(t)
+	asic := rootTestASIC()
+	now := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	point := lib.OperatingPoint{Frequency: 490, CoreVoltage: 1060}
+	minimum := lib.OperatingPoint{Frequency: 400, CoreVoltage: 1000}
+	bootstrap, err := store.Apply(lib.Bootstrap{
+		Info: rootTestInfo(point, 100), IP: "192.0.2.12", PairAdvertised: true,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerController := &controller{states: store, runtimes: make(map[string]*minerRuntime)}
+	state := closeInitialBaselineEpoch(t, store, bootstrap.State, now.Add(time.Minute))
+	baseline := mustPointRecord(t, store, rootTestMAC, point)
+	if baseline.Status != lib.PointValidated || baseline.EntryAttemptID != 0 || baseline.EvidenceEpochID <= 0 {
+		t.Fatalf("pass baseline is not a baseline-derived validated row: %+v", baseline)
+	}
+	at := now.Add(2 * time.Minute)
+	handled, err := minerController.enforceMinerSafety(
+		context.Background(), &state, hardLimitPoll(point, settings), asic, settings, at,
+	)
+	if err != nil || !handled {
+		t.Fatalf("hard-limit poll handled=%t: %v", handled, err)
+	}
+	demoted := mustPointRecord(t, store, rootTestMAC, point)
+	if demoted.Status != lib.PointThermal || demoted.EntryAttemptID != 0 ||
+		demoted.EvidenceEpochID != baseline.EvidenceEpochID || !demoted.EnteredAt.Equal(baseline.EnteredAt) {
+		t.Fatalf("baseline-derived demotion = %+v, want thermal keeping baseline epoch %d",
+			demoted, baseline.EvidenceEpochID)
+	}
+	if state.BestPoint() != (lib.OperatingPoint{}) || state.BestHashRate != 0 {
+		t.Fatalf("best summary outlived the only validated point: %+v", state)
+	}
+	if state.Phase != lib.PhaseCooldown || state.PendingKind != lib.MutationSafetyRollback ||
+		state.PendingPoint() != minimum {
+		t.Fatalf("overheating incumbent did not roll back to the advertised minimum: %+v", state)
+	}
+	records, err := store.ListPoints(rootTestMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected, ok := selectFinalPoint(records, asic, settings); ok {
+		t.Fatalf("demoted point is still selectable: %+v", selected)
+	}
+	store = revalidatedStore(t, store, path)
+	minerController.states = store
+}

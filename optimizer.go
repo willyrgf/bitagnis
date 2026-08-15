@@ -1452,6 +1452,15 @@ func (minerController *controller) rollbackForSafety(
 	return nil
 }
 
+// safetyPointRecord builds the terminal operating-point record a safety failure writes about the
+// point it was observed at. It is the only producer of thermal/power/vr_hot rows, and it recognizes
+// exactly two durable shapes: an unfinished trial (PointEntered with entry authority), which the
+// failure finalizes instead of a measurement window; and an already-validated point, which the
+// failure demotes. Both keep the row's entry provenance — EnteredAt, EntryAttemptID, ReferenceHash —
+// so the durable layer can still check entry authority and epoch pairing; a validated row exists in
+// both a trial-derived (EntryAttemptID > 0) and a baseline-derived (EntryAttemptID == 0) shape and
+// both are demotable. Any other status returns no record: the point already carries a terminal
+// verdict, and re-stating it is not new evidence.
 func (minerController *controller) safetyPointRecord(
 	state *lib.MinerState,
 	point lib.OperatingPoint,
@@ -1464,11 +1473,21 @@ func (minerController *controller) safetyPointRecord(
 		return nil, err
 	}
 	if existing, found := findRecord(records, point); found {
-		if existing.Status != lib.PointEntered || existing.EntryAttemptID <= 0 {
+		status := lib.PointStatus(failure.status)
+		typedLimit := safetyPointStatus(status)
+		trial := existing.Status == lib.PointEntered && existing.EntryAttemptID > 0
+		// A point that has already validated is demoted by a hard-limit verdict observed at it, so the
+		// evidence that it is no longer safe survives the episode. Without this, no later measurement
+		// could ever contradict a validated row, and final placement would keep re-selecting a point
+		// that overheats from its stale historical statistics — the rollback loop this fixes. The
+		// demotion requires a typed limit (thermal/power/vr_hot): an assessment that produced no
+		// failure at all — a normal poll inside an ongoing emergency episode, for instance — is not
+		// evidence against the point, and must not be silently mapped onto one.
+		demotable := existing.Status == lib.PointValidated && typedLimit
+		if !trial && !demotable {
 			return nil, nil
 		}
-		status := lib.PointStatus(failure.status)
-		if status != lib.PointThermal && status != lib.PointPower && status != lib.PointVRHot {
+		if !typedLimit {
 			status = lib.PointThermal
 		}
 		hashRate := info.HashRate

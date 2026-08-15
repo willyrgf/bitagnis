@@ -180,6 +180,15 @@ These invariants are high risk if violated:
 - Normal safety rollback chooses the closest validated point with thermal, VR-temperature, and
   power headroom, preferring a point that lowers both components; if no validated point qualifies,
   use the minimum advertised pair. Never authorize an unvalidated adjacent point for safety.
+- A hard limit reached at a point that had already validated demotes that point to the limit's
+  terminal status (`thermal`, `power`, `vr_hot`) in the same transition that rolls the miner back.
+  `validated` is a conclusion from evidence, not a permanent grant: without demotion, final
+  placement keeps re-selecting a point that has become unsafe from its stale historical statistics
+  and the miner loops through rollback and recovery forever. The demoted row keeps the entry
+  provenance and the closed baseline or trial epoch that validated it — the demotion carries no new
+  epoch — and `best_*` is recomputed in that same transaction, because it mirrors the maximum
+  validated hash rate. Demotion is scoped to this pass: a later environmental or operator pass
+  deletes point history and re-explores the point when conditions have changed.
 - Persist a pending operating-point request before touching the device. Do not evaluate it until
   the same MAC returns after proven reboot and exact complete-pair readback.
 - Persist one mutation-attempt record before hardware work, record PATCH and restart milestones

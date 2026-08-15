@@ -70,6 +70,14 @@ never guesses an unvalidated adjacent pair. If no such record exists, it uses
 the exact minimum advertised pair. A rollback can run while the failed point
 remains above an ordinary hard limit; ordinary point and mining changes cannot.
 
+Reaching a hard limit is also durable evidence about the point it happened at.
+A point that had already been measured as validated is demoted to that limit's
+outcome — thermal, power, or VR — in the same transition that rolls the miner
+back, so it leaves the set final placement and rollback selection draw from and
+the next-best measured point is chosen instead. The demotion lasts for the
+current pass: a later environmental or operator pass re-explores the point once
+conditions have changed.
+
 AxeOS v2.8.1 trips strictly above 75°C ASIC temperature or 105°C VR
 temperature and stores the unadvertised emergency state `50 MHz / 1000 mV`.
 Bitagnis never adopts or evaluates that firmware state. Firmware recovery

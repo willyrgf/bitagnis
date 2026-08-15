@@ -2641,14 +2641,15 @@ func loadOperatingPoint(
 	return record, nil
 }
 
-// updateOperatingPoint writes a terminal measurement over an existing "entered" row, binding the
-// closed evidence epoch that produced it. It is the one write path finalizeTrialTx and
-// CompleteBaseline share.
-func updateOperatingPoint(tx *sql.Tx, record OperatingPointRecord) error {
+// writeTerminalPoint writes a terminal measurement over an existing row whose stored status is
+// still from, binding the evidence epoch the record carries. The status guard in the WHERE clause is
+// what makes each caller a state transition rather than a blind overwrite: a row that has already
+// moved on is never rewritten.
+func writeTerminalPoint(tx *sql.Tx, record OperatingPointRecord, from PointStatus) (int64, error) {
 	if err := validatePointRecord(record); err != nil {
-		return err
+		return 0, err
 	}
-	_, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
+	result, err := tx.ExecContext(context.Background(), `UPDATE operating_points SET
 		status = ?, median_hash = ?, expected_hash = ?, attainment = ?, mean_temp = ?,
 		p95_temp = ?, p95_vr_temp = ?, p95_power = ?, error_percent = ?,
 		accepted_delta = ?, rejected_delta = ?, measured_at = ?, evidence_epoch_id = ?
@@ -2657,8 +2658,76 @@ func updateOperatingPoint(tx *sql.Tx, record OperatingPointRecord) error {
 		record.MeanTemp, record.P95Temp, record.P95VRTemp, record.P95Power,
 		nullableFloat(record.ErrorPercent), record.AcceptedDelta, record.RejectedDelta,
 		timeValue(record.MeasuredAt), record.EvidenceEpochID, record.MacAddr, record.Frequency,
-		record.CoreVoltage, string(PointEntered))
+		record.CoreVoltage, string(from))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// updateOperatingPoint writes a terminal measurement over an existing "entered" row, binding the
+// closed evidence epoch that produced it. It is the one write path finalizeTrialTx and
+// CompleteBaseline share.
+func updateOperatingPoint(tx *sql.Tx, record OperatingPointRecord) error {
+	_, err := writeTerminalPoint(tx, record, PointEntered)
 	return err
+}
+
+// demoteOperatingPoint records a hard safety limit over an already-"validated" row. It is the only
+// transition out of PointValidated, and the only one that removes a point from the set final
+// placement, rollback selection, and the best_* summary draw from — so unlike its "entered"
+// sibling it insists the write landed: a demotion that silently matched no row would leave the
+// unsafe point selectable forever, which is precisely the failure it exists to end.
+func demoteOperatingPoint(tx *sql.Tx, record OperatingPointRecord) error {
+	affected, err := writeTerminalPoint(tx, record, PointValidated)
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("demotion of %d/%d matched %d validated rows, want 1",
+			record.Frequency, record.CoreVoltage, affected)
+	}
+	return nil
+}
+
+// safetyLimitStatus reports whether a status is one of the three hard-limit verdicts a safety
+// transition can record about a point.
+func safetyLimitStatus(status PointStatus) bool {
+	return status == PointThermal || status == PointPower || status == PointVRHot
+}
+
+// listMinerPoints reads every operating-point row of one miner inside the writing transaction, so a
+// transition that has just changed a row can recompute a summary over the rows it will commit rather
+// than over the pre-transaction snapshot ListPoints would return.
+func listMinerPoints(tx *sql.Tx, macAddr string) ([]OperatingPointRecord, error) {
+	rows, err := tx.QueryContext(context.Background(),
+		pointRowSelect+" WHERE mac_addr = ? ORDER BY frequency ASC, core_voltage ASC", macAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPointRows(rows)
+}
+
+// refreshBestPointSummary recomputes best_* from the miner's durable rows. Every other writer of
+// best_* is monotone — a new validated measurement can only raise the maximum — so only the
+// transition that can take a row out of the validated set, a safety demotion, needs this. Leaving
+// it out would strand best_* on a point that is no longer validated, which validateBestPointSummary
+// rejects at the next database open.
+func refreshBestPointSummary(tx *sql.Tx, state *MinerState) error {
+	records, err := listMinerPoints(tx, state.MacAddr)
+	if err != nil {
+		return err
+	}
+	best, found := bestValidatedRecord(records)
+	if !found {
+		state.SetBestPoint(OperatingPoint{})
+		state.BestHashRate = 0
+		return nil
+	}
+	state.SetBestPoint(best.Point())
+	state.BestHashRate = best.MedianHash
+	return nil
 }
 
 func unobservablePoint(record OperatingPointRecord, at time.Time) OperatingPointRecord {
@@ -3304,8 +3373,9 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 	if record != nil && (record.MacAddr != state.MacAddr || record.Status == PointEntered) {
 		return TransitionResult{}, fmt.Errorf("persist safety transition: invalid point record")
 	}
-	// record.EvidenceEpochID (when record != nil) is not yet assigned here; closeCandidateEpoch
-	// below determines it, and updateOperatingPoint validates the complete record when it writes it.
+	// record.EvidenceEpochID (when record != nil) is not yet assigned here; the point's own durable
+	// row and closeCandidateEpoch below determine it, and the write path validates the complete
+	// record when it stores it.
 	durable, err := queryMiner(tx, state.MacAddr)
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("persist safety transition: load miner: %w", err)
@@ -3319,23 +3389,42 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 	} else if !errors.Is(openErr, sql.ErrNoRows) {
 		return TransitionResult{}, fmt.Errorf("persist safety transition: load open epoch: %w", openErr)
 	}
-	// A safety transition always takes ownership of whatever evidence epoch is open: it is one of
-	// the RFC's contradiction triggers. When Record measures the open epoch's own point, the epoch
-	// closes "rejected" (a hard safety limit is a verdict, not a change of subject) and the point
-	// record binds to it; otherwise any open epoch closes "contradicted".
-	candidateEpochID, err := closeCandidateEpoch(tx, state.MacAddr, record, at)
-	if err != nil {
-		return TransitionResult{}, fmt.Errorf("persist safety transition: close open epoch: %w", err)
-	}
+	// The row the record finalizes is read before any epoch closes: whether it is still an open
+	// candidate or an already-validated point being demoted decides both how the open epoch closes
+	// and which evidence epoch the row ends up carrying.
+	var current OperatingPointRecord
 	if record != nil {
-		current, err := loadOperatingPoint(tx, record.MacAddr, record.Point())
+		current, err = loadOperatingPoint(tx, record.MacAddr, record.Point())
 		if err != nil {
 			return TransitionResult{}, fmt.Errorf("persist safety transition: load point: %w", err)
 		}
 		if current.EntryAttemptID != record.EntryAttemptID {
 			return TransitionResult{}, fmt.Errorf("persist safety transition: point entry authority changed")
 		}
-		if current.Status == PointEntered {
+	}
+	// Demotion is the one legal transition out of PointValidated: a hard limit observed at a point
+	// that had already validated is evidence the point is no longer safe, and without it no later
+	// measurement could ever contradict a validated row. It carries no new evidence epoch — the row
+	// keeps the closed baseline or trial epoch that validated it, which is the pairing the durable
+	// invariant checker enforces against EntryAttemptID — so the epoch open now is not the
+	// demotion's evidence and closes "contradicted" like any other epoch a safety transition
+	// interrupts.
+	demotion := record != nil && current.Status == PointValidated && safetyLimitStatus(record.Status)
+	// A safety transition always takes ownership of whatever evidence epoch is open: it is one of
+	// the RFC's contradiction triggers. When Record finalizes a candidate at the open epoch's own
+	// point, the epoch closes "rejected" (a hard safety limit is a verdict, not a change of subject)
+	// and the point record binds to it; otherwise any open epoch closes "contradicted".
+	candidateEvidence := record
+	if demotion {
+		candidateEvidence = nil
+	}
+	candidateEpochID, err := closeCandidateEpoch(tx, state.MacAddr, candidateEvidence, at)
+	if err != nil {
+		return TransitionResult{}, fmt.Errorf("persist safety transition: close open epoch: %w", err)
+	}
+	if record != nil {
+		switch {
+		case current.Status == PointEntered:
 			record.EvidenceEpochID = candidateEpochID
 			if record.Status == PointUnobservable || record.Status == PointStarved {
 				record.EvidenceEpochID = 0
@@ -3343,18 +3432,28 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 			if err := updateOperatingPoint(tx, *record); err != nil {
 				return TransitionResult{}, fmt.Errorf("persist safety transition: finalize point: %w", err)
 			}
-		} else if current.Status != record.Status || !current.MeasuredAt.Equal(record.MeasuredAt) {
+		case demotion:
+			record.EvidenceEpochID = current.EvidenceEpochID
+			if err := demoteOperatingPoint(tx, *record); err != nil {
+				return TransitionResult{}, fmt.Errorf("persist safety transition: demote validated point: %w", err)
+			}
+			// best_* mirrors the maximum validated median hash rate, and the demotion has just taken a
+			// point out of that set; the summary moves with it, in this same transaction.
+			if err := refreshBestPointSummary(tx, &state); err != nil {
+				return TransitionResult{}, fmt.Errorf("persist safety transition: refresh best point: %w", err)
+			}
+		case current.Status != record.Status || !current.MeasuredAt.Equal(record.MeasuredAt):
 			return TransitionResult{}, fmt.Errorf("persist safety transition: point is already finalized differently")
 		}
 	}
 	if interrupted && (record == nil || record.Point() != interruptedEpoch.Point) {
-		current, err := loadOperatingPoint(tx, state.MacAddr, interruptedEpoch.Point)
+		interruptedPoint, err := loadOperatingPoint(tx, state.MacAddr, interruptedEpoch.Point)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return TransitionResult{}, fmt.Errorf("persist safety transition: load interrupted point: %w", err)
 		}
-		if err == nil && current.Status == PointEntered {
-			current = unobservablePoint(current, at)
-			if err := updateOperatingPoint(tx, current); err != nil {
+		if err == nil && interruptedPoint.Status == PointEntered {
+			interruptedPoint = unobservablePoint(interruptedPoint, at)
+			if err := updateOperatingPoint(tx, interruptedPoint); err != nil {
 				return TransitionResult{}, fmt.Errorf("persist safety transition: finalize interrupted point: %w", err)
 			}
 		}
@@ -3371,7 +3470,14 @@ func applySafetyTransition(tx *sql.Tx, value SafetyTransition, at time.Time) (Tr
 			closeAttempt = state.PendingKind != attempt.Kind || state.PendingPoint() != attempt.TargetPoint() ||
 				state.SafetyReason != attempt.Reason || !state.PendingSince.Equal(attempt.IntentCreatedAt)
 		}
-		if closeAttempt && attempt.Kind == MutationOperatingPoint && record == nil {
+		// A mutation cut short by safety leaves its target row reserved with nothing measured at it,
+		// so the target is consumed as unobservable — unless this transition's own record already
+		// finalizes that exact point, in which case its verdict is the better one and stands. The
+		// point comparison (rather than a bare record == nil) matters now that a record can describe
+		// the live point a failure was observed at while an unfinished mutation reserves a different
+		// one: that candidate must still be consumed.
+		if closeAttempt && attempt.Kind == MutationOperatingPoint &&
+			(record == nil || record.Point() != attempt.TargetPoint()) {
 			candidate, err := loadOperatingPoint(tx, attempt.MacAddr, attempt.TargetPoint())
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return TransitionResult{}, fmt.Errorf("persist safety transition: load superseded candidate: %w", err)
@@ -5044,9 +5150,11 @@ func validateCrossTableState(
 	// positive evidence_epoch_id resolves it to a closed epoch. Its outcome is "validated" or
 	// "rejected" for the normal window-evaluation paths; a safety-interrupted candidate
 	// (thermal/power/vr_hot) resolves to a "contradicted" epoch instead, because a safety transition
-	// takes ownership before any window predicate is evaluated (see closeCandidateEpoch). A baseline
-	// row always carries one (validatePointRecord requires it); a candidate row may legitimately
-	// carry none, per the resume-failure gap documented there.
+	// takes ownership before any window predicate is evaluated (see closeCandidateEpoch). A point
+	// demoted out of "validated" by a later hard limit carries the same safety statuses but keeps the
+	// epoch that validated it, so it resolves to a "validated" outcome — all three are accepted here.
+	// A baseline row always carries an epoch (validatePointRecord requires it); a candidate row may
+	// legitimately carry none, per the resume-failure gap documented there.
 	for _, record := range records {
 		if record.Status == PointEntered || record.Status == PointUnobservable || record.Status == PointStarved {
 			if record.EvidenceEpochID != 0 {
@@ -5078,7 +5186,7 @@ func validateCrossTableState(
 			return fmt.Errorf("point %s/%d/%d resolves to an open evidence epoch", record.MacAddr, record.Frequency, record.CoreVoltage)
 		}
 		validOutcome := epoch.Outcome == EpochValidated || epoch.Outcome == EpochRejected
-		safetyInterrupted := record.Status == PointThermal || record.Status == PointPower || record.Status == PointVRHot
+		safetyInterrupted := safetyLimitStatus(record.Status)
 		if !validOutcome && safetyInterrupted && epoch.Outcome == EpochContradicted {
 			validOutcome = true
 		}
@@ -5297,15 +5405,16 @@ func recordsForMiner(records []OperatingPointRecord, macAddr string) []Operating
 	return filtered
 }
 
-func validateBestPointSummary(state MinerState, records []OperatingPointRecord) error {
+// bestValidatedRecord is the single definition of the row a miner's best_* summary mirrors: the
+// highest validated median hash rate, tie-broken by betterStoredPoint. The durable writer
+// (refreshBestPointSummary) and the invariant checker (validateBestPointSummary) share it so the
+// stored summary and the rule it is checked against cannot drift apart.
+func bestValidatedRecord(records []OperatingPointRecord) (OperatingPointRecord, bool) {
 	var best OperatingPointRecord
 	found := false
 	for _, record := range records {
 		if record.Status != PointValidated {
 			continue
-		}
-		if record.MedianHash <= 0 || !finite(record.MedianHash) {
-			return fmt.Errorf("validated point %d/%d has no positive hash rate", record.Frequency, record.CoreVoltage)
 		}
 		if !found || record.MedianHash > best.MedianHash ||
 			(record.MedianHash == best.MedianHash && betterStoredPoint(record, best)) {
@@ -5313,6 +5422,19 @@ func validateBestPointSummary(state MinerState, records []OperatingPointRecord) 
 			found = true
 		}
 	}
+	return best, found
+}
+
+func validateBestPointSummary(state MinerState, records []OperatingPointRecord) error {
+	for _, record := range records {
+		if record.Status != PointValidated {
+			continue
+		}
+		if record.MedianHash <= 0 || !finite(record.MedianHash) {
+			return fmt.Errorf("validated point %d/%d has no positive hash rate", record.Frequency, record.CoreVoltage)
+		}
+	}
+	best, found := bestValidatedRecord(records)
 	if !found {
 		if state.BestHashRate != 0 || state.BestPoint() != (OperatingPoint{}) {
 			return fmt.Errorf("best state exists without a validated point")
